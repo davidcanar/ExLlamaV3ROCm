@@ -1,0 +1,112 @@
+From 1df781f6ac854df1ec047a45669c9b2fd730eb0c Mon Sep 17 00:00:00 2001
+From: David Canar <davidcanar@gmail.com>
+Date: Wed, 28 Oct 2026 12:09:38 -0600
+Subject: [PATCH 6/7] TP: add scoped cross-host sync modes
+
+---
+ exllamav3/model/model_tp_backend.py | 54 ++++++++++++++++++++++++-----
+ 1 file changed, 45 insertions(+), 9 deletions(-)
+
+diff --git a/exllamav3/model/model_tp_backend.py b/exllamav3/model/model_tp_backend.py
+index 5e991c7a..49354f45 100644
+--- a/exllamav3/model/model_tp_backend.py
++++ b/exllamav3/model/model_tp_backend.py
+@@ -20,7 +20,19 @@ GLOBALS_SIZE = 128*1024
+ SHBUF_SIZE = 16 * 1024 ** 2
+ _nccl_fp32 = os.environ.get("EXL3_TP_NCCL_FP32", "0") != "0"
+ _tp_trace = os.environ.get("EXL3_TP_TRACE_COLLECTIVES", "0") != "0"
+-_nccl_sync = os.environ.get("EXL3_TP_NCCL_SYNC", "1") != "0"
++# Cross-host collective host-sync mode (see TPBackendNCCL._sync_after_collective):
++#   "1" (default) - torch.cuda.synchronize(device): proven-correct full device sync
++#   "stream"      - torch.cuda.current_stream(device).synchronize(): same host
++#                   visibility for stream-ordered consumers without draining the
++#                   MoE expert-prefetch / staging side streams
++#   "0"           - no host sync; only safe when every consumer is stream-ordered
++#                   on the launching stream
++_nccl_sync = os.environ.get("EXL3_TP_NCCL_SYNC", "1").lower()
++if _nccl_sync not in ("0", "1", "stream"):
++    # Legacy semantics treated any value other than "0" as enabled; preserve
++    # that contract by falling back to full device sync for unknown values.
++    print(f" -- Unknown EXL3_TP_NCCL_SYNC=\"{_nccl_sync}\", using 1 (device sync)", flush = True)
++    _nccl_sync = "1"
+ _gather_chunk_bytes = int(os.environ.get("EXL3_TP_GATHER_CHUNK_BYTES", str(64 * 1024 ** 2)))
+ # 17 slots (16 devices + accumulator) x 2MB: 8 ring stages of the 256KB reduce chunk size
+ SHBUF_SIZE_R = 17 * 8 * 256 * 1024
+@@ -150,6 +162,33 @@ class TPBackendNCCL:
+             )
+ 
+ 
++    def _sync_after_collective(self):
++        """
++        Host-side completion barrier after a cross-host collective. PyTorch's NCCL
++        Work.wait() only enqueues stream ordering (it makes the launching stream
++        wait on the NCCL stream); it does not block the host. A host block of
++        some form is therefore still required before CPU-side consumption of a
++        collective result.
++
++        "1" (default): full device sync. Proven correct, but drains every stream
++        on the device - including the MoE expert-prefetch copy streams - at every
++        layer boundary.
++
++        "stream": current-stream sync. Blocks the host until the collective
++        result is visible to stream-ordered consumers on the launching stream,
++        letting side streams (weight prefetch, staging copies) keep running.
++
++        "0": no host sync. Correct only when every consumer of the collective
++        output is stream-ordered on the launching stream.
++        """
++        if _nccl_sync == "0":
++            return
++        if _nccl_sync == "stream":
++            torch.cuda.current_stream(self.device).synchronize()
++        else:
++            torch.cuda.synchronize(self.device)
++
++
+     def mp_warmup_nccl(self, device):
+         """
+         NCCL does lazy initialization which causes the first reduction operation to take an exceedingly long time
+@@ -182,8 +221,7 @@ class TPBackendNCCL:
+             # In cross-host mode device identities passed through the TP plan are global ranks.
+             self._trace_collective("broadcast", tensor, f"src={src_device}")
+             dist.broadcast(tensor, src = src_device)
+-            if _nccl_sync:
+-                torch.cuda.synchronize(self.device)
++            self._sync_after_collective()
+         else:
+             self.fallback.broadcast(tensor, src_device)
+ 
+@@ -200,8 +238,8 @@ class TPBackendNCCL:
+             tensor.copy_(temp)
+         else:
+             dist.all_reduce(tensor, async_op = False)
+-        if self.cross_host and _nccl_sync:
+-            torch.cuda.synchronize(self.device)
++        if self.cross_host:
++            self._sync_after_collective()
+ 
+ 
+     def _gather_cross_host(
+@@ -289,8 +327,7 @@ class TPBackendNCCL:
+     ):
+         if self.cross_host:
+             self._gather_cross_host(tensor, out_tensor, gather_devices, out_device, ldims)
+-            if _nccl_sync:
+-                torch.cuda.synchronize(self.device)
++            self._sync_after_collective()
+         else:
+             self.fallback.gather(tensor, out_tensor, gather_devices, out_device, ldims)
+ 
+@@ -305,8 +342,7 @@ class TPBackendNCCL:
+     ):
+         if self.cross_host:
+             self._gather_cross_host(tensor, out_tensor, gather_devices, out_device, ldims)
+-            if _nccl_sync:
+-                torch.cuda.synchronize(self.device)
++            self._sync_after_collective()
+         else:
+             self.fallback.gather_small(tensor, out_tensor, gather_devices, out_device, ldims)
+ 
+-- 
+2.54.0
+

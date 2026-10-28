@@ -1,0 +1,12 @@
+# ROCm 10.1 wheels for gfx1151 (AMD Strix Halo) — exact pins of the validated stack.
+#
+# Install with AMD's wheel index (setup.sh does this for you):
+#   uv pip install --index-url https://nightly.repo.amd.com/rocm/whl-next/ \
+#       --extra-index-url https://pypi.org/simple -r requirements/rocm.txt
+#
+# The `a20260822` suffix is the nightly snapshot the rig was validated on. If
+# that snapshot rotates out of the nightly index, the same packages exist on
+# the stable ROCm 10.1 index (https://stable.repo.amd.com/rocm/whl-next/) at
+# 2.14.0+rocm10.1.0 / 10.1.0 — drop the `a<date>` suffixes and re-test.
+torch[device-gfx1151]==2.14.0+rocm10.1.0a20260822
+rocm[devel,device-gfx1151]==10.1.0a20260822

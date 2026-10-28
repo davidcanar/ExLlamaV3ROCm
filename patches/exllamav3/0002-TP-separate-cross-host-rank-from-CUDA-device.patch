@@ -1,0 +1,216 @@
+From b493b9cbca471ca10282aee68ec98ec4645315dc Mon Sep 17 00:00:00 2001
+From: David Canar <davidcanar@gmail.com>
+Date: Tue, 27 Oct 2026 22:44:09 -0600
+Subject: [PATCH 2/7] TP: separate cross-host rank from CUDA device
+
+---
+ exllamav3/model/model_tp_fn.py    | 30 +++++++----
+ tests/tp/test_tp_rank_identity.py | 90 +++++++++++++++++++++++++++++++
+ 2 files changed, 111 insertions(+), 9 deletions(-)
+ create mode 100644 tests/tp/test_tp_rank_identity.py
+
+diff --git a/exllamav3/model/model_tp_fn.py b/exllamav3/model/model_tp_fn.py
+index 46e2b380..4da8a63c 100644
+--- a/exllamav3/model/model_tp_fn.py
++++ b/exllamav3/model/model_tp_fn.py
+@@ -21,11 +21,17 @@ from ..constants import PAGE_SIZE
+ 
+ 
+ def init_pg(device: int, active_devices: list[int], output_device: int, backend_args: dict, master: bool = False):
+-    rank = active_devices.index(device) if device >= 0 else -1
+-    output_rank = active_devices.index(output_device)
+-    world_size = len(active_devices)
++    cross_host = backend_args.get("cross_host", False)
++    rank = backend_args.get("rank", active_devices.index(device) if device >= 0 else -1)
++    output_rank = backend_args.get("output_rank", active_devices.index(output_device))
++    world_size = backend_args.get("world_size", len(active_devices))
++    if cross_host:
++        # CUDA ordinals are host-local; plan keys and collective endpoints are global TP ranks.
++        active_devices = backend_args.get("ranks", list(range(world_size)))
++        output_device = output_rank
+     local_context = {
+         "device": device,
++        "cross_host": cross_host,
+         "modules": [],
+         "kv_modules": [],
+         "recurrent_modules": [],
+@@ -49,6 +55,9 @@ def init_pg(device: int, active_devices: list[int], output_device: int, backend_
+                 init_method = backend_args["init_method"],
+                 master = master,
+                 uuid = backend_args["uuid"],
++                rank = rank if cross_host else None,
++                world_size = world_size if cross_host else None,
++                cross_host = cross_host,
+             )
+         case "native":
+             backend = TPBackendNative(
+@@ -166,7 +175,8 @@ def mp_model_append(local_context: dict, exported: dict):
+     cls = exported["cls"]
+     plan = local_context["plan"]
+ 
+-    module = cls.tp_import(local_context, exported, plan[device])
++    plan_key = local_context["rank"] if local_context.get("cross_host") else device
++    module = cls.tp_import(local_context, exported, plan[plan_key])
+     modules.append(module)
+     # Gated-residual sites hand a weighted stream copy to their successor; rewire on each append
+     from ..modules.hyperconnections import GatedResidual
+@@ -184,7 +194,7 @@ def mp_model_append_gather(local_context: dict):
+     """
+     from ..modules.gather import OutputGather
+     modules = local_context["modules"]
+-    device = local_context["device"]
++    device = local_context["rank"] if local_context.get("cross_host") else local_context["device"]
+     plan = local_context["plan"]
+     active_devices = local_context["active_devices"]
+     output_device = local_context["output_device"]
+@@ -314,6 +324,7 @@ def mp_model_forward_lm_head_argmax(
+ ):
+     consumer = local_context["inf_consumer"]
+     device = local_context["device"]
++    identity = local_context["rank"] if local_context.get("cross_host") else device
+     output_device = local_context["output_device"]
+     backend = local_context["backend"]
+ 
+@@ -348,7 +359,7 @@ def mp_model_forward_lm_head_argmax(
+         vp[..., 0] = v
+         ip[..., 0] = i
+ 
+-    if device == output_device:
++    if identity == output_device:
+         out_v_shape = list(vp.shape)
+         out_i_shape = list(ip.shape)
+         out_v_shape[-1] = sum(ldims)
+@@ -362,7 +373,7 @@ def mp_model_forward_lm_head_argmax(
+     backend.gather_small(vp, out_v, gather_devices, output_device, ldims)
+     backend.gather_small(ip, out_i, gather_devices, output_device, ldims)
+ 
+-    return (out_v, out_i) if device == output_device else None
++    return (out_v, out_i) if identity == output_device else None
+ 
+ 
+ def mp_model_forward_lm_head_topk(
+@@ -386,6 +397,7 @@ def mp_model_forward_lm_head_topk(
+     """
+     consumer = local_context["inf_consumer"]
+     device = local_context["device"]
++    identity = local_context["rank"] if local_context.get("cross_host") else device
+     output_device = local_context["output_device"]
+     backend = local_context["backend"]
+ 
+@@ -418,7 +430,7 @@ def mp_model_forward_lm_head_topk(
+     if gather_devices is None:
+         return v, i
+ 
+-    if device == output_device:
++    if identity == output_device:
+         out_v = torch.empty(*v.shape[:-1], sum(ldims), dtype = v.dtype, device = v.device)
+         out_i = torch.empty(*i.shape[:-1], sum(ldims), dtype = i.dtype, device = i.device)
+     else:
+@@ -426,7 +438,7 @@ def mp_model_forward_lm_head_topk(
+ 
+     backend.gather_small(v.contiguous(), out_v, gather_devices, output_device, ldims)
+     backend.gather_small(i.contiguous(), out_i, gather_devices, output_device, ldims)
+-    return (out_v, out_i) if device == output_device else None
++    return (out_v, out_i) if identity == output_device else None
+ 
+ 
+ # def mp_model_forward_lm_head_argmax_old(
+diff --git a/tests/tp/test_tp_rank_identity.py b/tests/tp/test_tp_rank_identity.py
+new file mode 100644
+index 00000000..ef625bcf
+--- /dev/null
++++ b/tests/tp/test_tp_rank_identity.py
+@@ -0,0 +1,90 @@
++"""Cross-host workers use global TP ranks for plans and local CUDA ordinals for allocation."""
++
++from types import SimpleNamespace
++
++import pytest
++
++from exllamav3.model import model_tp_fn
++from exllamav3.modules.hyperconnections import GatedResidual
++
++pytestmark = pytest.mark.nogpu
++
++
++class FakeImportedModule:
++    caps = {}
++    key = "fake"
++
++    def all_cache_modules(self):
++        return []
++
++    def all_recurrent_modules(self):
++        return []
++
++
++def append_context(device, rank, cross_host):
++    return {
++        "device": device,
++        "rank": rank,
++        "cross_host": cross_host,
++        "modules": [],
++        "kv_modules": [],
++        "recurrent_modules": [],
++        "plan": [
++            {"fake": (0, 2, "channels")},
++            {"fake": (2, 5, "channels")},
++            {"fake": (5, 9, "channels")},
++        ],
++    }
++
++
++def test_cross_host_append_uses_rank_plan(monkeypatch):
++    monkeypatch.setattr(GatedResidual, "link_sites", lambda modules: None)
++    context = append_context(device=0, rank=1, cross_host=True)
++    received = []
++
++    class FakeExport:
++        @classmethod
++        def tp_import(cls, local_context, exported, plan):
++            received.append((local_context["device"], plan))
++            return FakeImportedModule()
++
++    model_tp_fn.mp_model_append(context, {"cls": FakeExport})
++    assert received == [(0, {"fake": (2, 5, "channels")})]
++
++
++def test_single_host_append_keeps_cuda_plan_index(monkeypatch):
++    monkeypatch.setattr(GatedResidual, "link_sites", lambda modules: None)
++    context = append_context(device=2, rank=0, cross_host=False)
++    received = []
++
++    class FakeExport:
++        @classmethod
++        def tp_import(cls, local_context, exported, plan):
++            received.append((local_context["device"], plan))
++            return FakeImportedModule()
++
++    model_tp_fn.mp_model_append(context, {"cls": FakeExport})
++    assert received == [(2, {"fake": (5, 9, "channels")})]
++
++
++def test_cross_host_output_gather_uses_rank_identity():
++    context = {
++        "device": 0,
++        "rank": 1,
++        "cross_host": True,
++        "modules": [SimpleNamespace(key="head")],
++        "plan": [
++            {"head": (0, 4, "vocab")},
++            {"head": (4, 8, "vocab")},
++        ],
++        "active_devices": [0, 1],
++        "output_device": 0,
++    }
++
++    model_tp_fn.mp_model_append_gather(context)
++    gather = context["modules"][-1]
++    assert gather.device == 1
++    assert gather.output_device == 0
++    assert gather.gather_devices == [0, 1]
++    assert gather.ldims == [4, 4]
++    assert gather.active
+-- 
+2.54.0
+

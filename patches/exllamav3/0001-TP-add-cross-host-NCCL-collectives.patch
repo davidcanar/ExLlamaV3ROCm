@@ -1,0 +1,198 @@
+From 8b52001ae53a97b4a7c27775cc95f833e0696670 Mon Sep 17 00:00:00 2001
+From: David Canar <davidcanar@gmail.com>
+Date: Tue, 27 Oct 2026 22:40:23 -0600
+Subject: [PATCH 1/7] TP: add cross-host NCCL collectives
+
+---
+ exllamav3/model/model_tp_backend.py | 121 ++++++++++++++++++----------
+ 1 file changed, 77 insertions(+), 44 deletions(-)
+
+diff --git a/exllamav3/model/model_tp_backend.py b/exllamav3/model/model_tp_backend.py
+index 25aad90a..9826f973 100644
+--- a/exllamav3/model/model_tp_backend.py
++++ b/exllamav3/model/model_tp_backend.py
+@@ -82,14 +82,17 @@ class TPBackendNCCL:
+         master: bool,
+         uuid: str,
+         shbuf_size: int = SHBUF_SIZE,
++        rank: int | None = None,
++        world_size: int | None = None,
++        cross_host: bool = False,
+     ):
+         """
+         NCCL-backed tensor-parallel communication backend.
+ 
+         CUDA worker processes join a torch.distributed NCCL process group for barriers and all-reduce operations.
+-        The CPU helper process skips NCCL initialization. Operations not currently implemented directly with NCCL,
+-        such as broadcast and gather variants, delegate to a native shared-memory fallback backend so the rest of
+-        the TP code can use one backend interface.
++        The CPU helper process skips NCCL initialization. In single-host mode, broadcast and gather variants
++        delegate to a native shared-memory fallback backend. In cross-host mode, rank and world_size are explicit
++        global TP ranks, all collectives use torch.distributed, and no host-local shared memory is created.
+         """
+         self.device = device
+         if device < 0:
+@@ -97,8 +100,20 @@ class TPBackendNCCL:
+             return
+ 
+         self.active_devices = active_devices
+-        self.world_size = len(active_devices)
+-        self.rank = active_devices.index(device)
++        self.cross_host = cross_host
++        self.fallback = None
++        if cross_host:
++            if rank is None or world_size is None:
++                raise ValueError("Cross-host NCCL requires explicit rank and world_size")
++            if not 0 <= rank < world_size:
++                raise ValueError(f"Invalid TP rank {rank} for world_size {world_size}")
++            self.rank = rank
++            self.world_size = world_size
++        else:
++            if rank is not None or world_size is not None:
++                raise ValueError("rank/world_size overrides are only valid in cross-host mode")
++            self.world_size = len(active_devices)
++            self.rank = active_devices.index(device)
+ 
+         log_tp(device, f"NCCL init: world_size {self.world_size}, rank {self.rank}, device {device}, init_method {init_method}")
+         print(f" -- NCCL init: world_size {self.world_size}, rank {self.rank}, device {device}, init_method {init_method}")
+@@ -109,15 +124,16 @@ class TPBackendNCCL:
+             init_method = init_method,
+         )
+         self.mp_warmup_nccl(device)
+-        self.fallback = TPBackendNative(
+-            device,
+-            active_devices,
+-            output_device,
+-            init_method,
+-            master,
+-            uuid,
+-            shbuf_size
+-        )
++        if not cross_host:
++            self.fallback = TPBackendNative(
++                device,
++                active_devices,
++                output_device,
++                init_method,
++                master,
++                uuid,
++                shbuf_size
++            )
+ 
+ 
+     def mp_warmup_nccl(self, device):
+@@ -138,7 +154,8 @@ class TPBackendNCCL:
+             return
+ 
+         dist.barrier()
+-        self.fallback.close()
++        if self.fallback is not None:
++            self.fallback.close()
+         dist.destroy_process_group()
+ 
+ 
+@@ -147,9 +164,11 @@ class TPBackendNCCL:
+ 
+ 
+     def broadcast(self, tensor: torch.Tensor, src_device: int):
+-        self.fallback.broadcast(tensor, src_device)
+-        # src_rank = self.active_devices.index(src_device)
+-        # dist.broadcast(tensor, src = src_rank)
++        if self.cross_host:
++            # In cross-host mode device identities passed through the TP plan are global ranks.
++            dist.broadcast(tensor, src = src_device)
++        else:
++            self.fallback.broadcast(tensor, src_device)
+ 
+ 
+     def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
+@@ -164,6 +183,38 @@ class TPBackendNCCL:
+             dist.all_reduce(tensor, async_op = False)
+ 
+ 
++    def _gather_cross_host(
++        self,
++        tensor: torch.Tensor,
++        out_tensor: torch.Tensor | None,
++        gather_devices: list[int],
++        out_device: int,
++        ldims: list[int]
++    ):
++        """Gather last-dimension slices to one global rank with ordered NCCL send/recv."""
++        assert len(gather_devices) == len(ldims)
++        dst_rank = out_device
++        if self.rank == dst_rank:
++            assert out_tensor is not None, "Gather output rank must supply an output tensor"
++            assert out_tensor.shape[-1] == sum(ldims)
++            offset = 0
++            for src_rank, ldim in zip(gather_devices, ldims):
++                if ldim == 0:
++                    continue
++                out_slice = out_tensor[..., offset : offset + ldim]
++                offset += ldim
++                if src_rank == self.rank:
++                    assert tensor.shape[-1] == ldim
++                    out_slice.copy_(tensor)
++                else:
++                    # Last-dimension slicing can be non-contiguous; NCCL p2p uses a contiguous staging buffer.
++                    rbuf = torch.empty_like(out_slice, memory_format = torch.contiguous_format)
++                    dist.recv(rbuf, src = src_rank)
++                    out_slice.copy_(rbuf)
++        elif self.rank in gather_devices and tensor.shape[-1] > 0:
++            dist.send(tensor if tensor.is_contiguous() else tensor.contiguous(), dst = dst_rank)
++
++
+     def gather(
+         self,
+         tensor: torch.Tensor,
+@@ -172,31 +223,10 @@ class TPBackendNCCL:
+         out_device: int,
+         ldims: list[int]
+     ):
+-        self.fallback.gather(tensor, out_tensor, gather_devices, out_device, ldims)
+-
+-        # dst_rank = self.active_devices.index(out_device)
+-        # d_ldims = [0] * (max(self.active_devices) + 1)
+-        # for d, m in zip(gather_devices, ldims):
+-        #     d_ldims[d] = m
+-        # ldims = [d_ldims[d] for d in self.active_devices]
+-        #
+-        # if self.rank == dst_rank:
+-        #     od = 0
+-        #     for src, ldim in enumerate(ldims):
+-        #         if ldim == 0:
+-        #             continue
+-        #         out_slice = out_tensor[..., od : od + ldim]
+-        #         od += ldim
+-        #         if src == self.rank:
+-        #             out_slice.copy(tensor)
+-        #         else:
+-        #             # print(f"rank {self.rank} recv {out_slice.shape[-1]} from {src}")
+-        #             rbuf = torch.empty_like(out_slice)
+-        #             dist.recv(rbuf, src = src)
+-        #             out_slice.copy_(rbuf)
+-        # elif tensor.shape[-1] > 0:
+-        #     # print(f"rank {self.rank} send {tensor.shape[-1]} to {dst_rank}")
+-        #     dist.send(tensor, dst = dst_rank)
++        if self.cross_host:
++            self._gather_cross_host(tensor, out_tensor, gather_devices, out_device, ldims)
++        else:
++            self.fallback.gather(tensor, out_tensor, gather_devices, out_device, ldims)
+ 
+ 
+     def gather_small(
+@@ -207,7 +237,10 @@ class TPBackendNCCL:
+         out_device: int,
+         ldims: list[int]
+     ):
+-        self.fallback.gather_small(tensor, out_tensor, gather_devices, out_device, ldims)
++        if self.cross_host:
++            self._gather_cross_host(tensor, out_tensor, gather_devices, out_device, ldims)
++        else:
++            self.fallback.gather_small(tensor, out_tensor, gather_devices, out_device, ldims)
+ 
+ 
+     def run_cpu_reduce_jobs(self):
+-- 
+2.54.0
+

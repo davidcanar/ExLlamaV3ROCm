@@ -1,0 +1,378 @@
+From 0e259659f09b47c79c04ac9157af284cc70a1604 Mon Sep 17 00:00:00 2001
+From: davidcanar <davidcanar@localhost>
+Date: Wed, 28 Oct 2026 12:58:16 -0600
+Subject: [PATCH 7/7] TP cross-host: read back recurrent wshift from the
+ non-output rank worker
+
+A cross-host non-output rank runs every pass on a real child worker whose
+pickled copy of the exported recurrent states is where the DSV4/SWA ring
+shift (wshift) is written; restore_tp_params() only saw the driver-side
+exports, so the shift was dropped, window_beg never advanced, and ring
+addressing went stale once position outgrew the ring (~750 tokens on
+DS4.1: window 128 + 2*256 slack = 768 ring rows). mp_model_forward now
+returns the walk wshifts as the pass result on those ranks, and
+forward_tp/prefill_tp fetch that tiny result synchronously and copy it
+onto the driver exports before restore_tp_params(), so post_advance()
+advances window_beg exactly like on the output rank. Output-rank,
+single-host, warmup and single-module paths unchanged (tests/tp).
+---
+ exllamav3/model/model_tp.py         |  36 +++++
+ exllamav3/model/model_tp_fn.py      |  30 +++-
+ tests/tp/test_tp_wshift_readback.py | 234 ++++++++++++++++++++++++++++
+ 3 files changed, 298 insertions(+), 2 deletions(-)
+ create mode 100644 tests/tp/test_tp_wshift_readback.py
+
+diff --git a/exllamav3/model/model_tp.py b/exllamav3/model/model_tp.py
+index d930afa0..6551deaf 100644
+--- a/exllamav3/model/model_tp.py
++++ b/exllamav3/model/model_tp.py
+@@ -738,6 +738,36 @@ class Model_TPMixin:
+                     orig.tp_readback(exp)
+ 
+ 
++    def tp_apply_local_wshifts(self, params: dict, warmup: bool = False):
++        """Cross-host, non-output rank only: fetch this host's worker result for the pass that
++        just ran and copy its recurrent wshift metadata onto the driver's exported states.
++
++        The DSV4/SWA ring shift a pass decides is written into the exported recurrent-state
++        handle the walk sees. On the output rank that handle is the driver's own object (the
++        pseudo worker shares this process), so restore_tp_params() already transfers the shift.
++        A non-output cross-host rank instead walked on a real child worker holding a pickled
++        copy, and without this readback the shift was lost -- window_beg never advanced, and the
++        ring addressing went stale once position outgrew the ring (~750 tokens on DS4.1), which
++        is why cross-host serving was capped there.
++
++        The result is tiny (a list of ints) and consumed synchronously, so the local rank's ack
++        never joins the deferred tp_pending_acks; the output rank's exports are untouched (the
++        pseudo worker already mutated them), and single-host drivers never enter this path.
++        restore_tp_params() then moves the shift onto the real states, and the caller's
++        advance_recurrent_states()/post_advance() applies it to window_beg."""
++        if warmup or not self.tp_cross_host or self.tp_rank == self.tp_output_device:
++            return
++        payload = self.tp_worker_result(self.tp_rank)
++        assert isinstance(payload, dict) and "recurrent_wshifts" in payload, "TP logic error"
++        if self.tp_rank in self.tp_pending_acks:
++            self.tp_pending_acks.remove(self.tp_rank)
++        exported_rs = params.get("recurrent_states")
++        if exported_rs is not None:
++            for exp, wshift in zip(exported_rs, payload["recurrent_wshifts"]):
++                if exp is not None and wshift is not None and hasattr(exp, "wshift"):
++                    exp.wshift = wshift
++
++
+     def prefill_tp(
+         self,
+         x: torch.Tensor,
+@@ -767,6 +797,9 @@ class Model_TPMixin:
+             assert r is None, "TP logic error"
+         self.tp_pending_acks = [d for d in self.tp_localize_devices(self.active_devices) if d != self.tp_output_device]
+         self.tp_pending_acks.append(-1)
++        # Non-output cross-host rank: apply this host's worker result (its recurrent wshift)
++        # before the readback below hands the exports' fields to the real states
++        self.tp_apply_local_wshifts(params)
+         # See forward_tp: the exported recurrent-state handles must outlive the deferred acks
+         self.tp_pending_refs = (args, params.get("recurrent_states"))
+         self.restore_tp_params(params, reserve)
+@@ -808,6 +841,9 @@ class Model_TPMixin:
+         self.tp_pending_acks = [d for d in self.tp_localize_devices(self.active_devices) if d != self.tp_output_device]
+         if not warmup:
+             self.tp_pending_acks.append(-1)
++        # Non-output cross-host rank: apply this host's worker result (its recurrent wshift)
++        # before the readback below hands the exports' fields to the real states
++        self.tp_apply_local_wshifts(params, warmup)
+         # Pin the exported recurrent-state handles too: restore_tp_params swaps them out of the
+         # params dict in place, so holding args alone would not keep their shared storages alive
+         self.tp_pending_refs = (args, params.get("recurrent_states"))
+diff --git a/exllamav3/model/model_tp_fn.py b/exllamav3/model/model_tp_fn.py
+index 3a2bdddc..206873e9 100644
+--- a/exllamav3/model/model_tp_fn.py
++++ b/exllamav3/model/model_tp_fn.py
+@@ -240,6 +240,31 @@ def mp_model_append_gather(local_context: dict):
+     return None
+ 
+ 
++def recurrent_wshift_readback(params: dict) -> list:
++    """Ring shifts (wshift) this worker's copy of the exported recurrent states accumulated
++    during a forward pass. On a cross-host non-output rank the pass runs on a real child
++    worker against its own pickled exports, so the shifts it writes are invisible to the
++    driver's copies; forward_tp()/prefill_tp() read this list back through the pipe and copy
++    it onto the driver's exports before restore_tp_params() transfers it to the real states.
++    The output rank needs none of this: its pseudo worker shares the driver's exports."""
++    rs = params.get("recurrent_states")
++    if not rs:
++        return []
++    return [getattr(r, "wshift", None) if r is not None else None for r in rs]
++
++
++def _wshift_readback_result(local_context: dict, params: dict, warmup: bool, single_idx) -> dict | None:
++    """Result frame a cross-host non-output worker returns instead of the (always None) residual:
++    the recurrent wshift metadata its driver must apply. None everywhere else (output rank,
++    single-host children, warmup, single-module walks) keeps those paths byte for byte as they
++    were."""
++    if (warmup or single_idx is not None
++            or not local_context.get("cross_host")
++            or local_context["rank"] == local_context["output_rank"]):
++        return None
++    return {"recurrent_wshifts": recurrent_wshift_readback(params)}
++
++
+ def mp_model_forward(
+     local_context: dict,
+     shared_input: dict,
+@@ -314,10 +339,11 @@ def mp_model_forward(
+         if prefill and idx == last_kv_module_idx:
+             backend.end_cpu_reduce_jobs()
+             del params["prefill"]
+-            return None
++            return _wshift_readback_result(local_context, params, warmup, single_idx)
+ 
+     backend.end_cpu_reduce_jobs()
+-    return x
++    readback = _wshift_readback_result(local_context, params, warmup, single_idx)
++    return readback if readback is not None else x
+ 
+ 
+ def mp_model_forward_embedding(
+diff --git a/tests/tp/test_tp_wshift_readback.py b/tests/tp/test_tp_wshift_readback.py
+new file mode 100644
+index 00000000..b1e98ad0
+--- /dev/null
++++ b/tests/tp/test_tp_wshift_readback.py
+@@ -0,0 +1,234 @@
++"""Cross-host recurrent wshift readback.
++
++On a cross-host non-output rank the forward/prefill pass runs on a real child worker against a
++pickled copy of the exported recurrent states; the ring shifts (wshift) the walk writes there
++used to be lost, so the driver's DSV4/SWA states never advanced window_beg and the ring
++addressing went stale once position outgrew the ring (~750 tokens on DS4.1). These tests pin
++the fix: the worker returns its wshifts as the pass result, and forward_tp()/prefill_tp() on a
++non-output cross-host driver fetch that result synchronously and copy the shifts onto the
++driver's exports before restore_tp_params() hands them to the real states. Output-rank,
++single-host, warmup and single-module paths must stay exactly as they were.
++"""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from exllamav3.model import model_tp_fn
++from exllamav3.model.model_tp import Model_TPMixin
++from exllamav3.model.model_tp_backend import TPBackendNull
++from exllamav3.model.model_tp_fn import mp_model_forward, recurrent_wshift_readback
++
++pytestmark = pytest.mark.nogpu
++
++
++# ---- fakes -----------------------------------------------------------------------------------------------------------
++
++
++class FakeWalkModule:
++    """Stand-in for an imported TP module shard: writes a fixed wshift into every exported
++    recurrent state it sees, the way the DSA ring update does."""
++    key = "fake"
++    caps = {}
++
++    def __init__(self, shift: int = 0):
++        self.shift = shift
++
++    def prefetch(self, x, params):
++        pass
++
++    def prepare_for_device(self, x, params):
++        return x
++
++    def forward(self, x, params):
++        for rs in params.get("recurrent_states") or []:
++            if rs is not None:
++                rs.wshift = self.shift
++        return x
++
++
++class FakeConsumer:
++    def recv(self, p, cuda: bool = False):
++        return p
++
++
++def child_context(rank: int, output_rank: int, cross_host: bool, modules) -> dict:
++    return {
++        "device": 0,
++        "rank": rank,
++        "output_rank": output_rank,
++        "cross_host": cross_host,
++        "modules": modules,
++        "inf_consumer": FakeConsumer(),
++        "backend": TPBackendNull(),
++    }
++
++
++def exported(wshift: int = 0) -> SimpleNamespace:
++    return SimpleNamespace(cache = 1, slot = 0, position = 0, window_beg = 0, wshift = wshift)
++
++
++class FakeState:
++    """Real-state stand-in: exports a plain handle, readback copies the handle's wshift."""
++    def __init__(self):
++        self.wshift = 0
++        self.readback = None
++
++    def tp_export(self):
++        return exported()
++
++    def tp_readback(self, exp):
++        self.readback = exp.wshift
++
++
++class FakeProducer:
++    def clear(self):
++        pass
++
++    def send(self, x):
++        return x
++
++
++class FakePipe:
++    def __init__(self):
++        self.sent = []
++
++    def send_bytes(self, msg):
++        self.sent.append(msg)
++
++
++class FakeDriver(Model_TPMixin):
++    """Just enough of the TP driver to run the real forward_tp/prefill_tp bodies: dispatch and
++    result plumbing are recorded instead of touching processes or CUDA."""
++    def __init__(self, *, cross_host: bool, rank: int, output_device: int, active_devices):
++        Model_TPMixin.__init__(self)
++        self.tp_cross_host = cross_host
++        self.tp_rank = rank
++        self.tp_output_device = output_device
++        self.active_devices = active_devices
++        self.mp_parent_conn = {d: FakePipe() for d in active_devices if d != output_device or cross_host}
++        self.tp_producer = FakeProducer()
++        self.results = {}
++        self.dispatched = []
++
++    def tp_worker_dispatch(self, device, fn, args):
++        self.dispatched.append((device, fn))
++
++    def tp_worker_result(self, device):
++        return self.results.pop(device)
++
++
++# ---- worker side: the pass result carries the wshifts ---------------------------------------------------------------
++
++
++def test_readback_helper_collects_wshifts_and_nones():
++    params = {"recurrent_states": [exported(256), None, exported(0)]}
++    assert recurrent_wshift_readback(params) == [256, None, 0]
++    assert recurrent_wshift_readback({}) == []
++
++
++def test_forward_returns_wshifts_on_cross_host_non_output_rank():
++    exp = exported()
++    params = {"recurrent_states": [exp]}
++    ctx = child_context(rank = 1, output_rank = 0, cross_host = True, modules = [FakeWalkModule(shift = 256)])
++    x = torch.zeros(1, 1, 4)
++    out = mp_model_forward(ctx, x, params, last_kv_module_idx = 99, prefill = False, single_idx = None)
++    assert out == {"recurrent_wshifts": [256]}
++    assert exp.wshift == 256
++
++
++def test_prefill_stop_returns_wshifts_on_cross_host_non_output_rank():
++    exp = exported()
++    params = {"recurrent_states": [exp]}
++    modules = [FakeWalkModule(shift = 512), FakeWalkModule(shift = 512), FakeWalkModule(shift = 512)]
++    ctx = child_context(rank = 1, output_rank = 0, cross_host = True, modules = modules)
++    out = mp_model_forward(ctx, torch.zeros(1, 1, 4), params, last_kv_module_idx = 1, prefill = True, single_idx = None)
++    assert out == {"recurrent_wshifts": [512]}
++    assert "prefill" not in params
++
++
++def test_output_rank_and_single_host_and_warmup_paths_unchanged():
++    x = torch.zeros(1, 1, 4)
++    # single-host child
++    ctx = child_context(rank = 1, output_rank = 1, cross_host = False, modules = [FakeWalkModule(shift = 256)])
++    assert mp_model_forward(ctx, x, {"recurrent_states": [exported()]}, 99, False, None) is x
++    # cross-host output rank (the pseudo worker in the driver's process)
++    ctx = child_context(rank = 0, output_rank = 0, cross_host = True, modules = [FakeWalkModule(shift = 256)])
++    assert mp_model_forward(ctx, x, {"recurrent_states": [exported()]}, 99, False, None) is x
++    # warmup, cross-host non-output
++    ctx = child_context(rank = 1, output_rank = 0, cross_host = True, modules = [FakeWalkModule(shift = 256)])
++    assert mp_model_forward(ctx, x, {"tp_warmup": True, "recurrent_states": [exported()]}, 99, False, None) is x
++    # single-module walk
++    assert mp_model_forward(ctx, x, {"recurrent_states": [exported()]}, 99, False, 0) is x
++
++
++# ---- driver side: forward_tp / prefill_tp apply the local worker's wshifts ------------------------------------------
++
++
++def run_forward(driver: Model_TPMixin, params: dict, prefill: bool):
++    x = torch.zeros(1, 1, 4)
++    if prefill:
++        return driver.prefill_tp(x, params, 99, [])
++    return driver.forward_tp(x, params, 99, [])
++
++
++@pytest.mark.parametrize("prefill", [False, True])
++def test_non_output_cross_host_driver_applies_local_wshifts(prefill):
++    driver = FakeDriver(cross_host = True, rank = 1, output_device = 0, active_devices = [0, 1])
++    orig = FakeState()
++    params = {"recurrent_states": [orig]}
++    # what the real child worker on this host would answer: the pass result of mp_model_forward
++    child_ctx = child_context(1, 0, True, [FakeWalkModule(shift = 768)])
++    child_params = {"recurrent_states": [orig.tp_export()]}
++    driver.results[1] = mp_model_forward(child_ctx, torch.zeros(1, 1, 4), child_params, 99, prefill, None)
++
++    out = run_forward(driver, params, prefill)
++    assert out is None
++    assert orig.readback == 768                    # reached the real state through tp_readback
++    assert params["recurrent_states"] == [orig]    # originals restored
++    assert driver.tp_pending_acks == [-1]          # local rank's ack consumed, CPU helper's left deferred
++    assert 1 not in driver.results                 # nothing left to drain for the local rank
++
++
++def test_non_output_cross_host_driver_requires_the_readback_frame():
++    driver = FakeDriver(cross_host = True, rank = 1, output_device = 0, active_devices = [0, 1])
++    driver.results[1] = None                       # a stale/None ack would mean lost wshifts
++    with pytest.raises(AssertionError):
++        run_forward(driver, {"recurrent_states": [FakeState()]}, prefill = False)
++
++
++def test_output_rank_and_single_host_drivers_defer_as_before():
++    # cross-host output rank: result comes from the inline pseudo worker, readback path untouched
++    driver = FakeDriver(cross_host = True, rank = 0, output_device = 0, active_devices = [0, 1])
++    logits = torch.zeros(1, 1, 8)
++    driver.results[0] = logits
++    orig = FakeState()
++    out = run_forward(driver, {"recurrent_states": [orig]}, prefill = False)
++    assert out is logits
++    assert orig.readback == 0                     # export untouched (no remote worker applied anything)
++    assert driver.tp_pending_acks == [-1]         # rank 1 is remote on cross-host: only the CPU helper defers
++
++    # single-host driver: child acks stay deferred, nothing is fetched synchronously
++    driver = FakeDriver(cross_host = False, rank = 0, output_device = 0, active_devices = [0, 1])
++    driver.results[0] = logits
++    driver.results[1] = None
++    orig = FakeState()
++    out = run_forward(driver, {"recurrent_states": [orig]}, prefill = False)
++    assert out is logits
++    assert orig.readback == 0
++    assert driver.tp_pending_acks == [1, -1]
++    assert 1 in driver.results
++
++
++def test_warmup_pass_on_non_output_rank_stays_deferred():
++    driver = FakeDriver(cross_host = True, rank = 1, output_device = 0, active_devices = [0, 1])
++    driver.results[1] = None
++    orig = FakeState()
++    x = torch.zeros(1, 1, 4)
++    out = driver.forward_tp(x, {"tp_warmup": True, "recurrent_states": [orig]}, 99, [])
++    assert out is None
++    assert orig.readback == 0                      # warmup export untouched
++    assert driver.tp_pending_acks == [1]           # no CPU helper dispatch on warmup, ack still deferred
++    assert 1 in driver.results
++    assert all(dev != -1 for dev, _ in driver.dispatched)
+-- 
+2.54.0
+

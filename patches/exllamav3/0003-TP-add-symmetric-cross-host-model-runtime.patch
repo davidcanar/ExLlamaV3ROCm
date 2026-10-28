@@ -1,0 +1,718 @@
+From dbf2076c179fb2a05c04dd93300ca011cc2dac4f Mon Sep 17 00:00:00 2001
+From: David Canar <davidcanar@gmail.com>
+Date: Wed, 28 Oct 2026 01:41:06 -0600
+Subject: [PATCH 3/7] TP: add symmetric cross-host model runtime
+
+---
+ exllamav3/generator/disk_cache.py   |   3 +
+ exllamav3/model/model_tp.py         | 150 ++++++++++++++++++++--------
+ exllamav3/model/model_tp_backend.py |  78 ++++++++++++++-
+ exllamav3/model/model_tp_fn.py      |  21 +++-
+ exllamav3/modules/gather.py         |  19 +++-
+ tests/tp/test_tp_rank_identity.py   |  14 ++-
+ 6 files changed, 234 insertions(+), 51 deletions(-)
+
+diff --git a/exllamav3/generator/disk_cache.py b/exllamav3/generator/disk_cache.py
+index cb60d8a0..1dcfabea 100644
+--- a/exllamav3/generator/disk_cache.py
++++ b/exllamav3/generator/disk_cache.py
+@@ -231,6 +231,9 @@ class DiskPageCache:
+             Minimum spacing, in tokens, between the recurrent checkpoints kept along any root-to-leaf chain of
+             pages on disk; closer ones are pruned at idle (see prune_states). 0 keeps every checkpoint
+         """
++        for model, _cache_ids in cpu_tier.tp_groups:
++            if getattr(model, "tp_cross_host", False):
++                raise NotImplementedError("Disk cache tiers are not supported for cross-host TP")
+         self.cpu_tier = cpu_tier
+         self.root_dir = root_dir
+         self.root_size = int(max_size)
+diff --git a/exllamav3/model/model_tp.py b/exllamav3/model/model_tp.py
+index e42314fb..d930afa0 100644
+--- a/exllamav3/model/model_tp.py
++++ b/exllamav3/model/model_tp.py
+@@ -17,7 +17,7 @@ from ..util import log_tp, global_t0
+ from ..tokenizer.mm_embedding import send_embeddings
+ 
+ cleanupper = Cleanupper()
+-DISPATCH_TIMEOUT = 20
++DISPATCH_TIMEOUT = float(os.environ.get("EXL3_TP_DISPATCH_TIMEOUT", "20"))
+ 
+ class Model_TPMixin:
+ 
+@@ -36,6 +36,17 @@ class Model_TPMixin:
+         # command yet when forward_tp returns
+         self.tp_pending_acks = []
+         self.tp_pending_refs = None
++        self.tp_cross_host = False
++        self.tp_rank = None
++        self.tp_world_size = None
++        self.tp_local_cuda_device = None
++
++    def tp_localize_devices(self, devices):
++        """Limit command dispatch to workers hosted by this driver in cross-host mode."""
++        if not self.tp_cross_host:
++            return devices
++        return [device for device in devices if device == self.tp_rank]
++
+ 
+     def create_tp_context(self, tp_backend: str):
+         """
+@@ -70,6 +81,11 @@ class Model_TPMixin:
+                     "type": tp_backend,
+                     "init_method": f"tcp://{master_addr}:{master_port}",
+                     "uuid": uuid.uuid4().hex,
++                    "cross_host": self.tp_cross_host,
++                    "rank": self.tp_rank,
++                    "world_size": self.tp_world_size,
++                    "output_rank": self.tp_output_device,
++                    "ranks": self.active_devices,
+                 }
+             case "native":
+                 backend_args = {
+@@ -80,7 +96,8 @@ class Model_TPMixin:
+             case _:
+                 raise ValueError(f"Unkwown backend type: {tp_backend}")
+ 
+-        # Spawn child processes, each running the mp_model_worker function
++        # Slots are global rank IDs in cross-host mode, but only this node's worker is spawned.
++        # The CUDA ordinal remains host-local and is never used as a cross-host plan key.
+         num_devices = max(self.active_devices) + 1
+         assert not self.mp_children
+         assert not self.mp_parent_conn
+@@ -90,10 +107,15 @@ class Model_TPMixin:
+         self.mp_child_conn: list = [None] * (num_devices + 1)
+         self.tp_producer = SMProducer(buffer_size = 64 * 1024**2)
+ 
+-        for rank, device in enumerate(self.active_devices + [-1]):
+-            log_tp(None, f"Spawning child process: {device}")
+-            if self.tp_output_device == device:
+-                self.mp_parent_conn[device] = PseudoParentConn(
++        if self.tp_cross_host:
++            worker_specs = [(self.tp_rank, self.tp_local_cuda_device), (-1, -1)]
++        else:
++            worker_specs = [(device, device) for device in self.active_devices] + [(-1, -1)]
++
++        for slot, device in worker_specs:
++            log_tp(None, f"Spawning child process: slot {slot}, CUDA device {device}")
++            if self.tp_output_device == slot:
++                self.mp_parent_conn[slot] = PseudoParentConn(
+                     device,
+                     self.active_devices,
+                     self.tp_output_device,
+@@ -101,13 +123,13 @@ class Model_TPMixin:
+                     self.tp_producer,
+                     global_t0
+                 )
+-                self.mp_child_conn[device] = PseudoChildConn()
+-                self.mp_children[device] = PseudoChild()
++                self.mp_child_conn[slot] = PseudoChildConn()
++                self.mp_children[slot] = PseudoChild()
+             else:
+-                self.mp_parent_conn[device], self.mp_child_conn[device] = Pipe()
+-                self.mp_children[device] = Process(
++                self.mp_parent_conn[slot], self.mp_child_conn[slot] = Pipe()
++                self.mp_children[slot] = Process(
+                     target = mp_model_worker, args = (
+-                        self.mp_child_conn[device],
++                        self.mp_child_conn[slot],
+                         device,
+                         self.active_devices,
+                         self.tp_output_device,
+@@ -116,7 +138,7 @@ class Model_TPMixin:
+                         global_t0
+                     )
+                 )
+-                self.mp_children[device].start()
++                self.mp_children[slot].start()
+ 
+         # Install exit hook to avoid child processes hanging if main process exits before unloading model
+         cleanupper.register_atexit(self.destroy_tp_context)
+@@ -149,8 +171,10 @@ class Model_TPMixin:
+                     log_tp(device, f"Exception while closing backend, device {device}")
+                     pass
+ 
+-        # Destroy process group in main process. Called last since it blocks the main process
+-        self.mp_parent_conn[self.tp_output_device].quit()
++        # Destroy the in-process output worker, if it is hosted by this driver. Other nodes already
++        # received "quit" above and meet this worker in the distributed backend close barrier.
++        if not self.tp_cross_host or self.tp_rank == self.tp_output_device:
++            self.mp_parent_conn[self.tp_output_device].quit()
+ 
+         # Join child processes (terminate if hung), close connections
+         for device, (parent_conn, child_conn, child) in \
+@@ -158,7 +182,7 @@ class Model_TPMixin:
+             if device == self.tp_output_device or child is None:
+                 continue
+             log_tp(None, f"Attempting to destroy child, device {device}")
+-            child.join(timeout = 2)
++            child.join(timeout = DISPATCH_TIMEOUT if self.tp_cross_host else 2)
+             if child.is_alive():
+                 log_tp(None, f"Terminating child, device {device}")
+                 child.terminate()
+@@ -244,10 +268,11 @@ class Model_TPMixin:
+         can block on TP collectives; spawned workers must already have received the same command before that happens.
+         """
+         self.tp_drain_acks()
+-        for idx, device in enumerate(active_devices):
++        local_devices = self.tp_localize_devices(active_devices)
++        for idx, device in enumerate(local_devices):
+             d_args = args
+             if dev_args is not None:
+-                d_args = d_args + dev_args[idx]
++                d_args = d_args + dev_args[active_devices.index(device)]
+             conn = self.mp_parent_conn[device]
+             conn.send((fn, d_args))
+ 
+@@ -261,7 +286,7 @@ class Model_TPMixin:
+         early rendezvous point while child workers are still undispatched or unread.
+         """
+         r = []
+-        for device in active_devices:
++        for device in self.tp_localize_devices(active_devices):
+             r.append(self.tp_worker_result(device))
+         return r
+ 
+@@ -280,14 +305,15 @@ class Model_TPMixin:
+     def tp_cache_page_copy(self, cache_id: int, from_page: int, to_page: int, num_tokens: int):
+         # active_devices is ordered with the output-device pseudo-worker last, so all spawned workers receive the
+         # copy command before the main process enters the synchronous pseudo-worker call.
+-        for device in self.active_devices:
++        local_devices = self.tp_localize_devices(self.active_devices)
++        for device in local_devices:
+             self.tp_worker_dispatch(device, mp_cache_page_copy, (
+                 cache_id,
+                 from_page,
+                 to_page,
+                 num_tokens
+             ))
+-        for device in self.active_devices:
++        for device in local_devices:
+             self.tp_worker_result(device)
+ 
+ 
+@@ -296,6 +322,8 @@ class Model_TPMixin:
+         Size of one whole cache page across every rank, in bytes, allocating each rank's slot pool if max_slots
+         is given. Called once with max_slots = 0 to size a slot, then again once the budget is divided up.
+         """
++        if self.tp_cross_host:
++            raise NotImplementedError("Cross-host CPU page-cache tiers require a negotiated global slot count")
+         sizes = self.tp_worker_dispatch_wait_multi(
+             self.active_devices,
+             mp_cpu_cache_init,
+@@ -326,9 +354,10 @@ class Model_TPMixin:
+         process, this order gives child workers a chance to enter any collective/barrier before the main process
+         does.
+         """
+-        for device in self.active_devices:
++        local_devices = self.tp_localize_devices(self.active_devices)
++        for device in local_devices:
+             self.tp_worker_dispatch(device, func, args)
+-        for device in self.active_devices:
++        for device in local_devices:
+             self.tp_worker_result(device)
+ 
+ 
+@@ -336,6 +365,8 @@ class Model_TPMixin:
+         """
+         Run a worker function only on the TP output device and return its result.
+         """
++        if self.tp_cross_host and self.tp_rank != self.tp_output_device:
++            return None
+         self.tp_worker_dispatch(self.tp_output_device, func, args)
+         r = self.tp_worker_result(self.tp_output_device)
+         return r
+@@ -361,6 +392,8 @@ class Model_TPMixin:
+                 ad[device] = a
+ 
+         if len(ad) == 1 and self.tp_output_device in ad:
++            if self.tp_cross_host and self.tp_rank != self.tp_output_device:
++                return None
+             v, i = self.tp_worker_dispatch_single(
+                 self.tp_output_device,
+                 mp_model_forward_lm_head_argmax,
+@@ -372,7 +405,7 @@ class Model_TPMixin:
+         ldims = [1 if d in ad else 0 for d in gd]
+ 
+         dispatched = []
+-        for device in self.active_devices:
++        for device in self.tp_localize_devices(self.active_devices):
+             if device in gd:
+                 self.tp_worker_dispatch(
+                     device,
+@@ -387,6 +420,8 @@ class Model_TPMixin:
+             if r is not None:
+                 results.append((device, r))
+ 
++        if self.tp_cross_host and self.tp_rank != self.tp_output_device:
++            return None
+         assert len(results) == 1 and results[0][0] == self.tp_output_device, \
+             "TP logic error"
+ 
+@@ -428,6 +463,8 @@ class Model_TPMixin:
+         vocab = self.config.vocab_size
+ 
+         if len(ad) == 1 and self.tp_output_device in ad:
++            if self.tp_cross_host and self.tp_rank != self.tp_output_device:
++                return None
+             return self.tp_worker_dispatch_single(
+                 self.tp_output_device,
+                 mp_model_forward_lm_head_topk,
+@@ -438,7 +475,7 @@ class Model_TPMixin:
+         ldims = [top_k if d in ad else 0 for d in gd]
+ 
+         dispatched = []
+-        for device in self.active_devices:
++        for device in self.tp_localize_devices(self.active_devices):
+             if device in gd:
+                 self.tp_worker_dispatch(
+                     device,
+@@ -452,6 +489,8 @@ class Model_TPMixin:
+             r = self.tp_worker_result(device)
+             if device == self.tp_output_device:
+                 out = r
++        if self.tp_cross_host and self.tp_rank != self.tp_output_device:
++            return None
+         assert out is not None, "TP logic error"
+         all_v, all_i = out
+         v, idx = torch.topk(all_v, top_k, dim = -1, sorted = False)
+@@ -505,23 +544,41 @@ class Model_TPMixin:
+         assert use_per_device is None or reserve_per_device is None
+         if dev_limits is None: dev_limits = {}
+ 
+-        # Set output device
++        node_rank = os.environ.get("EXL3_TP_NODE_RANK")
++        self.tp_cross_host = node_rank is not None
++        if self.tp_cross_host:
++            if tp_backend != "nccl":
++                raise ValueError("Cross-host TP currently requires the nccl backend")
++            self.tp_rank = int(node_rank)
++            self.tp_world_size = int(os.environ.get("EXL3_TP_WORLD_SIZE", "0"))
++            self.tp_local_cuda_device = int(os.environ.get("EXL3_TP_LOCAL_DEVICE", "0"))
++            if sorted(active_devices) != list(range(self.tp_world_size)):
++                raise ValueError("Cross-host TP active devices must be global ranks [0 .. world_size - 1]")
++            if not 0 <= self.tp_rank < self.tp_world_size:
++                raise ValueError(f"Invalid EXL3_TP_NODE_RANK {self.tp_rank} for world size {self.tp_world_size}")
++            if not 0 <= self.tp_local_cuda_device < torch.cuda.device_count():
++                raise ValueError(f"Invalid local CUDA device {self.tp_local_cuda_device}")
++            if "EXLLAMA_MASTER_ADDR" not in os.environ or "EXLLAMA_MASTER_PORT" not in os.environ:
++                raise ValueError("Cross-host TP requires explicit EXLLAMA_MASTER_ADDR and EXLLAMA_MASTER_PORT")
++            active_devices = list(range(self.tp_world_size))
++
++        # Set output device (a global rank in cross-host mode)
+         if tp_output_device is None:
+             tp_output_device = active_devices[0]
+         self.tp_output_device = torch.device(tp_output_device).index
+ 
+-        # Move output device to end of active device list. This device is the TP "master" running synchronously in
+-        # the main process via PseudoParentConn, so keeping it last prevents fan-out helpers from blocking in the
+-        # main process before child workers have received their commands.
+-        active_devices.remove(self.tp_output_device)
+-        active_devices.append(self.tp_output_device)
++        if not self.tp_cross_host:
++            # Keep the in-process output device last so fan-out reaches spawned workers first.
++            active_devices.remove(self.tp_output_device)
++            active_devices.append(self.tp_output_device)
+ 
+         # Fix a TP crash on gfx1100: a loading thread's first CUDA call, made mid-load,
+         # can hang the ROCm runtime (no PCIe atomics). Warm the thread's per-device state up front,
+         # leaving the current device as it was
+         torch.cuda.init()
+         current = torch.cuda.current_device()
+-        for d in active_devices:
++        warm_devices = [self.tp_local_cuda_device] if self.tp_cross_host else active_devices
++        for d in warm_devices:
+             torch.cuda.set_device(d)
+             w = torch.zeros(1, device = torch.device("cuda", d))
+             torch.cuda.synchronize(d)
+@@ -535,7 +592,15 @@ class Model_TPMixin:
+         # Split model
+         num_devices = max(self.active_devices) + 1
+         max_mem = [0] * num_devices
+-        free_total = self.tp_worker_dispatch_wait_multi(self.active_devices, touch_device_measure_vram, ())
++        if self.tp_cross_host:
++            local_free = self.tp_worker_dispatch_wait_multi(
++                self.tp_localize_devices(self.active_devices), touch_device_measure_vram, ()
++            )[0]
++            free_total = self.tp_worker_dispatch_single(
++                self.tp_rank, mp_allgather_vram, (local_free,)
++            )
++        else:
++            free_total = self.tp_worker_dispatch_wait_multi(self.active_devices, touch_device_measure_vram, ())
+         for device, (free, total) in zip(self.active_devices, free_total):
+             # print(free / 1024**3)  snip
+             if reserve_per_device is not None:
+@@ -566,7 +631,7 @@ class Model_TPMixin:
+             self.active_devices,
+             mp_set_consumer,
+             (),
+-            [(producer.export(),) if d != tp_output_device else (producer,) for d in active_devices]
++            [(producer.export(),) if d != self.tp_output_device else (producer,) for d in active_devices]
+         )
+ 
+         # Begin loading modules
+@@ -690,16 +755,17 @@ class Model_TPMixin:
+         # wire-identical) — per-rank pickling of the params dict was part of the dispatch stagger.
+         args = (x, params, last_kv_module_idx, True, None)
+         msg = ForkingPickler.dumps((mp_model_forward, args))
+-        for device in self.active_devices:
++        for device in self.tp_localize_devices(self.active_devices):
+             if device == self.tp_output_device:
+                 self.tp_worker_dispatch(device, mp_model_forward, args)
+             else:
+                 self.mp_parent_conn[device].send_bytes(msg)
+         # Same deferred-ack scheme as forward_tp: only the inline pseudo-worker's result is
+         # consumed here, child acks drain at the next dispatch
+-        r = self.tp_worker_result(self.tp_output_device)
+-        assert r is None, "TP logic error"
+-        self.tp_pending_acks = [d for d in self.active_devices if d != self.tp_output_device]
++        if not self.tp_cross_host or self.tp_rank == self.tp_output_device:
++            r = self.tp_worker_result(self.tp_output_device)
++            assert r is None, "TP logic error"
++        self.tp_pending_acks = [d for d in self.tp_localize_devices(self.active_devices) if d != self.tp_output_device]
+         self.tp_pending_acks.append(-1)
+         # See forward_tp: the exported recurrent-state handles must outlive the deferred acks
+         self.tp_pending_refs = (args, params.get("recurrent_states"))
+@@ -726,7 +792,7 @@ class Model_TPMixin:
+         # Shared pre-pickled command bytes for child ranks, as in prefill_tp
+         args = (x, params, last_kv_module_idx, False, None)
+         msg = ForkingPickler.dumps((mp_model_forward, args))
+-        for device in self.active_devices:
++        for device in self.tp_localize_devices(self.active_devices):
+             if device == self.tp_output_device:
+                 self.tp_worker_dispatch(device, mp_model_forward, args)
+             else:
+@@ -735,9 +801,11 @@ class Model_TPMixin:
+         # is already buffered. The child ranks' None acks (and the CPU helper's) are left in flight
+         # and drained at the next dispatch, letting the caller queue sampling work on the output
+         # device while the child processes finish their module walks
+-        out = self.tp_worker_result(self.tp_output_device)
+-        assert out is not None, "TP logic error"
+-        self.tp_pending_acks = [d for d in self.active_devices if d != self.tp_output_device]
++        out = None
++        if not self.tp_cross_host or self.tp_rank == self.tp_output_device:
++            out = self.tp_worker_result(self.tp_output_device)
++            assert out is not None, "TP logic error"
++        self.tp_pending_acks = [d for d in self.tp_localize_devices(self.active_devices) if d != self.tp_output_device]
+         if not warmup:
+             self.tp_pending_acks.append(-1)
+         # Pin the exported recurrent-state handles too: restore_tp_params swaps them out of the
+diff --git a/exllamav3/model/model_tp_backend.py b/exllamav3/model/model_tp_backend.py
+index 9826f973..5e991c7a 100644
+--- a/exllamav3/model/model_tp_backend.py
++++ b/exllamav3/model/model_tp_backend.py
+@@ -19,6 +19,9 @@ from ..util import log_tp
+ GLOBALS_SIZE = 128*1024
+ SHBUF_SIZE = 16 * 1024 ** 2
+ _nccl_fp32 = os.environ.get("EXL3_TP_NCCL_FP32", "0") != "0"
++_tp_trace = os.environ.get("EXL3_TP_TRACE_COLLECTIVES", "0") != "0"
++_nccl_sync = os.environ.get("EXL3_TP_NCCL_SYNC", "1") != "0"
++_gather_chunk_bytes = int(os.environ.get("EXL3_TP_GATHER_CHUNK_BYTES", str(64 * 1024 ** 2)))
+ # 17 slots (16 devices + accumulator) x 2MB: 8 ring stages of the 256KB reduce chunk size
+ SHBUF_SIZE_R = 17 * 8 * 256 * 1024
+ SHBUF_SIZE_S = 16 * 1024
+@@ -102,6 +105,7 @@ class TPBackendNCCL:
+         self.active_devices = active_devices
+         self.cross_host = cross_host
+         self.fallback = None
++        self.trace_seq = 0
+         if cross_host:
+             if rank is None or world_size is None:
+                 raise ValueError("Cross-host NCCL requires explicit rank and world_size")
+@@ -136,6 +140,16 @@ class TPBackendNCCL:
+             )
+ 
+ 
++    def _trace_collective(self, op: str, tensor: torch.Tensor, detail: str = ""):
++        if _tp_trace:
++            self.trace_seq += 1
++            print(
++                f"TP collective rank={self.rank} seq={self.trace_seq} op={op} "
++                f"shape={tuple(tensor.shape)} dtype={tensor.dtype} {detail}",
++                flush = True,
++            )
++
++
+     def mp_warmup_nccl(self, device):
+         """
+         NCCL does lazy initialization which causes the first reduction operation to take an exceedingly long time
+@@ -166,12 +180,17 @@ class TPBackendNCCL:
+     def broadcast(self, tensor: torch.Tensor, src_device: int):
+         if self.cross_host:
+             # In cross-host mode device identities passed through the TP plan are global ranks.
++            self._trace_collective("broadcast", tensor, f"src={src_device}")
+             dist.broadcast(tensor, src = src_device)
++            if _nccl_sync:
++                torch.cuda.synchronize(self.device)
+         else:
+             self.fallback.broadcast(tensor, src_device)
+ 
+ 
+     def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
++        if self.cross_host:
++            self._trace_collective("all_reduce", tensor, f"contribution={contribution}")
+         # fp32 payloads normally go over a bf16 wire like the native backend; EXL3_TP_NCCL_FP32=1
+         # reduces them in fp32 (A/B testing of the wire rounding)
+         if tensor.dtype == torch.float32 and not _nccl_fp32:
+@@ -181,6 +200,8 @@ class TPBackendNCCL:
+             tensor.copy_(temp)
+         else:
+             dist.all_reduce(tensor, async_op = False)
++        if self.cross_host and _nccl_sync:
++            torch.cuda.synchronize(self.device)
+ 
+ 
+     def _gather_cross_host(
+@@ -191,13 +212,48 @@ class TPBackendNCCL:
+         out_device: int,
+         ldims: list[int]
+     ):
+-        """Gather last-dimension slices to one global rank with ordered NCCL send/recv."""
++        """Gather last-dimension slices to one global rank with batched NCCL P2P operations."""
++        self._trace_collective("gather", tensor, f"out={out_device} ldims={ldims}")
+         assert len(gather_devices) == len(ldims)
+         dst_rank = out_device
++
++        if len(gather_devices) == self.world_size and set(gather_devices) == set(range(self.world_size)):
++            # RCCL P2P is unreliable for some shapes on gfx1151. Use a padded collective, chunked
++            # along leading rows so large-vocabulary prefill cannot create an unbounded second copy.
++            max_dim = max(ldims)
++            if max_dim == 0:
++                return
++            if self.rank == dst_rank:
++                assert out_tensor is not None, "Gather output rank must supply an output tensor"
++                assert out_tensor.shape[-1] == sum(ldims)
++                out_flat = out_tensor.reshape(-1, sum(ldims))
++            flat_tensor = tensor.reshape(-1, tensor.shape[-1])
++            rows_per_chunk = max(1, _gather_chunk_bytes // (max_dim * tensor.element_size()))
++            for row_start in range(0, flat_tensor.shape[0], rows_per_chunk):
++                row_end = min(row_start + rows_per_chunk, flat_tensor.shape[0])
++                source = flat_tensor[row_start:row_end]
++                padded = torch.zeros(
++                    (source.shape[0], max_dim), dtype = tensor.dtype, device = tensor.device
++                )
++                if source.shape[-1] > 0:
++                    padded[..., :source.shape[-1]].copy_(source)
++                gathered = [torch.empty_like(padded) for _ in range(self.world_size)]
++                dist.all_gather(gathered, padded)
++                if self.rank == dst_rank:
++                    out_slice = out_flat[row_start:row_end]
++                    offset = 0
++                    for src_rank, ldim in zip(gather_devices, ldims):
++                        if ldim > 0:
++                            out_slice[..., offset : offset + ldim].copy_(gathered[src_rank][..., :ldim])
++                            offset += ldim
++            return
++
+         if self.rank == dst_rank:
+             assert out_tensor is not None, "Gather output rank must supply an output tensor"
+             assert out_tensor.shape[-1] == sum(ldims)
+             offset = 0
++            receives = []
++            ops = []
+             for src_rank, ldim in zip(gather_devices, ldims):
+                 if ldim == 0:
+                     continue
+@@ -207,12 +263,20 @@ class TPBackendNCCL:
+                     assert tensor.shape[-1] == ldim
+                     out_slice.copy_(tensor)
+                 else:
+-                    # Last-dimension slicing can be non-contiguous; NCCL p2p uses a contiguous staging buffer.
++                    # Last-dimension slicing can be non-contiguous; NCCL P2P uses contiguous staging.
+                     rbuf = torch.empty_like(out_slice, memory_format = torch.contiguous_format)
+-                    dist.recv(rbuf, src = src_rank)
+-                    out_slice.copy_(rbuf)
++                    receives.append((rbuf, out_slice))
++                    ops.append(dist.P2POp(dist.irecv, rbuf, src_rank))
++            if ops:
++                for work in dist.batch_isend_irecv(ops):
++                    work.wait()
++            for rbuf, out_slice in receives:
++                out_slice.copy_(rbuf)
+         elif self.rank in gather_devices and tensor.shape[-1] > 0:
+-            dist.send(tensor if tensor.is_contiguous() else tensor.contiguous(), dst = dst_rank)
++            sendbuf = tensor if tensor.is_contiguous() else tensor.contiguous()
++            op = dist.P2POp(dist.isend, sendbuf, dst_rank)
++            for work in dist.batch_isend_irecv([op]):
++                work.wait()
+ 
+ 
+     def gather(
+@@ -225,6 +289,8 @@ class TPBackendNCCL:
+     ):
+         if self.cross_host:
+             self._gather_cross_host(tensor, out_tensor, gather_devices, out_device, ldims)
++            if _nccl_sync:
++                torch.cuda.synchronize(self.device)
+         else:
+             self.fallback.gather(tensor, out_tensor, gather_devices, out_device, ldims)
+ 
+@@ -239,6 +305,8 @@ class TPBackendNCCL:
+     ):
+         if self.cross_host:
+             self._gather_cross_host(tensor, out_tensor, gather_devices, out_device, ldims)
++            if _nccl_sync:
++                torch.cuda.synchronize(self.device)
+         else:
+             self.fallback.gather_small(tensor, out_tensor, gather_devices, out_device, ldims)
+ 
+diff --git a/exllamav3/model/model_tp_fn.py b/exllamav3/model/model_tp_fn.py
+index 4da8a63c..3a2bdddc 100644
+--- a/exllamav3/model/model_tp_fn.py
++++ b/exllamav3/model/model_tp_fn.py
+@@ -1,4 +1,5 @@
+ import torch
++import torch.distributed as dist
+ import traceback
+ import os
+ import signal
+@@ -13,6 +14,7 @@ from ..util import log_tp, set_t0
+ 
+ _no_fwd_barrier = os.environ.get("EXL3_TP_NO_FWD_BARRIER", "1") != "0"
+ _stream_hash_passes = int(os.environ.get("EXL3_TP_STREAM_HASH", "0") or "0")
++_trace_collectives = os.environ.get("EXL3_TP_TRACE_COLLECTIVES", "0") != "0"
+ 
+ 
+ from ..util.misc import install_parent_death_signal
+@@ -136,6 +138,15 @@ def mp_cpu_reduce(local_context: dict):
+     backend.run_cpu_reduce_jobs()
+ 
+ 
++def mp_allgather_vram(local_context: dict, local_free_total: tuple[int, int]):
++    """Return identical (free, total) memory budgets ordered by global rank on every host."""
++    assert local_context.get("cross_host")
++    value = torch.tensor(local_free_total, dtype = torch.int64, device = local_context["device"])
++    gathered = [torch.empty_like(value) for _ in range(local_context["world_size"])]
++    dist.all_gather(gathered, value)
++    return [(int(item[0]), int(item[1])) for item in gathered]
++
++
+ def mp_set_plan(local_context: dict, plan: dict, active_devices: list):
+     """
+     Used by TP loader, send (potentially large) plan dict once to avoid pickling with every message while loading
+@@ -194,7 +205,8 @@ def mp_model_append_gather(local_context: dict):
+     """
+     from ..modules.gather import OutputGather
+     modules = local_context["modules"]
+-    device = local_context["rank"] if local_context.get("cross_host") else local_context["device"]
++    device = local_context["device"]
++    rank = local_context["rank"] if local_context.get("cross_host") else None
+     plan = local_context["plan"]
+     active_devices = local_context["active_devices"]
+     output_device = local_context["output_device"]
+@@ -215,7 +227,14 @@ def mp_model_append_gather(local_context: dict):
+         output_device = output_device,
+         gather_devices = gather_devices,
+         ldims = ldims,
++        rank = rank,
+     )
++    if _trace_collectives:
++        print(
++            f"TP gather setup: rank={module.rank} local_device={device} output={output_device} "
++            f"gather={gather_devices} ldims={ldims} active={module.active}",
++            flush = True,
++        )
+ 
+     modules.append(module)
+     return None
+diff --git a/exllamav3/modules/gather.py b/exllamav3/modules/gather.py
+index 6827be9a..f1e9eef7 100644
+--- a/exllamav3/modules/gather.py
++++ b/exllamav3/modules/gather.py
+@@ -1,8 +1,11 @@
+ from __future__ import annotations
+ from typing_extensions import override
+ from . import Module
++import os
+ import torch
+ 
++_trace_collectives = os.environ.get("EXL3_TP_TRACE_COLLECTIVES", "0") != "0"
++
+ class OutputGather(Module):
+     def __init__(
+         self,
+@@ -12,14 +15,18 @@ class OutputGather(Module):
+         output_device: int,
+         gather_devices: list[int],
+         ldims: list[int],
++        rank: int | None = None,
+     ):
+         super().__init__(config, key, None)
++        # device is the host-local CUDA ordinal used by prepare_for_device; rank is the
++        # optional global TP identity used for cross-host collective endpoints.
+         self.device = device
++        self.rank = device if rank is None else rank
+         self.output_device = output_device
+         self.gather_devices = gather_devices
+         self.ldims = ldims
+         self.odim = sum(ldims)
+-        self.active = device == output_device or device in gather_devices
++        self.active = self.rank == output_device or self.rank in gather_devices
+ 
+     @override
+     def optimizer_targets(self):
+@@ -45,7 +52,13 @@ class OutputGather(Module):
+         out_dtype: torch.dtype | None = None
+     ) -> torch.Tensor | None:
+ 
+-        if len(self.gather_devices) == 1 and self.device == self.output_device:
++        if _trace_collectives:
++            print(
++                f"OutputGather.forward: identity={self.rank} local_device={self.device} output={self.output_device} "
++                f"gather={self.gather_devices} active={self.active} x={tuple(x.shape)}",
++                flush = True,
++            )
++        if len(self.gather_devices) == 1 and self.rank == self.output_device:
+             return x
+ 
+         if not self.active:
+@@ -53,7 +66,7 @@ class OutputGather(Module):
+ 
+         backend = params["backend"]
+ 
+-        if self.output_device == self.device:
++        if self.output_device == self.rank:
+             out_shape = list(x.shape)
+             out_shape[-1] = self.odim
+             out_tensor = torch.empty(*out_shape, dtype = x.dtype, device = x.device)
+diff --git a/tests/tp/test_tp_rank_identity.py b/tests/tp/test_tp_rank_identity.py
+index ef625bcf..04a2cffe 100644
+--- a/tests/tp/test_tp_rank_identity.py
++++ b/tests/tp/test_tp_rank_identity.py
+@@ -5,6 +5,7 @@ from types import SimpleNamespace
+ import pytest
+ 
+ from exllamav3.model import model_tp_fn
++from exllamav3.model.model_tp import Model_TPMixin
+ from exllamav3.modules.hyperconnections import GatedResidual
+ 
+ pytestmark = pytest.mark.nogpu
+@@ -67,6 +68,16 @@ def test_single_host_append_keeps_cuda_plan_index(monkeypatch):
+     assert received == [(2, {"fake": (5, 9, "channels")})]
+ 
+ 
++def test_cross_host_driver_dispatches_only_to_local_slot():
++    mixin = Model_TPMixin()
++    mixin.tp_cross_host = True
++    mixin.tp_rank = 1
++    assert mixin.tp_localize_devices([0, 1]) == [1]
++    assert mixin.tp_localize_devices([0]) == []
++    mixin.tp_cross_host = False
++    assert mixin.tp_localize_devices([0, 1]) == [0, 1]
++
++
+ def test_cross_host_output_gather_uses_rank_identity():
+     context = {
+         "device": 0,
+@@ -83,7 +94,8 @@ def test_cross_host_output_gather_uses_rank_identity():
+ 
+     model_tp_fn.mp_model_append_gather(context)
+     gather = context["modules"][-1]
+-    assert gather.device == 1
++    assert gather.device == 0
++    assert gather.rank == 1
+     assert gather.output_device == 0
+     assert gather.gather_devices == [0, 1]
+     assert gather.ldims == [4, 4]
+-- 
+2.54.0
+

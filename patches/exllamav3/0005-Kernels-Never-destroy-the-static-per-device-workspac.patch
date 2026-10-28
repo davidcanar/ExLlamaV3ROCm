@@ -1,0 +1,65 @@
+From 521ee49ddd14a65e3944d408db953540eab6cfdf Mon Sep 17 00:00:00 2001
+From: Fabiano Anemone <anos@hotmail.it>
+Date: Mon, 19 Oct 2026 02:20:33 +0200
+Subject: [PATCH 5/7] Kernels: Never destroy the static per-device workspaces
+
+The routing GEMM's per-device workspaces (a static array) and the DSA top-k candidate workspace (a static
+map) hold device tensors. Their static destructors ran at process exit, after the CUDA allocator had gone:
+with PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync every tensor-parallel worker ended in
+'terminate called ... CUDA error: no error' (freeAsync) once its routing workspace had been used. Both are
+now allocated once and never destroyed, as the n-gram gather pool already is.
+---
+ exllamav3/exllamav3_ext/dsa_topk.cu     | 10 ++++++----
+ exllamav3/exllamav3_ext/routing_gemm.cu |  6 ++++--
+ 2 files changed, 10 insertions(+), 6 deletions(-)
+
+diff --git a/exllamav3/exllamav3_ext/dsa_topk.cu b/exllamav3/exllamav3_ext/dsa_topk.cu
+index 45c97d04..101b80e2 100644
+--- a/exllamav3/exllamav3_ext/dsa_topk.cu
++++ b/exllamav3/exllamav3_ext/dsa_topk.cu
+@@ -295,10 +295,12 @@ compaction resolves ties in ascending global index order, identical to the legac
+ static at::Tensor& dsa_topk_ws(int device)
+ {
+     static std::mutex mtx;
+-    static std::map<int, at::Tensor> ws;
++    // Leaked: a static map would free its tensors from a static destructor at exit, after the CUDA
++    // allocator has gone (a cudaMallocAsync free at teardown terminates the process)
++    static auto* ws = new std::map<int, at::Tensor>();
+     std::lock_guard<std::mutex> lock(mtx);
+-    auto it = ws.find(device);
+-    if (it == ws.end())
++    auto it = ws->find(device);
++    if (it == ws->end())
+     {
+         // Candidate indices + counts (int32) followed by candidate scores (half, same count
+         // as indices; int-sized allocation keeps one flat buffer)
+@@ -307,7 +309,7 @@ static at::Tensor& dsa_topk_ws(int device)
+             {(int64_t) TOPK_SPLIT_MAX_R * TOPK_SPLIT_G * TOPK_SPLIT_MAX_KPAD * 3 / 2 + TOPK_SPLIT_MAX_R * TOPK_SPLIT_G},
+             at::TensorOptions().dtype(at::kInt).device(at::Device(at::kCUDA, device))
+         );
+-        it = ws.emplace(device, std::move(t)).first;
++        it = ws->emplace(device, std::move(t)).first;
+     }
+     return it->second;
+ }
+diff --git a/exllamav3/exllamav3_ext/routing_gemm.cu b/exllamav3/exllamav3_ext/routing_gemm.cu
+index 1495718b..650e1e14 100644
+--- a/exllamav3/exllamav3_ext/routing_gemm.cu
++++ b/exllamav3/exllamav3_ext/routing_gemm.cu
+@@ -268,9 +268,11 @@ static int rg_slices(int R, int E, int KC)
+     return S;
+ }
+ 
+-// Per-device static workspaces for decode-class row counts
++// Per-device static workspaces for decode-class row counts. Leaked: a static array would free its tensors from
++// a static destructor at exit, after the CUDA allocator has gone (a cudaMallocAsync free at teardown terminates
++// the process)
+ struct RGWorkspace { at::Tensor ahi, alo, sa, part; int K = 0, E = 0; };
+-static RGWorkspace g_rg_ws[32];
++static RGWorkspace* const g_rg_ws = new RGWorkspace[32];
+ 
+ bool routing_gemm_det_fits(const at::Tensor& hidden, const at::Tensor& gate_i8, const at::Tensor& gate_sb, const at::Tensor& scores)
+ {
+-- 
+2.54.0
+

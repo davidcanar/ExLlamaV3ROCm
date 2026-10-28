@@ -1,0 +1,29 @@
+# runtime state / data (never commit)
+.venv/
+logs/
+run/
+model/
+engram-src*/
+src/
+build/
+*.so
+
+# python caches / test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+
+# editor / backup debris
+*.orig
+*.orig-*
+*.bak
+*.bak-*
+*.swp
+*~
+.idea/
+.vscode/
+
+# local-only configuration
+*.local.sh
+.env

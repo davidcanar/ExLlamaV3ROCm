@@ -1,0 +1,34 @@
+From 250e27d9646e670a68fefb2f28e02ace7002345b Mon Sep 17 00:00:00 2001
+From: Fabiano Anemone <anos@hotmail.it>
+Date: Mon, 19 Oct 2026 01:05:19 +0200
+Subject: [PATCH 4/7] TP: Close an overflow segment's handle once its tensor is
+ copied
+
+Since f157fc0b every tensor that does not fit the arena gets its own segment, and the producer held an open
+handle to each until clear(). A module with thousands of tensors past the arena (the routed experts of a
+large MoE layer) ran the process out of file descriptors during a TP load. On POSIX the segment stays
+reachable by name until clear() unlinks it, so the handle is closed right after the copy.
+---
+ exllamav3/model/model_tp_shared.py | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/exllamav3/model/model_tp_shared.py b/exllamav3/model/model_tp_shared.py
+index 496ecda6..dc400532 100644
+--- a/exllamav3/model/model_tp_shared.py
++++ b/exllamav3/model/model_tp_shared.py
+@@ -162,6 +162,12 @@ class SMProducer:
+         t_cpu = tensor_d.cpu().contiguous()
+         src = t_cpu.view(torch.uint8).numpy().view(np.uint8).ravel()
+         np.copyto(dst, src, casting = "no")
++        if desc["method"] == "overflow" and sys.platform != "win32":
++            # The segment stays reachable by name until clear() unlinks it, so the handle is not needed past the
++            # copy: one held per tensor ran a large module's export out of file descriptors. (On Windows a named
++            # mapping only lives while a handle to it is open)
++            del dst
++            segment.close()
+ 
+         if cache_id is not None:
+             _cache_insert(self, cache_id, tensor)
+-- 
+2.54.0
+

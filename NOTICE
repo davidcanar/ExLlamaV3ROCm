@@ -1,0 +1,49 @@
+NOTICE — third-party components used by ExLlamaV3ROCm
+=======================================================
+
+This repository contains the deployment glue, controller, launchers, server
+engine integration and patches written for the two-node Strix Halo rig
+(MIT, see LICENSE). It redistributes or references the following third-party
+work; each component keeps its own license and attribution:
+
+ExLlamaV3 (MIT, Copyright (c) 2025 Turboderp)
+  Used through the `anoane/exllamav3-anemone` fork (PR #449, branch `dsv41f`,
+  base commit d45e89611738e9134f72f5c9679cc9eae113bba8) plus the local
+  `multi-node-rocm` commit series in `patches/exllamav3/`.
+  Source is fetched by `setup.sh`; nothing from it is vendored here.
+
+Kyojin (MIT, Copyright (c) 2025 Turboderp)
+  <https://github.com/Yamz-Labs/kyojin>, commit
+  e2f37564bbae01a6ea8ad4176dfd97db09c253aa (release 1.8.2).
+  The HTTP/chat/parser/test layer in `tools/ds41/` is vendored from Kyojin
+  with per-file attribution headers; the full license text is retained at
+  `tools/ds41/LICENSE.kyojin`. See `tools/ds41/README.md` for the file map
+  and the two clearly marked LOCAL (exl3-tp) adaptations.
+
+OdinLink-Five (kernel driver GPL-2.0; userspace library, RCCL/NCCL plugins,
+  CLI, daemon and all other components MIT; Copyright (c) Geramy)
+  <https://github.com/Geramy/OdinLink-Five>, upstream commit 4534f58 plus the
+  local 5-file diff in `patches/odinlink/` (driver: odl_tb5_core.h,
+  odl_tb5_params.c, odl_tb5_proto.c, odl_tb5_ring_dma.c; RCCL v7 plugin:
+  rccl/src/odl_tb5_plugin.c). Only the patch is redistributed — the patched
+  files of `driver/` are GPL-2.0 derivative work and must stay GPL-2.0; the
+  RCCL plugin patch applies to MIT userspace code. Source is fetched by
+  `setup.sh`.
+
+DeepSeek-V4.1-Flash reference encoding (MIT, DeepSeek-AI)
+  `tools/ds41/testdata/reference/` carries the official reference
+  implementation and golden test inputs/outputs used by the golden prompt
+  tests (see `tools/ds41/README.md`).
+
+Model weights and Engram tables (NOT redistributed in this repository)
+  Quantized checkpoint: `LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw`
+  (EXL3 2.9 bpw quantization of DeepSeek-V4.1-Flash-1017).
+  Engram source tables: `deepseek-ai/DeepSeek-V4.1-Flash-1017`
+  (shards model-00047/00048-of-00048.safetensors). Both are downloaded by
+  `setup.sh` under their upstream licenses/terms; model data never enters
+  git (see .gitignore).
+
+AMD ROCm wheels and PyTorch (MIT/license of the ROCm software stack)
+  `torch[device-gfx1151]==2.14.0+rocm10.1.0a20260822` and
+  `rocm[devel,device-gfx1151]==10.1.0a20260822` from AMD's wheel index; see
+  `requirements/rocm.txt` and `requirements/python.txt` for the exact pins.
