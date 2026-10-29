@@ -173,16 +173,27 @@ fi
 
 # ---- 5. OdinLink-Five clone + patch + build ---------------------------------
 if (( DO_ODL )); then
-    if [[ -d "$EXL3_ODL_SRC/.git" ]] && git -C "$EXL3_ODL_SRC" diff --quiet 2>/dev/null; then
-        log "OdinLink already cloned and patched at $EXL3_ODL_SRC"
-    elif [[ -d "$EXL3_ODL_SRC/.git" ]]; then
-        log "OdinLink clone at $EXL3_ODL_SRC already carries local changes — leaving it alone"
-    else
+    if [[ ! -d "$EXL3_ODL_SRC/.git" ]]; then
         log "cloning OdinLink-Five (Geramy/OdinLink-Five @ $ODL_PIN) into $EXL3_ODL_SRC"
         git clone "$ODL_REPO" "$EXL3_ODL_SRC"
         git -C "$EXL3_ODL_SRC" checkout "$ODL_PIN"
-        log "applying patches/odinlink (5-file diff: driver multi-frame + RCCL v7 plugin)"
-        git -C "$EXL3_ODL_SRC" apply "$ROOT"/patches/odinlink/*.patch
+    fi
+    # Apply, in order, every patch that still applies; one that does not is already in
+    # (an existing clone gets the patches added since it was set up, e.g. 0003)
+    ODL_PATCHED=0
+    for p in "$ROOT"/patches/odinlink/*.patch; do
+        if git -C "$EXL3_ODL_SRC" apply --check "$p" 2>/dev/null; then
+            log "OdinLink: applying $(basename "$p")"
+            git -C "$EXL3_ODL_SRC" apply "$p"
+            ODL_PATCHED=1
+        else
+            log "OdinLink: $(basename "$p") already applied (or conflicts with local changes)"
+        fi
+    done
+    if (( ODL_PATCHED )) && [[ -f "$EXL3_ODL_BUILD/rccl/librccl_net_odl_tb5.so" ]]; then
+        log "OdinLink sources changed: rebuilding userspace + RCCL plugin"
+        cmake --build "$EXL3_ODL_BUILD" -j"$(nproc)"
+        warn "OdinLink driver sources changed: rebuild and reload odl_tb5 on both boxes (note below)"
     fi
 
     if [[ -f "$EXL3_ODL_BUILD/rccl/librccl_net_odl_tb5.so" ]]; then
@@ -203,7 +214,7 @@ if (( DO_ODL )); then
 
   OdinLink kernel module (needs root, NOT built above):
       cmake --build "$EXL3_ODL_BUILD" --target driver
-      sudo insmod  "$EXL3_ODL_BUILD/driver/odl_tb5.ko"
+      sudo insmod  "$EXL3_ODL_BUILD/driver/odl_tb5.ko" odl_ring_size=1024   # the 4096 default needs 16 MB contiguous
       sudo cp "$EXL3_ODL_SRC/driver/71-odl-tb5.rules" /etc/udev/rules.d/ && sudo udevadm control --reload-rules
     /dev/odl_tb5_0 appears only once the Thunderbolt peer connects.
 

@@ -36,12 +36,34 @@ would otherwise see an asymmetric NIC count across the ranks and could open
 the wrong link. The launchers set `ODL_RCCL_DEVICES=0`; unset keeps the old
 behaviour.
 
+`0003-odl-tb5-rx-copy-and-stale-tunnel-fixes.patch` applies on top of
+`0002` (driver only, GPL-2.0). Three fixes, all from a hang seen under memory
+pressure on 2026-10-28:
+
+- when the spare RX assembly buffers run dry (routine during big RCCL
+  transfers), the message copy used an order-8 `kmalloc(GFP_ATOMIC)` that fails
+  on a fragmented host, dropping the message and hanging both RCCL ranks. The
+  RX callback runs in a workqueue, so the copy is now `kvmalloc(GFP_KERNEL)`;
+- module exit freed `bind_any` devices without disabling their XDomain paths,
+  which left the DMA tunnel in the thunderbolt core (the next load failed
+  `enable_paths` with -ENOMEM until a reboot) and a devm action pointing into
+  the unloaded module. Those devices now go through the normal destroy path;
+- before enabling paths, a stale DMA tunnel on the instance's own NHI rings is
+  torn down (rings are exclusive; HopIDs are wildcards, rings are not, so
+  ThunderboltIP's tunnel is never touched). This recovers a link left in that
+  state by an older build.
+
+After rebuilding, reload the module on both boxes with the server stopped
+(`sudo rmmod odl_tb5`, then load it as before). Validated with
+`perf/run_stress.sh` (1–64 MiB all-reduces, exact results, with
+`rx_asm_pool=0` and with CPU load on both boxes) and full model serving.
+
 Apply with `git apply` (plain diffs, no commit identity to preserve):
 
     git clone https://github.com/Geramy/OdinLink-Five odinlink
     cd odinlink
     git checkout 4534f58
-    git apply /path/to/patches/odinlink/0001-odl-tb5-local-rccl-v7-multiframe-and-dma-fixes.patch               /path/to/patches/odinlink/0002-rccl-plugin-ODL_RCCL_DEVICES-allow-list.patch
+    git apply /path/to/patches/odinlink/*.patch      # 0001, 0002, 0003 in order
 
 `setup.sh` performs the clone/patch/build automatically (default source
 location `$HOME/.cache/odinlink`, override with `EXL3_ODL_SRC`; the built

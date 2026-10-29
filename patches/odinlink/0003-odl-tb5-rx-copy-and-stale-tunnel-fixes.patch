@@ -1,0 +1,227 @@
+odl_tb5: RX copy that cannot drop a message, no stale DMA tunnel after unload
+
+Applies on top of 0001 and 0002 (git apply, from the OdinLink-Five root).
+
+1. RX MSG_END fallback copy (driver/odl_tb5_ring_dma.c). When the spare
+   assembly buffers (rx_asm_pool) run dry -- routine while RCCL moves big
+   buffers and the reader falls behind -- MSG_END copied the message with
+   kmalloc(len, GFP_ATOMIC): an order-8 request for a 1 MiB message that
+   cannot reclaim or compact. On a fragmented host it failed, the message was
+   discarded, and both RCCL ranks hung in the collective until restart. The
+   RX callback runs from the thunderbolt core's ring_work (the ring has no
+   start_poll), so it may sleep: the copy is now kvmalloc(GFP_KERNEL)
+   (reclaim, compaction, vmalloc fallback), freed with kvfree, and E2E flow
+   control holds the sender meanwhile. might_sleep() documents the context.
+
+2. Module exit (driver/odl_tb5_service.c). Devices attached with bind_any
+   have no tb_service, so they were freed by an orphan loop that skipped
+   disabling the XDomain paths, releasing the HopIDs, dropping the xdomain
+   reference and removing the devm detach action. The DMA tunnel stayed in
+   the thunderbolt core (the next load failed enable_paths with -ENOMEM until
+   a reboot or cable replug) and the devm action would have called into the
+   unloaded module when the XDomain went away. They now go through
+   odl_tb5_destroy() after the action is removed.
+
+3. Path enable (driver/odl_tb5_transport_nhi.c). Before enabling, tear down
+   any DMA tunnel routed to the two NHI rings the instance holds: rings are
+   exclusive, so such a tunnel is stale (left by an older build's unload).
+   HopIDs are wildcards, rings are not, so ThunderboltIP's tunnel to the same
+   XDomain is never touched. This recovers a link that item 2 would have
+   prevented, without a reboot.
+
+Validated on the two-box rig: rx_asm_pool=0 (every message through the new
+copy) and the default pool, 1-64 MiB RCCL all-reduces with exact results,
+with and without CPU load on both boxes; the stale tunnel on Box1 cleared at
+load; full model serving afterwards.
+
+--- a/driver/odl_tb5_ring_dma.c
++++ b/driver/odl_tb5_ring_dma.c
+@@ -61,8 +61,10 @@
+ 		atomic_inc(&stream->rx_asm_pool_empty);
+ 		/* Greppable, because the counter is not readable from
+ 		 * userspace: this is the signal that MSG_END has gone back to
+-		 * copying, and so back to a large GFP_ATOMIC allocation that
+-		 * can fail. Steady state should never print this. */
++		 * copying (a kvmalloc'd copy, see the MSG_END path). That is
++		 * slower than the handoff but no longer able to lose the
++		 * message; a reader that falls behind during big transfers
++		 * prints this routinely. */
+ 		pr_warn_ratelimited("odl_tb5: stream %u rx_asm pool empty (%d) - MSG_END falling back to copy\n",
+ 				    stream->id,
+ 				    atomic_read(&stream->rx_asm_pool_empty));
+@@ -109,8 +111,9 @@
+ }
+ 
+ /* Release one received message. ->data is either a pool buffer handed over
+- * whole or a kmalloc'd copy from the fallback path, and the two need different
+- * allocators -- which is what ->data_from_pool records. */
++ * whole or a kvmalloc'd copy from the fallback path, and the two need different
++ * release paths -- which is what ->data_from_pool records. Callers run in
++ * process context with no spinlock held (kvfree may sleep on vmalloc memory). */
+ static void odl_tb5_rx_msg_free(struct odl_tb5_stream *stream,
+ 				struct odl_tb5_rx_msg *rxm)
+ {
+@@ -120,7 +123,7 @@
+ 		if (rxm->data_from_pool)
+ 			odl_tb5_asm_pool_put(stream, rxm->data);
+ 		else
+-			kfree(rxm->data);
++			kvfree(rxm->data);
+ 	}
+ 	kfree(rxm);
+ }
+@@ -312,6 +315,13 @@
+ 	struct odl_tb5_device *dev;
+ 	struct odl_tb5_frame_slot *slot;
+ 
++	/* Frame callbacks run from the thunderbolt core's ring_work, a work
++	 * item, with the ring lock dropped: the RX ring is allocated without a
++	 * start_poll callback, so nothing calls this from interrupt context.
++	 * MSG_END relies on that to allocate with GFP_KERNEL; say so where a
++	 * debug kernel can check it. */
++	might_sleep();
++
+ 	ctx = odl_tb5_ring_to_ctx(ring);
+ 	if (WARN_ON_ONCE(!ctx))
+ 		return;
+@@ -503,18 +513,24 @@
+ 							}
+ 
+ 							rxm = kzalloc(sizeof(*rxm),
+-								      GFP_ATOMIC);
++								      GFP_KERNEL);
+ 							/* Hand the filled buffer to the reader and
+ 							 * take a spare in its place: the delivery path
+ 							 * then does no allocation and no copy at all.
+ 							 *
+ 							 * If the pool is dry -- a reader that has
+-							 * stopped collecting -- fall back to copying
+-							 * the message out. That is the old behaviour
+-							 * and can still fail here, but it is now the
+-							 * rare case rather than every message, and a
+-							 * failure discards the message cleanly instead
+-							 * of delivering it short. */
++							 * fallen behind, routine while RCCL moves big
++							 * buffers -- copy the message out instead. This
++							 * used to be kmalloc(GFP_ATOMIC): an order-8
++							 * request for a 1 MiB message that cannot
++							 * reclaim or compact, so on a fragmented host it
++							 * failed, the message was discarded and both
++							 * RCCL ranks hung in the collective. This is
++							 * process context (see the top of the
++							 * function), so the copy may sleep: kvmalloc
++							 * reclaims, compacts and falls back to vmalloc,
++							 * and E2E flow control holds the sender for the
++							 * moment it takes. */
+ 							spare = (rxm && stream->rx_asm_buf) ?
+ 								odl_tb5_asm_pool_get(stream) : NULL;
+ 							if (spare) {
+@@ -522,8 +538,8 @@
+ 								rxm->data_from_pool = true;
+ 								stream->rx_asm_buf = spare;
+ 							} else if (rxm && stream->rx_asm_buf) {
+-								rxm->data = kmalloc(stream->rx_asm_len,
+-										    GFP_ATOMIC);
++								rxm->data = kvmalloc(stream->rx_asm_len,
++										     GFP_KERNEL);
+ 								if (rxm->data)
+ 									memcpy(rxm->data,
+ 									       stream->rx_asm_buf,
+--- a/driver/odl_tb5_service.c
++++ b/driver/odl_tb5_service.c
+@@ -14,6 +14,7 @@
+  * Also handles module parameters: ring_size, loopback, protocol, e2e.
+  */
+ 
++#include <linux/delay.h>
+ #include "odl_tb5_core.h"
+ #if IS_ENABLED(CONFIG_USB4)
+ #include <linux/pci.h>
+@@ -617,7 +618,7 @@
+ 
+ static void __exit odl_tb5_exit(void)
+ {
+-	struct odl_tb5_device *dev, *tmp;
++	struct odl_tb5_device *dev;
+ 
+ 	odl_tb5_debugfs_exit();
+ 
+@@ -639,31 +640,35 @@
+ 
+ 	odl_tb5_apple_exit();
+ 
+-	mutex_lock(&odl_tb5_devices_lock);
+-	list_for_each_entry_safe(dev, tmp, &odl_tb5_devices_list, list) {
+-		pr_warn("odl_tb5: cleaning up orphaned device at exit\n");
+-		list_del_rcu(&dev->list);
+-		atomic_set(&dev->removing, 1);
+-		hrtimer_cancel(&dev->rx_poll_timer);
+-		cancel_work_sync(&dev->verify_work);
+-		cancel_work_sync(&dev->ctrl_reply_work);
+-		cancel_work_sync(&dev->restart_work);
+-		cancel_work_sync(&dev->connect_work);
+-		cancel_delayed_work_sync(&dev->login_work);
+-		cancel_work_sync(&dev->tx_drain_work);
+-		odl_tb5_rings_stop(dev);
+-		synchronize_rcu();
+-		odl_tb5_streams_destroy_all(dev);
+-		ida_destroy(&dev->stream_ida);
+-		odl_tb5_frame_pool_free(dev);
+-		odl_tb5_batch_pool_free(dev);
+-		odl_tb5_dma_bufs_free(dev);
+-		odl_tb5_rings_free(dev);
+-		odl_tb5_chardev_destroy(dev);
+-		ida_free(&odl_tb5_ida, dev->index);
+-		kfree(dev);
++	/* What is still listed was attached with bind_any: no tb_service, so the
++	 * unregister above did not remove it. Tear it down the way its XDomain
++	 * detach would -- odl_tb5_destroy() disables the DMA paths, releases both
++	 * HopIDs and drops the xdomain reference. Freeing it without that (as this
++	 * loop used to) left the tunnel in the thunderbolt core, and the next load
++	 * then failed enable_paths with -ENOMEM until a reboot or a cable replug.
++	 * Remove the devm detach action first: once this module is gone it would
++	 * call into freed code when the XDomain goes away. If it is already gone
++	 * and the device is being removed, that detach is destroying it right now:
++	 * wait for it to unlist. (Gone and not being removed: it was never
++	 * registered, and destroying the device here is the only teardown.) */
++	for (;;) {
++		mutex_lock(&odl_tb5_devices_lock);
++		dev = list_first_entry_or_null(&odl_tb5_devices_list,
++					       struct odl_tb5_device, list);
++		mutex_unlock(&odl_tb5_devices_lock);
++		if (!dev)
++			break;
++		if (!dev->svc && dev->xd &&
++		    devm_remove_action_nowarn(&dev->xd->dev, odl_tb5_xd_detach,
++					      dev) &&
++		    atomic_read(&dev->removing)) {
++			msleep(10);
++			continue;
++		}
++		pr_info("odl_tb5: tearing down unbound device index %d at exit\n",
++			dev->index);
++		odl_tb5_destroy(dev);
+ 	}
+-	mutex_unlock(&odl_tb5_devices_lock);
+ 
+ #if IS_ENABLED(CONFIG_USB4)
+ 	odl_tb5_proto_unregister();
+--- a/driver/odl_tb5_transport_nhi.c
++++ b/driver/odl_tb5_transport_nhi.c
+@@ -233,6 +233,16 @@
+ 	struct odl_tb5_transport_ring_info rx_info = nhi_rx_ring_info(dev);
+ 	int ret, i;
+ 
++	/* Rings are exclusive, so a DMA tunnel still routed to the two rings this
++	 * instance holds can only be stale: left behind by an instance that went
++	 * away without disabling its paths. It keeps its HopIDs, and every
++	 * tb_xdomain_enable_paths() below then fails with -ENOMEM. Tear down
++	 * whatever tunnel uses these rings first. HopIDs are wildcards on purpose
++	 * (the stale tunnel's may differ); the rings are not, so ThunderboltIP and
++	 * any other user of this XDomain, which own rings of their own, never
++	 * match. On a clean link this matches nothing. */
++	tb_xdomain_disable_paths(xd, -1, tx_info.hop, -1, rx_info.hop);
++
+ 	for (i = 0; i < ODL_TB5_ENABLE_RETRIES; i++) {
+ 		ret = tb_xdomain_enable_paths(xd,
+ 					      nhi_priv(dev)->local_tx_hopid,
