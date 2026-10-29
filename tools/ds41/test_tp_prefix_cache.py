@@ -119,29 +119,41 @@ class CacheBackend:
 
 
 class CacheSpecBackend(CacheBackend):
-    """Spec stand-in: verify writes every window row (rejected drafts leave garbage behind), the
-    drafter has its own position-indexed rows, primed by spec prefills and refreshed per round."""
+    """Spec stand-in: verify writes every window row (rejected drafts leave garbage behind), and
+    the drafter keeps its own main-kv rows in a small ring, as the real backend does: a row is
+    (position, hash of the prefix through it), primed by spec prefills and refreshed per round,
+    and a draft reads only the rows of the last `draft_window_rows` positions. A draft whose
+    window holds a row of another sequence counts as stale (worse drafts, never wrong output)."""
 
     dspark = True
     dspark_block = 5
     export_layers = frozenset({36, 37, 38})
+    draft_window_rows = 8
+    RING = 40
 
     def __init__(self):
         super().__init__()
-        self.drows: dict[int, int] = {}
+        self.drows: dict[int, tuple[int, int]] = {}
         self.rounds = 0
+        self.stale_drafts = 0
+
+    def _dwrite(self, p):
+        self.drows[p % self.RING] = (p, self._st["hist"][p + 1])
+
+    def _window(self, position):
+        return range(max(0, position - self.draft_window_rows), position)
 
     def prefill(self, ids, state, spec=False, start=0):
         out = super().prefill(ids, state, spec, start)
         if spec:
             for p in range(start, len(ids) - 1):
-                self.drows[p] = self.kv[p]
+                self._dwrite(p)
         return out
 
     def draft(self, anchor, position, k_cap):
         self.calls.append(("draft", int(anchor), int(position), int(k_cap)))
-        stale = [i for i in range(position) if self.drows.get(i) != self.kv.get(i)]
-        assert not stale, f"draft at {position} over stale drafter rows {stale[:5]}"
+        if any(self.drows.get(q % self.RING) != (q, self._st["hist"][q + 1]) for q in self._window(position)):
+            self.stale_drafts += 1
         k = max(0, min(self.dspark_block, int(k_cap)))
         good = self.rounds % (k + 1) if k else 0          # the first `good` drafts are right
         self.rounds += 1
@@ -180,7 +192,21 @@ class CacheSpecBackend(CacheBackend):
     def refresh_draft_kv(self, taps, accepted, position):
         self.calls.append(("refresh", int(accepted), int(position)))
         for p in range(position - accepted, position):
-            self.drows[p] = self.kv[p]
+            self._dwrite(p)
+
+    def draft_window(self, position):
+        if not self._window(position):
+            return None
+        self.calls.append(("draft_window", int(position)))
+        return [self.drows.get(q % self.RING) for q in self._window(position)]
+
+    def set_draft_window(self, saved, position):
+        self.calls.append(("set_draft_window", int(position)))
+        for q, row in zip(self._window(position), saved):
+            if row is None:
+                self.drows.pop(q % self.RING, None)
+            else:
+                self.drows[q % self.RING] = row
 
 
 class Ranks:
@@ -261,8 +287,9 @@ def pc(**kw):
     return tp_engine.PrefixCache(**base)
 
 
-def both(spec, script, prefix_kw=None):
-    """Run `script(ranks)` -> list of (text, stats) with the prefix cache on and off."""
+def both(spec, script, prefix_kw=None, stale_ok=False):
+    """Run `script(ranks)` -> list of (text, stats) with the prefix cache on and off. Spec runs
+    also check that no draft read drafter rows of another sequence (unless `stale_ok`)."""
     on = Ranks(spec, pc(**(prefix_kw or {})))
     off = Ranks(spec, False)
     try:
@@ -275,6 +302,9 @@ def both(spec, script, prefix_kw=None):
         off.stop()
     assert [t for t, _ in got_on] == [t for t, _ in got_off], "prefix reuse changed a reply"
     assert all(s["cached_tokens"] == 0 for _, s in got_off)
+    if spec:
+        assert off.be0.stale_drafts == 0
+        assert stale_ok or on.be0.stale_drafts == 0, "a draft read drafter rows of another sequence"
     return got_on
 
 
@@ -353,27 +383,48 @@ def test_shared_prefix_then_divergence_keeps_the_shorter_checkpoint_valid():
     assert [s["cached_tokens"] for _, s in got] == [0, 40, 40, 40]
 
 
-def test_spec_request_after_plain_turns_only_reuses_drafter_valid_rows():
-    """A plain request writes trunk rows but not drafter rows: a later spec request may reuse
-    the trunk only as far as the drafter's rows still match (CacheSpecBackend asserts it)."""
+def test_spec_after_plain_turns_reuses_the_whole_trunk():
+    """A plain request writes trunk rows but no drafter rows, so its checkpoints carry no drafter
+    window. A spec request restores them anyway: the trunk state is exact (same replies as full
+    prefills); only drafts whose window reaches back past the restore point read stale rows."""
     a = prompt(10, 60)
-    c_len = []
+    seen = {}
 
     def script(r):
         out = [r.run(a, speculative=True)]
-        b = a + ids_of(out[0][0]) + prompt(11, 20)
-        out.append(r.run(b, speculative=False))           # plain: reuses the spec request's rows
-        c = b + ids_of(out[1][0]) + prompt(12, 20)
-        c_len.append(len(c))
-        out.append(r.run(c, speculative=True))            # drafter rows only cover a's sequence
-        out.append(r.run(c, speculative=False))           # the trunk could go further
+        b = a + ids_of(out[0][0]) + prompt(11, 3)         # short turns: the window spans the restore point
+        out.append(r.run(b, speculative=False))
+        c = b + ids_of(out[1][0]) + prompt(12, 3)
+        seen["b_end"] = len(b) + len(out[1][0]) - 1        # b's committed sequence (last token unfed)
+        out.append(r.run(c, speculative=True))
         return out
 
-    got = both(True, script)
-    assert got[1][1]["cached_tokens"] >= 60
-    spec_reuse, plain_reuse = got[2][1]["cached_tokens"], got[3][1]["cached_tokens"]
-    assert spec_reuse <= 60 + len(got[0][0])              # never past the spec request's rows
-    assert plain_reuse == c_len[0] - 1
+    got = both(True, script, stale_ok=True)
+    assert got[2][1]["cached_tokens"] == seen["b_end"]    # the spec request reused all of b
+
+
+def test_spec_checkpoint_carries_the_drafter_window_across_a_ring_wrap():
+    """A long reply wraps the drafter's main-kv ring past the turn's checkpoint; the next turn
+    restores the window saved with that checkpoint, so no draft reads another sequence's rows.
+    The control run saves checkpoints without the window and gets stale drafts."""
+    a = prompt(20, 60)
+
+    def run(save_window):
+        r = Ranks(True, pc())
+        try:
+            if not save_window:
+                r.be0.draft_window = lambda position: None
+            r.run(a, max_tokens=60)                        # 60 > RING: wraps past position 59
+            before = r.be0.stale_drafts
+            _, stats = r.run(a[:-1] + [7] + prompt(21, 3))  # a 3-token turn: the window reaches into a
+            r.check_mirror()
+            return stats["cached_tokens"], r.be0.stale_drafts - before
+        finally:
+            r.stop()
+
+    assert run(save_window=True) == (59, 0)
+    cached, stale = run(save_window=False)
+    assert cached == 59 and stale > 0
 
 
 def test_cache_prompt_false_skips_reuse_but_keeps_the_record_honest():

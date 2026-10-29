@@ -74,8 +74,8 @@ Prefix cache (2026-10-28, `PrefixCache`; EXL3_TP_PREFIX_CACHE=0 turns it off on 
   (DSV4State.stash: SWA ring, compressor windows, Engram id ring, host memory) after each prefill
   and at the end of each request. Rank 0 picks the longest valid checkpoint, and both ranks
   restore it and prefill the rest. Rank 0 decides everything; rank 1 only obeys the frames.
-- checkpoints are local copies on each rank (no collectives); the drafter's main-kv only counts
-  as valid up to the sequence the last spec request wrote (`draft_ids`)
+- checkpoints are local copies on each rank (no collectives); spec checkpoints also carry the
+  drafter's main-kv window on rank 0 (its main-kv is a ring, EXL3_TP_DRAFT_RING)
 
 Long prompts (2026-10-28 fix, test_tp_chunked_prefill.py):
 - every trunk call (prefill chunks, decode steps, spec verifies) carries batch_shape =
@@ -459,7 +459,8 @@ class TPModelBackend:
 
     def __init__(self, model, cache, tokenizer, *, span: int, cache_tokens: int, rank: int = 0,
                  dspark: bool = False, draft_model=None, draft_cache=None, draft_bt=None,
-                 export_layers=frozenset(), dspark_block: int = 5, page_size: int = 256):
+                 export_layers=frozenset(), dspark_block: int = 5, page_size: int = 256,
+                 draft_window_rows: int = 128):
         self.model = model
         self.cache = cache
         self.tokenizer = tokenizer
@@ -473,6 +474,7 @@ class TPModelBackend:
         self.export_layers = frozenset(export_layers)
         self.dspark_block = int(dspark_block)
         self.page_size = int(page_size)
+        self.draft_window_rows = int(draft_window_rows)
         self.vocab_size = int(tokenizer.actual_vocab_size)
 
     @classmethod
@@ -578,20 +580,38 @@ class TPModelBackend:
             if report is not None:
                 log(f"tp: rank 0 VRAM before draft load: {report[0]:.1f} GiB free of {report[1]:.1f} GiB")
             started = time.time()
+            # The drafter only ever reads the main-kv rows of the last `sliding_window`
+            # positions, so its cache is a ring of `ring` pages: logical page i lives in
+            # physical page i % ring (reads and writes both go through draft_bt). The ring
+            # must hold one prefill chunk plus the window (a chunk's rows must not alias
+            # each other, and the window before a draft must survive the chunk written
+            # just before it). EXL3_TP_DRAFT_RING=0 allocates the whole context again.
+            window = int(config.sliding_window)
+            cache_pages = cache_tokens // PAGE_SIZE
+            ring = env_int("EXL3_TP_DRAFT_RING", span // PAGE_SIZE + 2)
+            if ring <= 0 or ring >= cache_pages:
+                ring = cache_pages
+            elif ring * PAGE_SIZE < span + window:
+                raise ValueError(f"EXL3_TP_DRAFT_RING={ring} pages cannot hold a {span}-row prefill "
+                                 f"chunk plus the drafter's {window}-row window")
             draft_model = Model.from_config(config, component="mtp")
-            draft_cache = Cache(draft_model, max_num_tokens=cache_tokens, max_batch_size=1)
+            draft_cache = Cache(draft_model, max_num_tokens=ring * PAGE_SIZE, max_batch_size=1)
             draft_model.load(progressbar=False)
             draft_model.attach_to(model)     # private embedding (CPU) + private head (GPU)
             assert draft_model.own_head is not None, "drafter did not get its private head (attach order bug)"
-            draft_bt = torch.arange(cache_tokens // PAGE_SIZE, dtype=torch.int32).view(1, -1)
+            draft_bt = (torch.arange(cache_pages, dtype=torch.int32) % ring).view(1, -1)
+            ring_mib = sum(l.storage_size() for l in draft_cache.layers.values()) / 2**20
             log(f"tp: rank 0 DSpark drafter loaded in {time.time() - started:.1f} s "
-                f"(block {block}, taps at layers {sorted(export_layers)}, max_history {MAX_HISTORY})")
+                f"(block {block}, taps at layers {sorted(export_layers)}, max_history {MAX_HISTORY}; "
+                f"main-kv {'ring of ' + str(ring) + ' pages' if ring < cache_pages else 'full context'}, "
+                f"{ring_mib:.1f} MiB)")
             check_memory_floor("after the DSpark drafter load", rank=rank, floor_gib=floor_gib, log=log)
 
         tokenizer = Tokenizer.from_config(config)
         return cls(model, cache, tokenizer, span=span, cache_tokens=cache_tokens, rank=rank,
                    dspark=dspark, draft_model=draft_model, draft_cache=draft_cache, draft_bt=draft_bt,
-                   export_layers=export_layers, dspark_block=block, page_size=PAGE_SIZE)
+                   export_layers=export_layers, dspark_block=block, page_size=PAGE_SIZE,
+                   draft_window_rows=int(config.sliding_window))
 
     def new_state(self):
         import torch
@@ -754,6 +774,37 @@ class TPModelBackend:
                 "cache_seqlens": torch.tensor([int(position)], dtype=torch.int32),
             },
         )
+
+    def _draft_window_rows(self, position: int):
+        """Physical main-kv rows of the drafter's window before `position` (None if empty)."""
+        import torch
+        lo = max(0, int(position) - self.draft_window_rows)
+        if int(position) <= lo:
+            return None
+        pos = torch.arange(lo, int(position))
+        pages = self.draft_bt[0].long()[pos // self.page_size]
+        return pages * self.page_size + pos % self.page_size
+
+    def draft_window(self, position: int):
+        """Host copy of the drafter main-kv rows a draft at `position` reads (its sliding
+        window), one tensor per drafter layer (rank 0). The main-kv is a ring that reuses a
+        row once the sequence has moved a ring's length on, so a prefix-cache checkpoint
+        carries this window and set_draft_window() puts it back at restore."""
+        import torch
+        rows = self._draft_window_rows(position)
+        if rows is None or self.draft_cache is None:
+            return None
+        with torch.inference_mode():
+            return [l.kv.view(-1, l.width)[rows.to(l.kv.device)].cpu() for l in self.draft_cache.layers.values()]
+
+    def set_draft_window(self, saved, position: int) -> None:
+        import torch
+        rows = self._draft_window_rows(position)
+        if rows is None or saved is None:
+            return
+        with torch.inference_mode():
+            for l, t in zip(self.draft_cache.layers.values(), saved):
+                l.kv.view(-1, l.width)[rows.to(l.kv.device)] = t.to(l.kv.device)
 
     def refresh_draft_kv(self, taps, accepted: int, position: int) -> None:
         """Refresh the drafter's main-kv from the accepted rows of one verify pass (rank 0)."""
@@ -1030,15 +1081,18 @@ def _common_prefix(a: array, b: array) -> int:
 
 
 class Checkpoint:
-    """One stashed recurrent state: the trunk state after its first `pos` tokens (`ids`)."""
+    """One stashed recurrent state: the trunk state after its first `pos` tokens (`ids`), plus
+    (spec requests, rank 0) the drafter's main-kv window before `pos`, or None if the drafter
+    had not seen those positions."""
 
-    __slots__ = ("key", "pos", "ids", "stash", "used")
+    __slots__ = ("key", "pos", "ids", "stash", "draft", "used")
 
-    def __init__(self, key: int, pos: int, ids: array, stash: Any, used: int):
+    def __init__(self, key: int, pos: int, ids: array, stash: Any, used: int, draft: Any = None):
         self.key = key
         self.pos = pos
         self.ids = ids
         self.stash = stash
+        self.draft = draft
         self.used = used
 
 
@@ -1052,9 +1106,13 @@ class PrefixCache:
     windows and overlaps, Engram id ring) to skip that prefix: a checkpoint, stashed by both
     ranks after each prefill (position len(ids) - 1: through `<｜Assistant｜>`, the part of the
     prompt the next turn's template renders identically) and at the end of each request (the
-    reply too, for templates that echo it verbatim, e.g. tool conversations). The drafter's
-    main-kv (rank 0) is position-indexed as well, but only spec requests write it, so
-    `draft_ids` records the sequence its rows hold and spec requests restore at most that far.
+    reply too, for templates that echo it verbatim, e.g. tool conversations).
+
+    The drafter (rank 0) reads only the main-kv rows of the last `sliding_window` positions,
+    and its main-kv is a ring that reuses those rows once the sequence moves on, so a spec
+    checkpoint also carries that window (`Checkpoint.draft`) and a restore puts it back. A
+    checkpoint taken where the drafter had not seen the positions (a plain request) has no
+    window: restoring it for a spec request is still exact, only the first drafts are poor.
 
     Invariant: the token prefix of every retained checkpoint is a prefix of `kv_ids`, so a
     checkpoint at pos <= common_prefix(kv_ids, prompt) is valid for the prompt. `finish` drops
@@ -1066,7 +1124,6 @@ class PrefixCache:
         self.min_tokens = max(1, int(min_tokens))
         self.save_end = bool(save_end)
         self.kv_ids = array("i")
-        self.draft_ids = array("i")
         self.ckpts: list[Checkpoint] = []
         self._key = 0
         self._tick = 0
@@ -1085,11 +1142,9 @@ class PrefixCache:
         self._tick += 1
         c.used = self._tick
 
-    def plan(self, ids: array, spec: bool) -> Checkpoint | None:
+    def plan(self, ids: array) -> Checkpoint | None:
         """The longest checkpoint valid for this prompt's prefill (ids[:-1]), or None."""
         limit = min(_common_prefix(self.kv_ids, ids), len(ids) - 1)
-        if spec:
-            limit = min(limit, _common_prefix(self.draft_ids, ids))
         best = None
         for c in self.ckpts:
             if c.pos <= limit and (best is None or c.pos > best.pos):
@@ -1111,27 +1166,23 @@ class PrefixCache:
         self._key += 1
         return self._key, evicted
 
-    def add(self, key: int, ids: array, stash: Any) -> Checkpoint:
-        c = Checkpoint(key, len(ids), ids, stash, 0)
+    def add(self, key: int, ids: array, stash: Any, draft: Any = None) -> Checkpoint:
+        c = Checkpoint(key, len(ids), ids, stash, 0, draft)
         self._touch(c)
         self.ckpts.append(c)
         return c
 
-    def finish(self, committed: array, spec: bool) -> list[Checkpoint]:
+    def finish(self, committed: array) -> list[Checkpoint]:
         """A request committed `committed` (positions [0, E)); returns the checkpoints it invalidated."""
         self.kv_ids = committed
-        if spec:
-            self.draft_ids = committed                  # the drafter rows track every committed token
         dead = [c for c in self.ckpts if c.pos > len(committed) or committed[:c.pos] != c.ids]
         for c in dead:
             self.ckpts.remove(c)
         return dead
 
-    def fail(self, start: int, spec: bool) -> list[Checkpoint]:
+    def fail(self, start: int) -> list[Checkpoint]:
         """A request failed after writing from `start`: only positions below it are still known."""
         self.kv_ids = self.kv_ids[:start]
-        if spec:
-            self.draft_ids = self.draft_ids[:start]
         dead = [c for c in self.ckpts if c.pos > start]
         for c in dead:
             self.ckpts.remove(c)
@@ -1245,7 +1296,7 @@ class TPEngine:
             self._drop_all_next = False
         if px is None or not use_cache:
             return None, 0, None, []
-        ck = px.plan(array("i", ids), spec)
+        ck = px.plan(array("i", ids))
         start = ck.pos if ck is not None else 0
         save, evicted = None, []
         if len(ids) - 1 >= px.min_tokens and len(ids) - 1 > start:
@@ -1258,18 +1309,40 @@ class TPEngine:
             frame["save"] = save
         return ck, start, save, evicted
 
-    def _prefix_state(self, ck: Checkpoint | None, start: int, evicted: list[Checkpoint]):
+    def _prefix_state(self, ck: Checkpoint | None, start: int, evicted: list[Checkpoint],
+                      spec: bool = False):
+        """The request's state (restored from `ck` or fresh), and for spec requests the first
+        position whose drafter main-kv row is known to belong to this sequence: 0 for a fresh
+        state (the spec prefill writes every row), the start of the restored window for a
+        checkpoint that carries one (put back here), `start` for one that does not."""
         state = self.backend.restore(ck.stash, start) if ck is not None else self.backend.new_state()
         for c in evicted:
             self.backend.drop_stash(c.stash)
-        return state
+        if not spec:
+            return state, None
+        if ck is None:
+            return state, 0
+        if ck.draft is not None and hasattr(self.backend, "set_draft_window"):
+            self.backend.set_draft_window(ck.draft, start)
+            return state, max(0, start - int(getattr(self.backend, "draft_window_rows", 0)))
+        return state, start
 
-    def _prefix_save(self, key: int | None, state, ids: list[int]) -> None:
+    def _draft_window_at(self, pos: int, draft_from: int | None):
+        """The drafter window to keep with a checkpoint at `pos`, if every row of it is known."""
+        if draft_from is None or not hasattr(self.backend, "draft_window"):
+            return None
+        if draft_from > max(0, pos - int(getattr(self.backend, "draft_window_rows", 0))):
+            return None
+        return self.backend.draft_window(pos)
+
+    def _prefix_save(self, key: int | None, state, ids: list[int], draft_from: int | None = None) -> None:
         if key is not None:
-            self.prefix.add(key, array("i", ids[: len(ids) - 1]), self.backend.stash(state))
+            n = len(ids) - 1
+            self.prefix.add(key, array("i", ids[:n]), self.backend.stash(state), self._draft_window_at(n, draft_from))
 
     def _prefix_end(self, state, frame: dict, start: int, spec: bool, committed: list[int] | None,
-                    pending: int | None, use_cache: bool, end_pos: int | None = None) -> None:
+                    pending: int | None, use_cache: bool, end_pos: int | None = None,
+                    draft_from: int | None = None) -> None:
         """Settle the record after a request, before its state is released: `committed` is the
         token sequence now at positions [0, E) (None: the request failed). Drops the checkpoints
         its writes invalidated, saves the final state, and adds both to the end frame. Runs for
@@ -1283,11 +1356,11 @@ class TPEngine:
         if px is None:
             return
         if committed is None:
-            dead = px.fail(start, spec)
+            dead = px.fail(start)
             keys = [c.key for c in dead] + ([pending] if pending is not None else [])
         else:
             seq = array("i", committed)
-            dead = px.finish(seq, spec)
+            dead = px.finish(seq)
             keys = [c.key for c in dead]
         for c in dead:
             self.backend.drop_stash(c.stash)
@@ -1304,7 +1377,7 @@ class TPEngine:
             if back:
                 self.backend.rewind(state, back)
                 frame["rewind"] = back
-            px.add(key, seq[:save_at], self.backend.stash(state))
+            px.add(key, seq[:save_at], self.backend.stash(state), self._draft_window_at(save_at, draft_from))
             frame["save"] = key
         if keys:
             frame["drop"] = keys
@@ -1331,7 +1404,7 @@ class TPEngine:
         detok = _Detok(getattr(self.tk, "_tk", self.tk))
         text = ""
         try:
-            state = self._prefix_state(ck, start, evicted)
+            state, _ = self._prefix_state(ck, start, evicted)
             _prefill(self.backend, ids, state, False, start)
             self._prefix_save(pending, state, ids)
             pending = None
@@ -1378,11 +1451,12 @@ class TPEngine:
                 "eos": eos, "eos_reason": reason, "spec_used": False}
 
     def _finish_request(self, state, end: dict, start: int, spec: bool, committed: list[int] | None,
-                        pending: int | None, use_cache: bool, n_ids: int, end_pos: int | None = None) -> None:
+                        pending: int | None, use_cache: bool, n_ids: int, end_pos: int | None = None,
+                        draft_from: int | None = None) -> None:
         """Request teardown on rank 0 (both paths): prefix record and end-of-request checkpoint,
         state release, memory trim, then the end frame that makes rank 1 do the same."""
         try:
-            self._prefix_end(state, end, start, spec, committed, pending, use_cache, end_pos)
+            self._prefix_end(state, end, start, spec, committed, pending, use_cache, end_pos, draft_from)
         except Exception as exc:                                        # noqa: BLE001
             # the record no longer matches what the ranks hold: forget every checkpoint
             self.log(f"tp: prefix cache bookkeeping failed ({type(exc).__name__}: {exc}); clearing it")
@@ -1414,7 +1488,6 @@ class TPEngine:
                 self.backend.drop_stash(c.stash)
             px.ckpts.clear()
             px.kv_ids = array("i")
-            px.draft_ids = array("i")
             self._drop_all_next = True
 
     def _prefix_reset(self, end: dict) -> None:
@@ -1426,7 +1499,6 @@ class TPEngine:
                 pass
         px.ckpts.clear()
         px.kv_ids = array("i")
-        px.draft_ids = array("i")
         end.pop("save", None)
         end.pop("rewind", None)
         end.pop("drop", None)
@@ -1442,7 +1514,7 @@ class TPEngine:
         self.channel.send(begin)
         end = {"op": "end", "req": self.requests}
         state = None
-        committed = end_pos = None
+        committed = end_pos = draft_from = None
         n_new = 0
         eos = False
         reason = "max_new_tokens"
@@ -1454,7 +1526,7 @@ class TPEngine:
         block = int(self.backend.dspark_block)
         try:
             with torch.inference_mode():
-                state = self._prefix_state(ck, start, evicted)
+                state, draft_from = self._prefix_state(ck, start, evicted, spec=True)
                 pparams = _prefill(self.backend, ids, state, True, start)
                 taps = (pparams or {}).get("export_states")
                 if taps:
@@ -1462,7 +1534,7 @@ class TPEngine:
                     # once from the returned taps, as before. The real backend validates each
                     # chunk's export and primes per chunk inside prefill().
                     self.backend.draft_prefill_kv(taps)
-                self._prefix_save(pending, state, ids)
+                self._prefix_save(pending, state, ids, draft_from)
                 pending = None
                 t_first = time.perf_counter()
                 anchor, position = int(ids[-1]), len(ids) - 1
@@ -1529,7 +1601,8 @@ class TPEngine:
                     text += tail
                     emit(tail)
         finally:
-            self._finish_request(state, end, start, True, committed, pending, use_cache, len(ids), end_pos)
+            self._finish_request(state, end, start, True, committed, pending, use_cache, len(ids), end_pos,
+                                 draft_from)
         t1 = time.perf_counter()
         t_first = t_first if t_first is not None else t1
         return {"cached_tokens": start, "new_tokens": n_new, "prompt_tokens": len(ids),

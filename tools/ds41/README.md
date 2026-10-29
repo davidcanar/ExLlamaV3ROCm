@@ -170,8 +170,12 @@ both ranks prefill only the rest; `cached_tokens` / `timings.cache_n` report the
   prefix of the committed sequence: after each request it drops the checkpoints the request's
   writes invalidated (any request, `cache_prompt: false` included), and evicts the least
   recently used when the slots are full.
-- The drafter's main-kv (rank 0) is position-indexed too, but only spec requests write it:
-  spec requests restore at most as far as the last spec request's sequence (`draft_ids`).
+- The DSpark drafter (rank 0) only reads the main-kv rows of the last 128 positions, so its
+  main-kv is a ring of `EXL3_TP_DRAFT_RING` pages (10 by default: one 2048-row prefill chunk
+  plus the window; 7.5 MiB instead of 1.5 GiB at 512K). Spec checkpoints keep that window
+  (384 KiB) and a restore puts it back, so drafting after a restore reads the right rows even
+  when the ring has wrapped since. A checkpoint from a plain request has no window: restoring
+  it is still exact, only the drafts within the first 128 positions are poorer.
 - `cache_prompt: false` skips restore and checkpoints for that request; a new `cache_salt`
   drops every checkpoint (`reset_prefix_cache`).
 - One linear sequence: a request that diverges early (a client's side request for a title,
@@ -241,7 +245,10 @@ DS41_REF_DIR=/home/davidcanar/exl3ds4/model ../../.venv/bin/python -m pytest -q 
   rejected drafts left behind): every scenario (multi-turn, retry, verbatim continuation,
   divergence, plain/spec mixes, `cache_prompt: false`, LRU eviction, a rank-0 failure
   mid-request, `cache_salt`) runs with the cache on and off and the replies must be identical;
-  both ranks' model calls and checkpoint tables must match.
+  both ranks' model calls and checkpoint tables must match. The spec stand-in keeps its drafter
+  rows in a small ring and counts drafts that read rows of another sequence: none may, except
+  right after restoring a plain request's checkpoint; a long reply that wraps the ring past a
+  checkpoint must still draft from the right rows after the restore.
 
 ## Knobs and defaults
 
@@ -273,6 +280,7 @@ DS41_REF_DIR=/home/davidcanar/exl3ds4/model ../../.venv/bin/python -m pytest -q 
 | `EXL3_TP_PREFIX_MIN` | 256 | shortest prefix worth a checkpoint, in tokens |
 | `EXL3_TP_PREFIX_END` | 1 | also checkpoint the end of each reply (useful when clients echo replies verbatim, e.g. tool calls) |
 | `EXL3_TP_PREFIX_LOG` | 0 | log one line per request: reused tokens and the checkpoint positions |
+| `EXL3_TP_DRAFT_RING` | span/256 + 2 (10) | DSpark drafter main-kv ring in pages (rank 0); 0 = allocate the whole context (1.5 GiB at 512K) |
 
 `EXL3_TP_SPAN`, `EXL3_TP_CACHE_TOKENS`, `EXL3_TP_USE_PER_DEVICE` and `EXL3_TP_MEM_FLOOR` join
 the DSpark/env variables the launchers forward to Box2 (ssh forwards nothing): the chunk plan

@@ -135,8 +135,9 @@ On other machines, override the rig's addresses and paths:
 ## Known limitations
 
 - If either rank dies mid-request, restart both (`exl3ds4.sh restart`).
-- Memory is tight: GPU memory is system RAM, and the model leaves ~2 GiB per
-  box for the OS. Keep other heavy jobs off the boxes while serving.
+- Memory is tight: GPU memory is system RAM, and the model leaves ~3.6 GiB on
+  Box1 and ~2 GiB on Box2 for the OS. Keep other heavy jobs off the boxes while
+  serving.
 - Greedy output is not always bit-identical between two identical requests
   (see [docs/PERFORMANCE.md](docs/PERFORMANCE.md#reproducibility)).
 - No vision input. Prefill speed at the full 512K context is unmeasured.

@@ -85,16 +85,24 @@ GPU allocation competes with the OS.
 |---|---:|---:|
 | weights (load budgets with DSpark) | 95 GiB | 104 GiB |
 | DSA KV pools at 512K tokens (fp16) | 1.6 GiB | 1.6 GiB |
-| DSpark drafter main-kv at 512K tokens | 1.5 GiB | — |
+| DSpark drafter main-kv (ring of 10 pages) | 7.5 MiB | — |
 | prefix checkpoints (2 × 32 MiB) | 64 MiB | 64 MiB |
-| RAM left for the OS | ~1.8 GiB | ~2 GiB |
+| RAM left for the OS | ~3.6 GiB | ~2 GiB |
 
 The KV cache is small: V4.1-Flash keeps four pool-owning layers (2, 8, 14, 20;
 the other layers read their owner's pool), three at compression rate 2 and one
 at rate 1, 1,280 bytes per entry. It has to stay in memory: every decode step
-scores the indexer keys of every cached position. The drafter's main-kv is
-allocated for the full context, but the drafter only ever reads the last 128
-positions.
+scores the indexer keys of every cached position.
+
+The DSpark drafter only ever reads the main-kv rows of the last 128 positions,
+yet its cache used to be allocated for the whole context: 512K positions × 3
+drafter layers × 1 KiB = 1.5 GiB on Box1. It is now a ring of 10 pages
+(`EXL3_TP_DRAFT_RING`; one prefill chunk plus the window, 7.5 MiB), and prefix
+checkpoints keep the drafter's window so a restore after the ring wrapped still
+drafts from the right rows. A/B on Box1, 60 s after a restart: 2,160 MiB
+available with the full cache, 3,662 MiB with the ring. Greedy acceptance is
+unchanged (2.33 per round at 847 tokens, 2.75 at 25.7K), and a corrupt-and-restore
+check on the real drafter (`perf/draft_ring_check.py`) gives bit-identical drafts.
 
 The rank-0 process had ~8.5 GiB swapped out right after a restart, and the box
 had ~0.9 GiB free. Keep other memory-hungry or CPU-heavy jobs off the boxes
@@ -131,3 +139,4 @@ exact results, with the pool disabled and with CPU load on both boxes.
 | `PROF_DRIVER=prefix_logits.py perf/run_prof.sh pfx` | first-token logits, cached vs fresh (`PFX_ALIGN=1`: bit-exact variant) |
 | `perf/run_bench.sh` | cross-box all-reduce latency, RCCL vs `odl_ar2` |
 | `perf/run_stress.sh` | large RCCL all-reduces with exact checks (link robustness) |
+| `PROF_DRIVER=draft_ring_check.py perf/run_prof.sh ring` | the drafter ring: draft before and after a corrupt-and-restore of its window |
