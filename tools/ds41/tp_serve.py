@@ -83,6 +83,7 @@ async def _tp_status(request: web.Request) -> web.Response:
         "status": "ok" if rank1 in ("ok", "busy", "unknown") else "degraded",
         "source": "exl3-tp-serve", "rank1": rank1, "proto": tp_engine.PROTO,
         "dspark": bool(getattr(engine, "dspark", False)),
+        "vision": bool(getattr(engine, "supports_vision", False)),
         "requests": getattr(engine, "requests", None),
         "ctx": getattr(engine, "ctx", None), "sessions": 1,
     })
@@ -101,13 +102,19 @@ def build_tp_engine(args: argparse.Namespace) -> Any:
     channel = tp_engine.ControlChannel.listen(
         args.control_host, args.control_port,
         accept_timeout=tp_engine.env_float("EXL3_TP_ACCEPT_TIMEOUT", 1800.0), log=print)
+    vision = getattr(backend, "vision", None) is not None
     channel.send({"op": "hello", "proto": tp_engine.PROTO, "vocab_size": backend.vocab_size,
-                  "dspark": bool(backend.dspark)})
+                  "dspark": bool(backend.dspark), "vision": vision})
     reply = channel.recv()
     if reply.get("op") != "hello_ok" or int(reply.get("proto", -1)) != tp_engine.PROTO \
             or int(reply.get("rank", -1)) != 1:
         startup_health.abort(f"rank 1 handshake failed: {reply}")
         raise SystemExit(f"tp-serve: rank 1 handshake failed: {reply}")
+    if not bool(reply.get("vision_capable", False)):
+        startup_health.abort("rank 1 does not speak this control protocol's vision frames "
+                             f"(proto {tp_engine.PROTO}); sync tools/ds41 on both boxes and restart")
+        raise SystemExit("tp-serve: rank 1 lacks vision support (old tp_engine.py on Box2?) -- "
+                         "restart both ranks with the same tools/ds41")
     if int(reply.get("vocab_size", -1)) != backend.vocab_size:
         startup_health.abort("rank 1 loaded a different vocabulary")
         raise SystemExit(f"tp-serve: vocab mismatch with rank 1 ({reply.get('vocab_size')} != {backend.vocab_size});"
@@ -119,6 +126,12 @@ def build_tp_engine(args: argparse.Namespace) -> Any:
                          f"rank 1 {bool(reply.get('dspark'))}); {which}")
     print(f"tp-serve: rank 1 connected and verified (vocab {backend.vocab_size}, "
           f"dspark {'on' if backend.dspark else 'off'})", flush=True)
+    if vision:
+        print("tp-serve: vision on (rank 0 tower + aligner loaded; image requests ship their rows "
+              "to rank 1 per request; image prompts bypass the prefix cache)", flush=True)
+    else:
+        print("tp-serve: vision off (image requests are refused with 400; EXL3_TP_VISION=0, a "
+              "degraded load or a text-only model -- see the load log)", flush=True)
     if backend.dspark:
         which = "greedy and sampled requests" if tp_engine.SPEC_SAMPLED else "greedy requests (temperature 0)"
         print(f"tp-serve: DSpark speculative decoding on (block {backend.dspark_block}, max_history "

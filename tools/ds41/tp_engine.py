@@ -23,6 +23,28 @@ by control frames; it never reads a forward's return value (cross-host TP produc
 output rank, rank 0, only). Model collectives (RCCL over Odinlink) stay symmetric; the control
 channel only sequences the loop, exactly like the TokenChannel of the manual script.
 
+Vision (2026-10-29, `tp_vision.py`; rank 0 loads the tower + aligner, `component = "vision"`,
+EXL3_TP_VISION=0 disables, EXL3_TP_VISION_STRICT=1 makes a load/floor failure fatal instead of
+degrading to text-only):
+- image requests carry ids >= 1000000000 (the indexed-embeddings dynamic base, PR #449): the
+  trunk is natively multimodal through `params["indexed_embeddings"]` (MoE bias_vl routing,
+  Engram n-gram block, PLE mapping all key off those ids), so rank 1 only needs the tower's
+  OUTPUT ROWS, not the tower. Rank 0 computes them once per image, ships them as one imgmeta
+  frame + raw binary frames (sha256-validated), and both ranks attach the same list to every
+  prefill chunk; decode steps never see image ids (a prompt must end on a text token)
+- the vendored chat layer renders one `<｜deepseek_image｜>` per image; `prepare_images`
+  (CPU, off the event loop) decodes safely (data:/base64/http(s), byte + pixel caps) and plans
+  the exact token span from the tower's own resize math; `prompt_ids(prompt, images)` splices
+  each occurrence into its unique dynamic-id range, so lengths account for the expansion
+- image requests bypass the prefix cache entirely (no restore, no save): the dynamic ids are
+  unique per allocation, so cross-request identity would need pixel hashing -- deliberately
+  not attempted in this first version. Text requests keep the cache, including against the
+  text prefix an image request left in the cache (identical ids, still valid)
+- DSpark composes with vision (the drafter never sees image ids: it drafts from the anchor
+  and verifies text rows) -- and a first vision run that does not fit VRAM beside the drafter
+  is practical per launch with `EXL3_TP_DSPARK=0 ./exl3ds4.sh restart` (both ranks read it;
+  no file edits, budgets fall back to the no-drafter defaults)
+
 Optional DSpark (MTP speculative decoding), opt-in at load time with EXL3_TP_DSPARK=1 on BOTH
 ranks, follows scripts/tp_ds41_dspark.py (the proven two-node path) op for op:
   - both ranks build the trunk cache with max_history=8 and load with per-rank budgets
@@ -46,14 +68,22 @@ Lockstep rule: every stop decision (eos token, stop string, max_tokens, cancel) 
 AFTER sampling a token and BEFORE sending its `step` frame. Once a `step` has been sent, the next
 forward is committed on both ranks, so the two ranks always issue the same number of collectives.
 
-Control protocol (framed JSON over TCP: 4-byte little-endian length prefix, then UTF-8 bytes):
-  rank 0 -> rank 1: {"op": "hello", "proto": 3, "vocab_size": V, "dspark": B}   handshake after both loads
+Control protocol (framed JSON over TCP: 4-byte little-endian length prefix, then UTF-8 bytes;
+binary payloads -- vision rows -- use the same length prefix with a 0x01 tag byte ahead of the
+raw bytes, which no JSON frame can start with):
+  rank 0 -> rank 1: {"op": "hello", "proto": 4, "vocab_size": V, "dspark": B, "vision": B}   handshake
                     {"op": "begin", "req": N, "ids": [int, ...], "spec": B}     new request (fresh state)
+                      ids may hold image rows as dynamic ids >= 1000000000 when an
+                      imgmeta frame with matching ranges preceded the begin
                       + "restore": K, "start": S   prefix cache: restore checkpoint K (position S)
                                                    and prefill only ids[S:]
                       + "drop": [K, ...]           drop these checkpoints (after the restore)
                       + "save": K                  checkpoint the state after the prefill as K
                       + "drop_all": true           first drop every checkpoint (cache_salt reset)
+                    {"op": "imgmeta", "n": K, "images": [spec...]}   vision: the tower's rows follow
+                      as K binary frames (alias, id range, rows/dim/dtype, sha256 per image);
+                      rank 1 rebuilds its indexed_embeddings and answers imgmeta_ok BEFORE
+                      rank 0 sends begin (a corrupt shipment never reaches a model call)
                     {"op": "step", "req": N, "token": T}                        plain decode: feed T next
                     {"op": "round", "req": N, "k": K, "window": [int, ...]}     spec: verify [anchor, drafts]
                     {"op": "accept", "req": N, "accepted": A}                   spec: settle, rewind(k - A)
@@ -63,7 +93,9 @@ Control protocol (framed JSON over TCP: 4-byte little-endian length prefix, then
                         "drop_all": true clears every checkpoint after a rank-0 bookkeeping failure)
                     {"op": "ping"}                                             liveness probe (idle only)
                     {"op": "shutdown"}                                         clean exit
-  rank 1 -> rank 0: {"op": "hello_ok", "proto": 3, "rank": 1, "vocab_size": V, "dspark": B}
+  rank 1 -> rank 0: {"op": "hello_ok", "proto": 4, "rank": 1, "vocab_size": V, "dspark": B,
+                     "vision_capable": B}   (proto-4 workers speak imgmeta + binary frames)
+                    {"op": "imgmeta_ok", "req": N, "images": K, "rows": R}      vision rows landed intact
                     {"op": "pong"}
                     {"op": "error", "message": "..."}                          rank 1 failed; restart both
 
@@ -122,8 +154,12 @@ from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 
-PROTO = 3                    # 3: prefix-cache fields on begin/end (a proto-2 rank 1 would desync)
-MAX_FRAME = 1 << 26          # 64 MiB frame guard
+import tp_vision
+
+PROTO = 4                    # 4: vision frames (imgmeta + binary blobs, hello.vision) and the
+                             #    dynamic-id prompt rows they license; a proto-3 rank 1 would
+                             #    misread an imgmeta frame as JSON and desync
+MAX_FRAME = 1 << 26          # 64 MiB frame guard (JSON and binary frames alike)
 MAX_HISTORY = 8              # recurrent rollback capacity of the spec path (as the proven script)
 
 _ROOT = os.environ.get(
@@ -164,6 +200,41 @@ class ChannelClosed(ConnectionError):
 
 class ProtocolError(RuntimeError):
     """The peer sent a frame this side does not understand."""
+
+
+_BLOB_TAG = b"\x01"          # binary-frame tag: no JSON frame can start with this byte
+
+
+def _mm_embedding_mod():
+    """exllamav3.tokenizer.mm_embedding, imported lazily (CPU tests run without a model)."""
+    global FIRST_MM_EMBEDDING_INDEX
+    from exllamav3.tokenizer import mm_embedding
+    if FIRST_MM_EMBEDDING_INDEX != mm_embedding.FIRST_MM_EMBEDDING_INDEX:
+        raise RuntimeError(
+            f"exllamav3 dynamic-id base {mm_embedding.FIRST_MM_EMBEDDING_INDEX} differs from this "
+            f"engine's {FIRST_MM_EMBEDDING_INDEX}; the shipped prompt rows would address the wrong ids")
+    return mm_embedding
+
+
+FIRST_MM_EMBEDDING_INDEX = tp_vision.FIRST_MM_EMBEDDING_INDEX
+
+
+def make_mm_embedding(first_index: int, rows, *, alias: str = "", metadata: dict | None = None):
+    """An MMEmbedding bound to an explicit dynamic-id range (the engine assigns ranges at
+    prepare time so prompt_ids and generate agree without rerunning the allocator).
+
+    Built through the same dict form recv_embeddings uses on TP workers, so rank 0 (fresh
+    tower rows) and rank 1 (rows off the wire) produce identical objects."""
+    mod = _mm_embedding_mod()
+    n = int(rows.shape[0])
+    return mod.MMEmbedding(imp={
+        "metadata": dict(metadata or {}),
+        "full_length": n, "mm_length": n,
+        "first_index": int(first_index), "last_index": int(first_index) + n,
+        "text_alias": alias or None, "grid_thw": None, "mrope_merge_size": None,
+        "embeddings": rows, "deepstack_embeddings": None,
+        "align": 0, "align_phase": 0, "align_lead": 0,
+    })
 
 
 def _torch_generator(seed: int | None):
@@ -354,21 +425,56 @@ class ControlChannel:
             buf += chunk
         return bytes(buf)
 
-    def send(self, msg: dict) -> None:
-        payload = json.dumps(msg, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    def _send_frame(self, payload: bytes) -> None:
         if len(payload) > MAX_FRAME:
             raise ValueError(f"control frame too large: {len(payload)} bytes")
+        self.conn.sendall(struct.pack("<I", len(payload)) + payload)
+
+    def send(self, msg: dict) -> None:
+        payload = json.dumps(msg, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         with self.lock:
-            self.conn.sendall(struct.pack("<I", len(payload)) + payload)
+            self._send_frame(payload)
+
+    def send_blob(self, data: bytes) -> None:
+        """One binary frame (vision rows). Same length-prefixed envelope as JSON frames; a
+        leading 0x01 tag byte distinguishes the two, and no JSON payload can begin with it
+        (JSON frames always start with '{')."""
+        with self.lock:
+            self._send_frame(_BLOB_TAG + data)
+
+    def send_with_blobs(self, msg: dict, blobs: list[bytes]) -> None:
+        """One JSON frame followed by its binary frames, atomically under the channel lock:
+        nothing (not even a ping) can interleave, and the reader knows to take exactly
+        len(blobs) binary frames after the JSON frame that announced them."""
+        payload = json.dumps(msg, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        with self.lock:
+            self._send_frame(payload)
+            for blob in blobs:
+                self._send_frame(_BLOB_TAG + blob)
 
     def recv(self) -> dict:
         (length,) = struct.unpack("<I", self._read_exact(4))
         if not 0 < length <= MAX_FRAME:
             raise ChannelClosed(f"bad control frame length {length}")
-        msg = json.loads(self._read_exact(length).decode("utf-8"))
+        payload = self._read_exact(length)
+        if payload[:1] != b"{":
+            if payload[:1] == _BLOB_TAG:
+                raise ProtocolError("expected a JSON control frame but a binary frame arrived (desync)")
+            raise ChannelClosed("control frame is not JSON")
+        msg = json.loads(payload.decode("utf-8"))
         if not isinstance(msg, dict):
             raise ChannelClosed("control frame is not a JSON object")
         return msg
+
+    def recv_blob(self) -> bytes:
+        """The raw bytes of one binary frame (rank 1, after an imgmeta JSON frame)."""
+        (length,) = struct.unpack("<I", self._read_exact(4))
+        if not 0 < length <= MAX_FRAME:
+            raise ChannelClosed(f"bad control frame length {length}")
+        payload = self._read_exact(length)
+        if payload[:1] != _BLOB_TAG:
+            raise ProtocolError("expected a binary frame after imgmeta; a JSON frame arrived instead")
+        return payload[1:]
 
     def request(self, msg: dict, timeout: float = 30.0) -> dict:
         """Send one frame and wait for one reply with a shorter socket timeout (liveness probes)."""
@@ -377,6 +483,19 @@ class ControlChannel:
             self.conn.settimeout(timeout)
             try:
                 self.send(msg)
+                return self.recv()
+            finally:
+                self.conn.settimeout(old)
+
+    def request_with_blobs(self, msg: dict, blobs: list[bytes], timeout: float = 120.0) -> dict:
+        """Send one JSON frame plus its binary frames and wait for one JSON reply (the
+        imgmeta -> imgmeta_ok handshake; a shipment rank 1 could not land intact never
+        reaches a model call)."""
+        with self.lock:
+            old = self.conn.gettimeout()
+            self.conn.settimeout(timeout)
+            try:
+                self.send_with_blobs(msg, blobs)
                 return self.recv()
             finally:
                 self.conn.settimeout(old)
@@ -460,7 +579,7 @@ class TPModelBackend:
     def __init__(self, model, cache, tokenizer, *, span: int, cache_tokens: int, rank: int = 0,
                  dspark: bool = False, draft_model=None, draft_cache=None, draft_bt=None,
                  export_layers=frozenset(), dspark_block: int = 5, page_size: int = 256,
-                 draft_window_rows: int = 128):
+                 draft_window_rows: int = 128, vision=None, vision_cfg=None):
         self.model = model
         self.cache = cache
         self.tokenizer = tokenizer
@@ -476,12 +595,17 @@ class TPModelBackend:
         self.page_size = int(page_size)
         self.draft_window_rows = int(draft_window_rows)
         self.vocab_size = int(tokenizer.actual_vocab_size)
+        self.vision = vision                      # the component="vision" tower+aligner Model,
+        self.vision_cfg = vision_cfg              # rank 0 only; None everywhere else. vision_cfg is
+        # the config.vision namespace (patch_size, downsample_ratio, max_n_token, min_pixels,
+        # max_wh_ratio) the CPU-side geometry plan of tp_vision needs -- present whenever the
+        # config describes a tower, even when the tower itself is not loaded.
 
     @classmethod
     def load(cls, *, rank: int, world_size: int = 2, model_dir: str | None = None,
              engram_dir: str | None = None, cache_tokens: int | None = None, span: int | None = None,
              mem_per_device=None, budgets=None, dspark: bool | None = None, progress: bool | None = None,
-             log: Callable[[str], None] = print) -> "TPModelBackend":
+             vision: bool | None = None, log: Callable[[str], None] = print) -> "TPModelBackend":
         """Two-node TP load, exactly like scripts/tp_ds41_generate.py (Engram tables included).
 
         With EXL3_TP_DSPARK=1 (or `dspark=True`), the trunk cache gets max_history=8, the default
@@ -607,11 +731,48 @@ class TPModelBackend:
                 f"{ring_mib:.1f} MiB)")
             check_memory_floor("after the DSpark drafter load", rank=rank, floor_gib=floor_gib, log=log)
 
+        # ---- rank 0 only: the vision tower + aligner, beside the TP trunk ---------------------
+        # (a separate non-TP Model: its forward issues no collectives, so rank 1's dispatch
+        # sequence is unaffected; rank 1 never loads it -- it only receives the tower's output
+        # rows per request, over the control channel, as indexed_embeddings)
+        vision_model = None
+        want_vision = env_truthy("EXL3_TP_VISION", True) if vision is None else bool(vision)
+        tower_present = getattr(config, "vision", None) is not None and "vision" in config.model_classes
+        if want_vision and rank == 0 and tower_present:
+            strict = env_truthy("EXL3_TP_VISION_STRICT", False)
+            try:
+                started = time.time()
+                vision_model = Model.from_config(config, component="vision")
+                vision_model.load(progressbar=False)
+                check_memory_floor("after the vision tower load", rank=rank, floor_gib=floor_gib, log=log)
+                log(f"tp: rank {rank} vision tower + aligner loaded in {time.time() - started:.1f} s "
+                    f"(image input on; a request pays one tower pass per image)")
+            except Exception as exc:                                        # noqa: BLE001  (degrade, or rethrow)
+                if vision_model is not None:
+                    try:
+                        vision_model.unload()
+                    except Exception:                                       # noqa: BLE001
+                        pass
+                    vision_model = None
+                if strict:
+                    raise
+                # Degrade to text-only instead of wedging the box: the server comes up, refuses
+                # image requests with a clean 400, and the log says exactly what to change.
+                log(f"tp: rank {rank} WARNING: vision unavailable ({type(exc).__name__}: {exc}); "
+                    f"serving text-only. Room for the tower: restart with EXL3_TP_DSPARK=0 (frees "
+                    f"the drafter budget; both ranks), lower EXL3_TP_BUDGETS, or accept text-only "
+                    f"with EXL3_TP_VISION=0. EXL3_TP_VISION_STRICT=1 makes this fatal.")
+        elif want_vision and rank == 0 and not tower_present:
+            if vision is not None or os.environ.get("EXL3_TP_VISION", ""):
+                raise RuntimeError("EXL3_TP_VISION=1 but this model folder has no vision tower tensors")
+            log(f"tp: rank {rank} config has no vision tower tensors; serving text-only")
+
         tokenizer = Tokenizer.from_config(config)
         return cls(model, cache, tokenizer, span=span, cache_tokens=cache_tokens, rank=rank,
                    dspark=dspark, draft_model=draft_model, draft_cache=draft_cache, draft_bt=draft_bt,
                    export_layers=export_layers, dspark_block=block, page_size=PAGE_SIZE,
-                   draft_window_rows=int(config.sliding_window))
+                   draft_window_rows=int(config.sliding_window), vision=vision_model,
+                   vision_cfg=getattr(config, "vision", None))
 
     def new_state(self):
         import torch
@@ -661,7 +822,7 @@ class TPModelBackend:
         except Exception:                                                   # noqa: BLE001  (CPU tests, no GPU)
             pass
 
-    def prefill(self, ids: list[int], state, spec: bool = False, start: int = 0):
+    def prefill(self, ids: list[int], state, spec: bool = False, start: int = 0, embeddings=None):
         """Cached prefill of all but the last prompt token (the decode loop feeds that one),
         in `span`-row chunks, from position `start` (a restored prefix-cache checkpoint; the
         state must be at that position, 0 for a fresh state).
@@ -673,6 +834,13 @@ class TPModelBackend:
         recurrent state's position (the library asserts the match); one pass per chunk also
         bounds the activation transient to the loader's measured max_chunk_size instead of the
         full prompt length.
+
+        `embeddings` (image requests) is attached to EVERY chunk as indexed_embeddings: the
+        ids of an image span are dynamic ids >= 1e9, and whichever chunk holds them must carry
+        the rows they address. The library ships the list to this rank's workers itself
+        (prepare_inputs_for_tp -> send_embeddings), so both ranks attach their own identical
+        list and nothing image-shaped rides the collectives. Text requests pass None and get
+        byte-for-byte the params they always had.
 
         With `spec=True` every chunk exports the DSpark taps at the target layers (identical
         dispatch on both ranks); rank 0 then projects that chunk's taps into the drafter's kv
@@ -698,6 +866,8 @@ class TPModelBackend:
                 "past_len": int(a),
                 "recurrent_states": [state],
             }
+            if embeddings is not None:
+                params["indexed_embeddings"] = list(embeddings)
             if spec:
                 params["export_state_layers"] = self.export_layers
             self.model.prefill(torch.tensor(ids[a:b], dtype=torch.long).view(1, -1), params)
@@ -820,38 +990,50 @@ class TPModelBackend:
         )
 
     def unload(self) -> None:
+        if self.vision is not None:
+            self.vision.unload()
         if self.draft_model is not None:
             self.draft_model.unload()
         self.model.unload()
 
-    def forward(self, token: int, position: int, state):
+    def forward(self, token: int, position: int, state, embeddings=None):
         """One plain decode step: feed `token` with `past_len=position`. The block table spans
         the whole cache, so decode steps at any position stay inside the DSA pool. Returns the
         logits row cropped to the real vocabulary on the output rank, None on every other rank
         (cross-host TP returns no logits there by design -- reading them raised on rank 1 and
-        wedged the collectives)."""
+        wedged the collectives).
+
+        `embeddings` (image requests) is attached only when the fed id is itself a dynamic
+        image id (>= 1e9), which happens only for the first forward of a prompt that ends on
+        an image span -- the engine refuses those prompts today, so in practice every decode
+        step carries no image payload at all. Both ranks make the same decision from the same
+        id, so the collective sequences stay identical."""
         import torch
-        logits = self.model.forward(
-            torch.tensor(int(token), dtype=torch.long).view(1, 1),
-            params={
-                "attn_mode": "flash_attn",
-                "cache": self.cache,
-                "batch_shape": (1, self.cache_tokens),
-                "past_len": int(position),
-                "recurrent_states": [state],
-                "last_tokens_only": 1,
-            },
-        )
+        params = {
+            "attn_mode": "flash_attn",
+            "cache": self.cache,
+            "batch_shape": (1, self.cache_tokens),
+            "past_len": int(position),
+            "recurrent_states": [state],
+            "last_tokens_only": 1,
+        }
+        if embeddings is not None and int(token) >= FIRST_MM_EMBEDDING_INDEX:
+            params["indexed_embeddings"] = list(embeddings)
+        logits = self.model.forward(torch.tensor(int(token), dtype=torch.long).view(1, 1), params)
         if self.rank != self.OUTPUT_RANK:
             return None
         return logits[0, -1, : self.vocab_size]
 
 
-def _prefill(backend, ids: list[int], state, spec: bool, start: int):
-    """backend.prefill from `start` (the CPU stand-ins without prefix-cache support never get one)."""
+def _prefill(backend, ids: list[int], state, spec: bool, start: int, embeddings=None):
+    """backend.prefill from `start` (the CPU stand-ins without prefix-cache support never get one).
+    Image requests add `embeddings`; the scripted test backends without the parameter are called
+    exactly as before (image tests use backends that accept it)."""
     if start:
-        return backend.prefill(ids, state, spec=spec, start=start)
-    return backend.prefill(ids, state, spec=spec)
+        return backend.prefill(ids, state, spec=spec, start=start,
+                               **({} if embeddings is None else {"embeddings": embeddings}))
+    return backend.prefill(ids, state, spec=spec,
+                           **({} if embeddings is None else {"embeddings": embeddings}))
 
 
 # ---- rank 1: the persistent mirror -------------------------------------------------------------------------
@@ -881,6 +1063,7 @@ class Rank1Worker:
         self.round_k = None        # k of the round frame awaiting its accept
         self.prompt_len = 0        # prefilled rows of the active request (memory-trim gating at end)
         self.stashes: dict[int, tuple[int, Any]] = {}   # prefix-cache checkpoints: key -> (position, stash)
+        self.embeddings = None     # image rows of the request being armed (imgmeta -> begin)
 
     def handshake(self) -> dict:
         hello = self.channel.recv()
@@ -891,7 +1074,8 @@ class Rank1Worker:
                 f"rank 1: control protocol mismatch (rank 0 sent {hello.get('proto')!r}, this worker speaks {PROTO})")
         self.channel.send({"op": "hello_ok", "proto": PROTO, "rank": 1,
                            "vocab_size": int(self.backend.vocab_size),
-                           "dspark": bool(getattr(self.backend, "dspark", False))})
+                           "dspark": bool(getattr(self.backend, "dspark", False)),
+                           "vision_capable": True})   # proto 4: imgmeta + binary frames understood
         self.log("tp: rank 1 handshake complete")
         return hello
 
@@ -908,6 +1092,8 @@ class Rank1Worker:
             try:
                 if op == "begin":
                     self._begin(msg)
+                elif op == "imgmeta":
+                    self._imgmeta(msg)
                 elif op == "step":
                     self._step(msg)
                 elif op == "round":
@@ -933,13 +1119,48 @@ class Rank1Worker:
                     pass
                 raise
 
+    def _imgmeta(self, msg: dict) -> None:
+        """Rank 0's tower output for the request being armed: one JSON frame plus n binary
+        frames. Validated (blob sizes, sha256, dynamic-id ranges) and rebuilt as this rank's
+        indexed_embeddings, then acknowledged BEFORE rank 0 sends begin -- a shipment that did
+        not land byte-exact never reaches a model call, where a bad row would fault inside a
+        collective and wedge rank 0's NCCL peer instead of erroring."""
+        if self.state is not None:
+            raise ProtocolError("rank 1: imgmeta while a request is still active")
+        specs = msg.get("images") or []
+        blobs = [self.channel.recv_blob() for _ in range(int(msg.get("n", len(specs))))]
+        try:
+            described = tp_vision.decode_imgmeta(msg, blobs, FIRST_MM_EMBEDDING_INDEX)
+        except ValueError as exc:
+            raise ProtocolError(f"rank 1: bad imgmeta shipment: {exc}") from exc
+        self.embeddings = [make_mm_embedding(d["first_index"], d["tensor"], alias=d["alias"],
+                                             metadata={"source": "rank0-wire"})
+                           for d in described]
+        self.channel.send({"op": "imgmeta_ok", "req": msg.get("req"), "images": len(self.embeddings),
+                           "rows": sum(int(d["rows"]) for d in described)})
+
     def _begin(self, msg: dict) -> None:
         if self.state is not None:
             raise ProtocolError("rank 1: begin while a request is still active")
         ids = [int(t) for t in msg["ids"]]
         if len(ids) < 2:
             raise ValueError("rank 1: prompt must hold at least 2 token ids")
-        bad = [t for t in ids if not 0 <= t < self.backend.vocab_size]
+        # Image rows ride as dynamic ids >= 1e9; they are legal only when an imgmeta shipment
+        # with covering ranges preceded this begin (rank 1 never sees the tower itself)
+        embeds = self.embeddings or None
+        mm_ids = [t for t in ids if t >= FIRST_MM_EMBEDDING_INDEX]
+        if mm_ids and embeds is None:
+            raise ValueError(f"rank 1: prompt holds {len(mm_ids)} image row id(s) but no imgmeta "
+                             "shipment preceded the begin")
+        if embeds is not None and not mm_ids:
+            raise ProtocolError("rank 1: imgmeta shipped but the begin ids hold no image rows")
+        if embeds is not None:
+            ranges = [(e.first_index, int(e.first_index) + int(e.mm_length)) for e in embeds]
+            for t in mm_ids:
+                if not any(a <= t < b for a, b in ranges):
+                    raise ValueError(f"rank 1: image row id {t} is outside every shipped range "
+                                     f"({[(a, b) for a, b in ranges]})")
+        bad = [t for t in ids if FIRST_MM_EMBEDDING_INDEX > t >= self.backend.vocab_size or t < 0]
         if bad:
             raise ValueError(f"rank 1: prompt token id {bad[0]} outside the vocabulary")
         # Cache bound, checked BEFORE any model call: past it the DSA pool faults inside a
@@ -970,12 +1191,15 @@ class Rank1Worker:
         # the same order as rank 0: restore (or a fresh state), drops, prefill, save
         self.state = self.backend.restore(entry[1], start) if restore is not None else self.backend.new_state()
         self._drop(msg.get("drop"))
-        _prefill(self.backend, ids, self.state, spec, start)
+        _prefill(self.backend, ids, self.state, spec, start, embeds)
         self.position = len(ids) - 1
         if msg.get("save") is not None:
             self._save(int(msg["save"]))
         if not spec:
-            self.backend.forward(ids[-1], self.position, self.state)
+            if embeds is not None and ids[-1] >= FIRST_MM_EMBEDDING_INDEX:
+                self.backend.forward(ids[-1], self.position, self.state, embeds)
+            else:
+                self.backend.forward(ids[-1], self.position, self.state)
             self.position += 1
         # spec mode: no first forward -- the round window carries the anchor at this position
 
@@ -984,7 +1208,14 @@ class Rank1Worker:
             raise ProtocolError("rank 1: step without begin")
         if self.spec:
             raise ProtocolError("rank 1: step during a spec request (mode is fixed per request)")
-        self.backend.forward(int(msg["token"]), self.position, self.state)
+        token = int(msg["token"])
+        # a dynamic image id is the only token that needs the rows (mirrors rank 0's gate);
+        # every real decode step carries nothing, and the plain test stand-ins keep their
+        # three-argument signature
+        if self.embeddings and token >= FIRST_MM_EMBEDDING_INDEX:
+            self.backend.forward(token, self.position, self.state, self.embeddings)
+        else:
+            self.backend.forward(token, self.position, self.state)
         self.position += 1
 
     def _round(self, msg: dict) -> None:
@@ -1044,6 +1275,7 @@ class Rank1Worker:
         self.request_id = None
         self.spec = False
         self.round_k = None
+        self.embeddings = None     # the next image request ships its own rows
         trim = getattr(self.backend, "trim_memory", None)    # rank 0 trims on long requests;
         if trim is not None and self.prompt_len > getattr(self.backend, "span", 0):
             trim()                                           # rank 1 mirrors at end (local-only op)
@@ -1061,6 +1293,7 @@ class Rank1Worker:
         self.spec = False
         self.round_k = None
         self.prompt_len = 0
+        self.embeddings = None
 
 
 # ---- rank 0: prompt reuse across requests ------------------------------------------------------------------
@@ -1224,6 +1457,10 @@ class TPEngine:
         self.vocab_size = int(backend.vocab_size)
         self.eos_id = eos_id
         self.dspark = bool(getattr(backend, "dspark", False))
+        self.vision = getattr(backend, "vision", None)         # the tower lives on rank 0 only
+        self.vision_cfg = getattr(backend, "vision_cfg", None)
+        self._mm_alloc = tp_vision.MMIndexAllocator()
+        self.image_token_id = self._resolve_image_token()
         self.requests = 0
         self.last_stats: dict[str, Any] = {}
         self._gen = _torch_generator(seed)
@@ -1237,16 +1474,105 @@ class TPEngine:
             self.prefix = None
         self._drop_all_next = False       # reset_prefix_cache ran: rank 1 drops its copies at the next begin
 
+    # -- vision (rank 0 prepares and ships; rank 1 receives through the control channel)
+    def _resolve_image_token(self) -> int | None:
+        """Id of `<｜deepseek_image｜>`, the one placeholder the rendered prompt carries per
+        image. The tokenizer's own entry wins (the HF tokenizer of the model folder); a
+        `image_token_id` attribute on a test tokenizer is honored too."""
+        explicit = getattr(self.tk, "image_token_id", None)
+        if isinstance(explicit, int) and explicit >= 0:
+            return int(explicit)
+        hf = getattr(self.tk, "_tk", None)
+        for getter in ("token_to_id",):
+            fn = getattr(hf, getter, None)
+            if fn is not None:
+                try:
+                    tid = fn("<｜deepseek_image｜>")
+                    if tid is not None:
+                        return int(tid)
+                except Exception:                                       # noqa: BLE001  (not an HF tokenizer)
+                    pass
+        return None
+
+    @property
+    def supports_vision(self) -> bool:
+        """The vendored server refuses image parts unless this is True (Engine contract)."""
+        return self.vision is not None and self.image_token_id is not None
+
+    def prepare_images(self, records: list[dict]) -> list[tp_vision.PreparedImage]:
+        """Request image records -> prepared images (CPU, off the event loop: fetch, decode,
+        geometry). Raises ImageError (a ValueError) on anything wrong; the server answers 400.
+
+        The span each image will occupy is fixed here (unique dynamic-id range + exact row
+        count from the tower's own resize math), so `prompt_ids` can expand placeholders and
+        count the expanded length before any GPU work happens."""
+        if not self.supports_vision:
+            raise tp_vision.ImageError("this server has no vision support (no tower loaded: "
+                                       "EXL3_TP_VISION=0, a failed load, or a text-only model)")
+        if not isinstance(records, list) or not records:
+            raise tp_vision.ImageError("prepare_images needs a non-empty list of image records")
+        limit = tp_vision.env_int("EXL3_TP_MAX_IMAGES", tp_vision.DEFAULT_MAX_IMAGES)
+        if len(records) > limit:
+            raise tp_vision.ImageError(f"{len(records)} images exceed the per-request limit of "
+                                       f"{limit} (EXL3_TP_MAX_IMAGES)")
+        return [tp_vision.prepare_one(r, self.vision_cfg, self._mm_alloc) for r in records]
+
+    def _vision_encode(self, images: list[tp_vision.PreparedImage]) -> list:
+        """Run the tower + aligner for each image (model thread, no collectives) and bind the
+        rows to the dynamic-id range assigned at prepare time. The block layout (start marker,
+        image rows, per-row newline, end marker) is the tower's own `get_image_embeddings`; the
+        row count is asserted against the prepare-time plan, so the CPU geometry and the tower
+        can never quietly disagree."""
+        import torch
+        out = []
+        dim = None
+        with torch.inference_mode():
+            for img in images:
+                mme = self.vision.get_image_embeddings(None, img.pil)
+                rows = mme.embeddings
+                if rows.shape[0] != img.n_tokens:
+                    raise RuntimeError(
+                        f"vision tower produced {rows.shape[0]} rows for {img.alias} but the "
+                        f"prepare-time plan promised {img.n_tokens} (grid {img.n_llm_h}x{img.n_llm_w}); "
+                        "the resize math drifted -- refuse rather than mis-splice")
+                if dim is None:
+                    dim = int(rows.shape[1])
+                elif int(rows.shape[1]) != dim:
+                    raise RuntimeError(f"vision rows of inconsistent width: {rows.shape[1]} vs {dim}")
+                img.rows = rows
+                out.append(make_mm_embedding(img.first_index, rows, alias=img.alias,
+                                             metadata={"key": img.key, "grid_llm": (img.n_llm_h, img.n_llm_w)}))
+        return out
+
+    def _ship_embeddings(self, images: list[tp_vision.PreparedImage], embeddings: list) -> None:
+        """Hand rank 1 the tower rows for the request being armed: one imgmeta frame plus one
+        binary frame per image, then the imgmeta_ok reply (validated: count, rows, sha256
+        checked on rank 1 before it answers)."""
+        meta, blobs = tp_vision.encode_imgmeta(images)
+        meta["req"] = self.requests
+        reply = self.channel.request_with_blobs(meta, blobs, timeout=env_float("EXL3_TP_IMGMETA_TIMEOUT", 120.0))
+        if reply.get("op") != "imgmeta_ok" or int(reply.get("images", -1)) != len(embeddings) \
+                or int(reply.get("rows", -1)) != sum(e.mm_length for e in embeddings):
+            raise RuntimeError(f"rank 1 rejected the image shipment: {reply}")
+
     # -- tokenization (Kyojin HFTokenizer semantics: specials parsed from the prompt text, no extra BOS)
     def count_tokens(self, text: str) -> int:
         return len(self.tk.encode(text))
 
-    def prompt_ids(self, prompt: str) -> list[int]:
+    def prompt_ids(self, prompt: str, images: list | None = None) -> list[int]:
         ids = [int(t) for t in self.tk.encode(prompt)]
         if not ids:
             raise ValueError("empty prompt")
-        if max(ids) >= self.vocab_size:
-            raise ValueError(f"prompt token id {max(ids)} outside the vocabulary (0..{self.vocab_size - 1})")
+        if images:
+            # each <｜deepseek_image｜> occurrence becomes its image's dynamic-id span, in order;
+            # the returned length is the EXPANDED length (what the cache bound must check)
+            if not self.supports_vision:
+                raise ValueError("image input is not supported on this server (no vision tower)")
+            ids = tp_vision.expand_prompt_ids(ids, list(images), self.image_token_id)
+            ids = [int(t) for t in ids]
+        text_ceiling = max((t for t in ids if t < FIRST_MM_EMBEDDING_INDEX), default=-1)
+        if text_ceiling >= self.vocab_size:
+            raise ValueError(f"prompt token id {text_ceiling} outside the vocabulary (0..{self.vocab_size - 1})")
         return ids
 
     def encode_ids(self, text: str, add_special_tokens: bool = False) -> list[int]:
@@ -1389,7 +1715,10 @@ class TPEngine:
     # -- one request (the model thread; the op sequence Rank1Worker mirrors)
     def _run(self, ids: list[int], max_tokens: int, sampler: TopPSampler, eos_id: int | None,
              stops: list[str], cancel: asyncio.Event | None, emit: Callable[[str], None],
-             use_cache: bool = True) -> dict[str, Any]:
+             use_cache: bool = True, images: list | None = None) -> dict[str, Any]:
+        embeddings = self._vision_encode(images) if images else None
+        if embeddings:
+            self._ship_embeddings(images, embeddings)    # imgmeta + blobs + imgmeta_ok, before begin
         begin = {"op": "begin", "req": self.requests, "ids": [int(t) for t in ids]}
         ck, start, pending, evicted = self._prefix_begin(ids, False, use_cache, begin)
         self.channel.send(begin)
@@ -1405,10 +1734,13 @@ class TPEngine:
         text = ""
         try:
             state, _ = self._prefix_state(ck, start, evicted)
-            _prefill(self.backend, ids, state, False, start)
+            _prefill(self.backend, ids, state, False, start, embeddings)
             self._prefix_save(pending, state, ids)
             pending = None
             cur, pos = int(ids[-1]), len(ids) - 1
+            # a prompt ending on an image span is refused in generate(); the decode loop's
+            # first forward is therefore always a text token (no rows to attach)
+            assert cur < FIRST_MM_EMBEDDING_INDEX, "image-span prompt tail slipped through"
             fed = list(ids)              # the tokens at positions [0, pos) once `cur` is forwarded
             # Lockstep rule: every stop decision happens after sampling, before the step frame.
             while True:
@@ -1446,9 +1778,12 @@ class TPEngine:
             self._finish_request(state, end, start, False, committed, pending, use_cache, len(ids))
         t1 = time.perf_counter()
         t_first = t_first if t_first is not None else t1
-        return {"cached_tokens": start, "new_tokens": n_new, "prompt_tokens": len(ids),
-                "time_prefill": t_first - t0, "time_generate": t1 - t_first,
-                "eos": eos, "eos_reason": reason, "spec_used": False}
+        stats = {"cached_tokens": start, "new_tokens": n_new, "prompt_tokens": len(ids),
+                 "time_prefill": t_first - t0, "time_generate": t1 - t_first,
+                 "eos": eos, "eos_reason": reason, "spec_used": False}
+        if images:
+            stats.update(images=len(images), image_tokens=sum(1 for t in ids if t >= FIRST_MM_EMBEDDING_INDEX))
+        return stats
 
     def _finish_request(self, state, end: dict, start: int, spec: bool, committed: list[int] | None,
                         pending: int | None, use_cache: bool, n_ids: int, end_pos: int | None = None,
@@ -1507,8 +1842,12 @@ class TPEngine:
     # -- one spec request (the model thread; mirrors the round/accept sequence of Rank1Worker)
     def _run_spec(self, ids: list[int], max_tokens: int, stops: list[str], cancel: asyncio.Event | None,
                   emit: Callable[[str], None], spec_k: int | None, eos_id: int | None,
-                  sampler: TopPSampler | None = None, use_cache: bool = True) -> dict[str, Any]:
+                  sampler: TopPSampler | None = None, use_cache: bool = True,
+                  images: list | None = None) -> dict[str, Any]:
         import torch                                                    # the whole request runs under inference_mode (as the script)
+        embeddings = self._vision_encode(images) if images else None
+        if embeddings:
+            self._ship_embeddings(images, embeddings)    # imgmeta + blobs + imgmeta_ok, before begin
         begin = {"op": "begin", "req": self.requests, "ids": [int(t) for t in ids], "spec": True}
         ck, start, pending, evicted = self._prefix_begin(ids, True, use_cache, begin)
         self.channel.send(begin)
@@ -1527,7 +1866,7 @@ class TPEngine:
         try:
             with torch.inference_mode():
                 state, draft_from = self._prefix_state(ck, start, evicted, spec=True)
-                pparams = _prefill(self.backend, ids, state, True, start)
+                pparams = _prefill(self.backend, ids, state, True, start, embeddings)
                 taps = (pparams or {}).get("export_states")
                 if taps:
                     # Stand-ins (and any backend that does not prime its own drafter): prime
@@ -1605,13 +1944,16 @@ class TPEngine:
                                  draft_from)
         t1 = time.perf_counter()
         t_first = t_first if t_first is not None else t1
-        return {"cached_tokens": start, "new_tokens": n_new, "prompt_tokens": len(ids),
-                "time_prefill": t_first - t0, "time_generate": t1 - t_first,
-                "eos": eos, "eos_reason": reason, "spec_used": True,
-                "spec_rounds": rounds, "spec_k_last": k if rounds else None,
-                "accepted_draft_tokens": accepted_total, "rejected_draft_tokens": drafted_total - accepted_total,
-                "draft_steps": rounds,
-                "accepted_per_step": (accepted_total / rounds) if rounds else 0.0}
+        stats = {"cached_tokens": start, "new_tokens": n_new, "prompt_tokens": len(ids),
+                 "time_prefill": t_first - t0, "time_generate": t1 - t_first,
+                 "eos": eos, "eos_reason": reason, "spec_used": True,
+                 "spec_rounds": rounds, "spec_k_last": k if rounds else None,
+                 "accepted_draft_tokens": accepted_total, "rejected_draft_tokens": drafted_total - accepted_total,
+                 "draft_steps": rounds,
+                 "accepted_per_step": (accepted_total / rounds) if rounds else 0.0}
+        if images:
+            stats.update(images=len(images), image_tokens=sum(1 for t in ids if t >= FIRST_MM_EMBEDDING_INDEX))
+        return stats
 
     async def generate(self, prompt: str, *, max_tokens: int, temperature: float, top_p: float,
                        stop: list[str], cancel: asyncio.Event | None = None, stats: dict | None = None,
@@ -1619,12 +1961,33 @@ class TPEngine:
                        images: list | None = None, speculative: bool | None = None,
                        spec_k: int | None = None, **_: Any) -> AsyncIterator[str]:
         if images:
-            raise ValueError("this engine has no vision support")
-        ids = [int(t) for t in prompt_ids] if prompt_ids is not None else self.prompt_ids(prompt)
+            if not isinstance(images, list) or not all(isinstance(x, tp_vision.PreparedImage) for x in images):
+                raise ValueError("images must be a list of images this engine prepared (prepare_images)")
+            if not self.supports_vision:
+                raise ValueError("image input is not supported on this server (no vision tower)")
+        if prompt_ids is not None:
+            ids = [int(t) for t in prompt_ids]
+        elif images:
+            ids = self.prompt_ids(prompt, images)          # expand placeholders here (direct callers)
+        else:
+            ids = self.prompt_ids(prompt)
         if len(ids) < 2:
             raise ValueError("prompt must hold at least 2 token ids (prefill feeds all but the last)")
+        # image rows ride as dynamic ids >= 1e9; they are legal only as the expanded spans of
+        # this request's images (never as bare numbers -- /v1/completions prompt ids stay text)
+        mm_positions = [i for i, t in enumerate(ids) if t >= FIRST_MM_EMBEDDING_INDEX]
+        if mm_positions and not images:
+            raise ValueError(f"prompt holds {len(mm_positions)} image row id(s) outside the vocabulary "
+                             f"(first at position {mm_positions[0]}) but no images were sent")
+        if images and not mm_positions:
+            raise ValueError("the prompt has no image placeholders for the images sent "
+                             "(the rendered prompt needs one <｜deepseek_image｜> per image)")
+        if mm_positions and ids[-1] >= FIRST_MM_EMBEDDING_INDEX:
+            raise ValueError("the prompt must end with a text token, not an image span "
+                             "(append text after the last image)")
         if len(ids) + 1 > self.ctx:
-            raise ValueError(f"prompt of {len(ids)} tokens does not fit the context of {self.ctx}")
+            raise ValueError(f"prompt of {len(ids)} tokens does not fit the context of {self.ctx}"
+                             + (" (image spans expand to their full token counts)" if images else ""))
         # Engine/library bounds, checked BEFORE the begin frame reaches rank 1: past the cache
         # bound the DSA pool faults inside a collective and rank 1's NCCL peer (rank 0) hangs
         # for its full watchdog timeout instead of seeing an error
@@ -1634,6 +1997,11 @@ class TPEngine:
                              f"{cache_cap - 2} usable tokens (EXL3_TP_CACHE_TOKENS={cache_cap}); "
                              f"refused before any rank dispatch")
         max_tokens = max(1, min(int(max_tokens), self.ctx - len(ids) - 1))
+        # Image requests bypass the prefix cache for now: the dynamic ids are unique per
+        # allocation, so identifying "the same image" across requests needs pixel hashing
+        # (deliberately not in this first version). cache_prompt stays effective for text.
+        if images:
+            cache_prompt = False
         # Spec mode is chosen here, once per request, at the settled start boundary. Sampled
         # requests draft too (exact speculative sampling, see _accept_sampled) unless
         # EXL3_TP_SPEC_SAMPLED=0 restores the greedy-only rule; an explicit opt-out always runs
@@ -1660,11 +2028,12 @@ class TPEngine:
                     if spec:
                         done = self._run_spec(ids, max_tokens, [s for s in (stop or []) if s],
                                               cancel, lambda piece: loop.call_soon_threadsafe(q.put_nowait, piece),
-                                              spec_k, eos_id, sampler, use_cache=bool(cache_prompt))
+                                              spec_k, eos_id, sampler, use_cache=bool(cache_prompt),
+                                              images=images)
                     else:
                         done = self._run(ids, max_tokens, sampler, eos_id, [s for s in (stop or []) if s],
                                          cancel, lambda piece: loop.call_soon_threadsafe(q.put_nowait, piece),
-                                         use_cache=bool(cache_prompt))
+                                         use_cache=bool(cache_prompt), images=images)
                 loop.call_soon_threadsafe(q.put_nowait, done)
             except BaseException as exc:                                # noqa: BLE001  (handed to the awaiting side)
                 loop.call_soon_threadsafe(q.put_nowait, exc)

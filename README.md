@@ -5,7 +5,8 @@ quant) on **two AMD Strix Halo machines** joined by one Thunderbolt/USB4 cable.
 [ExLlamaV3](https://github.com/turboderp/ExLlamaV3) splits the model across both
 boxes (tensor parallelism), [OdinLink](https://github.com/Geramy/OdinLink-Five)
 carries the traffic over the cable, and an OpenAI-compatible server exposes it
-with MTP speculative decoding ("DSpark"), a prompt cache and a 512K-token context.
+with MTP speculative decoding ("DSpark"), a prompt cache, image input (vision)
+and a 512K-token context.
 
 This repository is the working deployment, packaged for reinstallation: an
 installer, a controller script, the server, and the patches it needs on top of
@@ -97,6 +98,14 @@ Endpoints: `POST /v1/chat/completions` (streaming or not), `POST /v1/completions
 health). Thinking is on by default: replies carry `reasoning_content` and
 `content`, and tool calls use the DeepSeek DSML format.
 
+Image input is on by default (`/health` reports `"vision": true`): send
+`{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}`
+parts in a message and the model reads them. Each image costs one vision-tower
+pass on Box1 plus its expanded token span in the prompt; DSpark and SSE
+streaming compose with it, and a broken image is a clean 400. Design, caps and
+knobs (`EXL3_TP_VISION`, `EXL3_TP_MAX_IMAGES`, ...):
+[tools/ds41/README.md](tools/ds41/README.md#vision-image-input-2026-10-29).
+
 Per-request options beyond the OpenAI ones:
 
 | field | effect |
@@ -116,10 +125,12 @@ time; others queue.
 
 `exl3ds4.sh` sets the validated defaults: 512K-token context
 (`EXL3_TP_SAFE_CTX` / `EXL3_TP_CACHE_TOKENS`), DSpark on (`EXL3_TP_DSPARK=1`),
-prompt cache on (`EXL3_TP_PREFIX_CACHE=1`, two 32 MiB checkpoints per box). Every
-optimization can be switched off on its own if you suspect it:
+prompt cache on (`EXL3_TP_PREFIX_CACHE=1`, two 32 MiB checkpoints per box), and
+the vision tower on (`EXL3_TP_VISION=1`: a failed tower load degrades to
+text-only instead of failing startup; `EXL3_TP_VISION_STRICT=1` makes it fatal).
+Every optimization can be switched off on its own if you suspect it:
 `EXL3_ROCM_MOE_DECODE_RANGE=0`, `EXL3_TP_ODL_AR2=0`, `EXL3_TP_SPEC_SAMPLED=0`,
-`EXL3_TP_PREFIX_CACHE=0`. The full list is in
+`EXL3_TP_PREFIX_CACHE=0`, `EXL3_TP_VISION=0`. The full list is in
 [tools/ds41/README.md](tools/ds41/README.md#knobs-and-defaults).
 
 On other machines, override the rig's addresses and paths:
@@ -140,7 +151,10 @@ On other machines, override the rig's addresses and paths:
   serving.
 - Greedy output is not always bit-identical between two identical requests
   (see [docs/PERFORMANCE.md](docs/PERFORMANCE.md#reproducibility)).
-- No vision input. Prefill speed at the full 512K context is unmeasured.
+- Image prompts do not use the prefix cache yet: each image request re-encodes
+  its images and re-prefills (identifying "the same image" across requests needs
+  pixel hashing, not built in this first version; text prompts keep the cache).
+  Prefill speed at the full 512K context is unmeasured.
 
 ## Repository layout
 

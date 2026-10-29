@@ -5,9 +5,14 @@
 - **Rank 0 (Box1)** runs the HTTP server (`tools/ds41/tp_serve.py`), renders
   prompts, samples tokens and drives the request. **Rank 1 (Box2)** runs
   `tools/ds41/tp_rank1.py` and mirrors every model call, driven by framed JSON
-  over a TCP control channel on the Thunderbolt IP link.
+  over a TCP control channel on the Thunderbolt IP link (protocol 4: JSON
+  frames, prefix-cache fields and the vision `imgmeta` + binary blob frames).
 - Model collectives use RCCL over OdinLink (`NCCL_NET=ODL_TB5`). Decode-sized
   all-reduces bypass RCCL through `odl_ar2` (stream-ordered, no host sync).
+- The vision tower + aligner runs on rank 0 only (`tools/ds41/tp_vision.py` is
+  its CPU-side half: safe loading, geometry, the dynamic-id allocator and the
+  rank-0→rank-1 row codec). Rank 1 receives each image's tower output rows per
+  request over the control channel, so image input adds no collectives.
 - Lockstep rule: every stop decision happens on rank 0 after sampling and
   before the next frame, so both ranks always issue the same collectives.
   Details, the control protocol and the prefix-cache design:
@@ -20,11 +25,16 @@ cd ~/exl3ds4/tools/ds41
 DS41_REF_DIR=~/exl3ds4/model ../../.venv/bin/python -m pytest -q \
     test_ds41_chat.py test_ds41_parse.py test_ds41_serve.py test_tp_control.py \
     test_tp_chunked_prefill.py test_tp_prefix_cache.py test_serve_compat.py
+PYTHONPATH=~/exl3ds4/src/exllamav3-dsv41f \
+    ../../.venv/bin/python -m pytest -q test_tp_vision.py   # engine-level vision tests
 ```
 
-Last run: 525 passed, 6 skipped (the skips need the real tokenizer; set
-`DS41_REF_DIR`). The TP tests run the real `Rank1Worker` over a loopback socket
-against stand-in backends, and assert both ranks make identical model calls.
+Last run: 526 passed, 6 skipped (the skips need the real tokenizer; set
+`DS41_REF_DIR`); the vision suite passed 33/33. The TP tests run the real
+`Rank1Worker` over a loopback socket against stand-in backends, and assert both
+ranks make identical model calls; the vision tests additionally run the real
+`TPEngine` pairs with a tower stand-in and (with the exllamav3 tree on
+`PYTHONPATH`) against the real `MMEmbedding`/geometry code — no GPU needed.
 
 ## GPU smoke tests (server stopped)
 

@@ -76,6 +76,35 @@ only the new tokens. Design and protocol: `tools/ds41/README.md`.
   cache-free run where two tokens are nearly tied.
 - Costs: stash 1–12 ms, restore 2–6 ms.
 
+## Vision
+
+Image input (protocol 4, 2026-10-29) loads the tower + aligner on rank 0 only:
+~0.7 GiB (12.7 → 12.0 GiB free of the 124 GiB GTT with DSpark and the 512K
+cache resident) and 4.2 s at startup. Rank 1 loads nothing; each image request
+ships the tower's output rows over the control channel (~0.3 MiB per image at
+bf16, sha256-checked) and both ranks attach them as `indexed_embeddings`.
+
+Live numbers (running server, DSpark on, greedy, one 800×600 PNG ≈ 326 image
+tokens + chat template = 336 prompt tokens): **~1.4 s end to end** over HTTP —
+tower pass + ship + 336-token prefill + 6 decoded tokens. The same request with
+`"speculative": true` accepted 5 draft tokens and answered identically; the SSE
+stream of it delivers the same text in chunks. `perf/` has no dedicated vision
+benchmark yet; these numbers came from the validation run below.
+
+Image requests bypass the prefix cache deliberately (`cached_tokens: 0` in
+usage): each image gets a fresh dynamic-id range, so cross-request identity
+needs pixel hashing — **not enabled in this first version**. Text caching is
+unaffected: a text follow-up sent after image traffic still restored 1644 of
+its prompt tokens.
+
+Validated live on 2026-10-29 against the running server: `/health` and
+`/tp/status` report `vision: true` (proto 4); a test card reading **BLUE HERON
+42** was transcribed verbatim with plain decoding, with DSpark, and over SSE;
+`data:image/png;base64,AAAA` answered 400 (`cannot decode image`) without
+reaching either rank's model; a text request before, between and after the
+image requests behaved exactly as without vision (prefix cache engaged:
+1644 cached tokens on the follow-up turn).
+
 ## Memory
 
 GPU memory is system RAM on these boxes (unified memory, ~124 GiB GTT), so every
@@ -86,8 +115,9 @@ GPU allocation competes with the OS.
 | weights (load budgets with DSpark) | 95 GiB | 104 GiB |
 | DSA KV pools at 512K tokens (fp16) | 1.6 GiB | 1.6 GiB |
 | DSpark drafter main-kv (ring of 10 pages) | 7.5 MiB | — |
+| vision tower + aligner (rank 0) | ~0.7 GiB | — |
 | prefix checkpoints (2 × 32 MiB) | 64 MiB | 64 MiB |
-| RAM left for the OS | ~3.6 GiB | ~2 GiB |
+| RAM left for the OS | ~2.9 GiB (with the vision tower) | ~2 GiB |
 
 The KV cache is small: V4.1-Flash keeps four pool-owning layers (2, 8, 14, 20;
 the other layers read their owner's pool), three at compression rate 2 and one

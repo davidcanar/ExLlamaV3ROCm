@@ -42,12 +42,15 @@ folder; the helpers themselves are covered through the suite above.
 New code in this folder: `tp_engine.py` (control protocol, `TPModelBackend`, `Rank1Worker`,
 `TPEngine`; sampling/detok adapted from Kyojin `ds41_model.py`, model calls mirroring
 `scripts/tp_ds41_generate.py`), `tp_serve.py` (rank-0 entry point + `/tp/status`), `tp_rank1.py`
-(rank-1 entry point), `test_tp_control.py` (CPU tests incl. the rank-0/rank-1 lockstep guarantee),
-`test_tp_chunked_prefill.py` (CPU regression tests for the long-prompt fix: cache-sized block
-tables, span-chunked prefill, pre-dispatch bounds, startup memory floor), the `tp_*.sh` launchers
-(environment identical to `scripts/run_rank.sh`, which stays untouched), and `vendor_kyojin.py`
-(the script that copied the vendored files above, headers included — rerunnable against
-`src/kyojin` to refresh the vendored layer).
+(rank-1 entry point), `tp_vision.py` (CPU-side image handling for the two-node server: safe
+loading, the V4.1 geometry plan, dynamic-id ranges and the rank-0→rank-1 row codec — no GPU
+needed to import or test it), `test_tp_control.py` (CPU tests incl. the rank-0/rank-1 lockstep
+guarantee), `test_tp_chunked_prefill.py` (CPU regression tests for the long-prompt fix:
+cache-sized block tables, span-chunked prefill, pre-dispatch bounds, startup memory floor),
+`test_tp_vision.py` (CPU tests of the vision path incl. both ranks over loopback), the
+`tp_*.sh` launchers (environment identical to `scripts/run_rank.sh`, which stays untouched),
+and `vendor_kyojin.py` (the script that copied the vendored files above, headers included —
+rerunnable against `src/kyojin` to refresh the vendored layer).
 
 ## Endpoints
 
@@ -136,16 +139,23 @@ and spec prompts, back-to-back requests on one server, server healthy throughout
 ## Control protocol (rank 0 ⇄ rank 1)
 
 Framed JSON over the Thunderbolt TCP control channel (`EXL3_TP_CONTROL_PORT`): 4-byte
-little-endian length prefix + UTF-8 JSON. `hello`/`hello_ok` (protocol + vocab + DSpark check)
-after both loads; then per request `begin {ids, spec}` → fresh state, prefill (with the DSpark
-tap export on spec requests), and in spec mode forward #1 of the last prompt token only on
-plain requests; `step {token}` per plain token, or `round {k, window}` + `accept {a}` per spec
-round (one multi-row verify + one mirrored rewind); `end` → both release the state.
-`ping`/`pong` for `/tp/status`, `shutdown` for clean exit. Protocol 3 adds the prefix-cache
-fields: `begin` may carry `restore`/`start` (restore checkpoint K at position S and prefill only
-`ids[S:]`), `drop`, `save` and `drop_all`; `end` may carry `drop`, `rewind` and `save`. Rank 0
-decides all of them and rank 1 applies them in the same order (restore, drops, prefill, save;
-end: drops, rewind, save, release); a protocol-2 rank 1 is refused at the handshake.
+little-endian length prefix + UTF-8 JSON. Binary payloads (vision rows) use the same prefix
+with a `0x01` tag byte ahead of the raw bytes — a byte no JSON frame can start with.
+`hello`/`hello_ok` (protocol + vocab + DSpark check) after both loads; then per request
+`begin {ids, spec}` → fresh state, prefill (with the DSpark tap export on spec requests), and
+in spec mode forward #1 of the last prompt token only on plain requests; `step {token}` per
+plain token, or `round {k, window}` + `accept {a}` per spec round (one multi-row verify + one
+mirrored rewind); `end` → both release the state. Image requests first send
+`imgmeta {n, images[]}` followed by `n` binary frames (the tower's rows per image: alias,
+dynamic-id range, rows/dim/dtype, sha256); rank 1 validates, rebuilds its
+`indexed_embeddings` and answers `imgmeta_ok` **before** rank 0 sends `begin`, so a corrupt
+shipment is a clean error, never a mid-collective fault. Protocol 3 added the prefix-cache
+fields (`begin` may carry `restore`/`start` — restore checkpoint K at position S, prefill
+only `ids[S:]` — plus `drop`, `save`, `drop_all`; `end` may carry `drop`, `rewind` and
+`save`; rank 0 decides all of them and rank 1 applies them in the same order), and protocol 4
+added the vision frames (`hello.vision`, `imgmeta` + binary blobs; a proto-3 rank 1 would
+misread an imgmeta frame as JSON and desync, so the handshake refuses it). `ping`/`pong` for
+`/tp/status`, `shutdown` for clean exit.
 
 **Lockstep rule:** every stop decision (eos, stop string, `max_tokens`, cancel) happens on
 rank 0 *after* sampling a token and *before* sending its `step`. Once a `step` is sent the next
@@ -181,6 +191,42 @@ both ranks prefill only the rest; `cached_tokens` / `timings.cache_n` report the
 - One linear sequence: a request that diverges early (a client's side request for a title,
   say) overwrites the cached tokens past the shared prefix, and the next turn of the main
   conversation re-prefills from there.
+
+## Vision (image input, 2026-10-29)
+
+Rank 0 loads the tower + aligner (`component = "vision"`, the PR #449 architecture
+`deepseek_v41_vision.py`) beside the TP trunk — a separate non-TP model, so its forward runs
+no collectives and rank 1's dispatch sequence is untouched. Rank 1 never loads it: image rows
+travel per request as `imgmeta` + binary frames, and both ranks attach the identical
+`indexed_embeddings` list to every prefill chunk (the trunk is natively multimodal through the
+dynamic ids ≥ 1000000000: MoE `bias_vl` routing, the Engram n-gram block and the PLE mapping
+all key off them).
+
+- **Request path:** the vendored chat layer renders one `<｜deepseek_image｜>` per image part
+  (`render_chat_vl`); `prepare_images` (CPU, off the event loop) loads bytes safely — data:
+  URLs, bare base64 and http(s), capped at 32 MiB fetched / 100 Mpx decoded, EXIF-oriented,
+  every failure a clean 400 — and plans each image's exact token span from the tower's own
+  resize math; `prompt_ids(prompt, images)` splices each placeholder into its image's unique
+  dynamic-id range, so context/cache bounds check the *expanded* length; `generate` runs the
+  tower once per image on the model thread, ships the rows, prefills and decodes as usual.
+- **Prefix cache:** image requests bypass it entirely (unique ids per allocation make
+  cross-request identity a pixel-hash problem, deliberately not attempted here). Text requests
+  keep the full cache, including against the text prefix an image request left behind.
+- **DSpark composes** with vision (the drafter only ever sees the anchor and text rows). A
+  first run that does not fit VRAM beside the drafter is practical per launch:
+  `EXL3_TP_DSPARK=0 ./exl3ds4.sh restart` (both ranks read it, budgets fall back to the
+  no-drafter defaults, no file edits). If the tower still does not fit, the rank degrades to
+  text-only with a loud log instead of wedging (`EXL3_TP_VISION_STRICT=1` makes it fatal).
+- **Limits:** prompts must end on a text token (the chat template always does); at most
+  `EXL3_TP_MAX_IMAGES` (8) images per request; `EXL3_TP_IMAGE_HTTP=0` disables URL fetches.
+
+Validated live (2026-10-29, the running server, `proto 4`, DSpark on, 512K cache):
+`/health` and `/tp/status` report `vision: true`; an 800×600 test card reading **BLUE HERON
+42** comes back verbatim with plain decoding and with DSpark (`"speculative": true`, 5 draft
+tokens accepted), streamed over SSE (chunked deltas + `[DONE]`), at 336 expanded prompt
+tokens and ~1.4 s per request end to end; `data:image/png;base64,AAAA` is a clean 400 that
+reaches neither rank's model; image requests report `cached_tokens: 0` (cache bypassed) and a
+text follow-up after image traffic still restores 1644 of its prompt tokens.
 
 ## Launch (from Box1)
 
@@ -220,6 +266,8 @@ cd /home/davidcanar/exl3ds4/tools/ds41
 DS41_REF_DIR=/home/davidcanar/exl3ds4/model ../../.venv/bin/python -m pytest -q \
     test_ds41_chat.py test_ds41_parse.py test_ds41_serve.py test_tp_control.py \
     test_tp_chunked_prefill.py test_tp_prefix_cache.py test_serve_compat.py
+PYTHONPATH=/home/davidcanar/exl3ds4/src/exllamav3-dsv41f \
+    ../../.venv/bin/python -m pytest -q test_tp_vision.py     # engine-level vision tests
 ```
 
 - `test_ds41_chat.py` — golden: rendered prompts byte- and token-identical to the official
@@ -249,6 +297,14 @@ DS41_REF_DIR=/home/davidcanar/exl3ds4/model ../../.venv/bin/python -m pytest -q 
   rows in a small ring and counts drafts that read rows of another sequence: none may, except
   right after restoring a plain request's checkpoint; a long reply that wraps the ring past a
   checkpoint must still draft from the right rows after the restore.
+- `test_tp_vision.py` - the vision support: safe image loading (data:/base64/http(s), byte +
+  pixel caps, scheme refusal), the V4.1 geometry plan against the architecture's own
+  `plan_resize`, unique dynamic-id ranges/aliases and placeholder expansion, JSON+binary frame
+  sharing on one channel, sha256-validated rank-1 reconstruction (corruption/overlap/truncation
+  refused), `indexed_embeddings` on every prefill chunk at unchanged offsets (never on text),
+  engine end-to-end pairs over loopback (tower stand-in, bit-exact rows on rank 1, cache
+  bypass, broken-prompt refusals before any dispatch), and the vendored HTTP layer over the
+  real `TPEngine` with images (needs the exllamav3 tree on `PYTHONPATH`; skips otherwise).
 
 ## Knobs and defaults
 
@@ -281,6 +337,11 @@ DS41_REF_DIR=/home/davidcanar/exl3ds4/model ../../.venv/bin/python -m pytest -q 
 | `EXL3_TP_PREFIX_END` | 1 | also checkpoint the end of each reply (useful when clients echo replies verbatim, e.g. tool calls) |
 | `EXL3_TP_PREFIX_LOG` | 0 | log one line per request: reused tokens and the checkpoint positions |
 | `EXL3_TP_DRAFT_RING` | span/256 + 2 (10) | DSpark drafter main-kv ring in pages (rank 0); 0 = allocate the whole context (1.5 GiB at 512K) |
+| `EXL3_TP_VISION` | 1 (auto) | rank 0 loads the vision tower + aligner; a load or memory-floor failure degrades to text-only (loud log) unless `EXL3_TP_VISION_STRICT=1` |
+| `EXL3_TP_MAX_IMAGES` | 8 | per-request image limit (each image costs up to `max_image_tokens - 2` prompt rows) |
+| `EXL3_TP_IMAGE_HTTP` | 1 | allow http(s) image URL fetches (data:/base64 always allowed); 0 refuses URLs |
+| `EXL3_TP_IMAGE_MAX_BYTES` / `_MAX_PIXELS` / `_FETCH_TIMEOUT` | 32 MiB / 100 Mpx / 30 s | caps on fetched image bytes, decoded pixels (decompression bombs) and fetch timeout |
+| `EXL3_TP_IMGMETA_TIMEOUT` | 120 s | how long rank 0 waits for rank 1's `imgmeta_ok` per image request |
 
 `EXL3_TP_SPAN`, `EXL3_TP_CACHE_TOKENS`, `EXL3_TP_USE_PER_DEVICE` and `EXL3_TP_MEM_FLOOR` join
 the DSpark/env variables the launchers forward to Box2 (ssh forwards nothing): the chunk plan
@@ -301,7 +362,13 @@ holds for `EXL3_TP_ODL_AR2*`, `EXL3_TP_SHARED_EXPERT_DEVICE` (it changes the TP 
    the two known ways a request could kill a rank mid-collective, but a genuine library fault
    still wedges the peer.
 4. **Greedy by default** (`temperature 0`); `temperature/top_p > 0` sampling runs on rank 0 only
-   (safe: sampling happens after the collectives). Vision and non-DSpark MTP are not wired into
-   the TP path; DSpark serves sampled requests through speculative sampling.
+   (safe: sampling happens after the collectives). Non-DSpark MTP is not wired into the TP
+   path; DSpark serves sampled requests through speculative sampling and composes with vision.
 5. The HTTP default bind is `0.0.0.0:8080` (the deployment binds `0.0.0.0:1234`); no
-   authentication — keep it on the LAN, or pass `--host 127.0.0.1`.
+   authentication — keep it on the LAN, or pass `--host 127.0.0.1`. Image URL fetches
+   (`http(s)`) are operator-trust like the rest of the endpoint (no SSRF filtering;
+   `EXL3_TP_IMAGE_HTTP=0` turns them off).
+6. **Vision first-version limits:** image prompts bypass the prefix cache (no pixel-hash
+   identity yet — a repeated image re-encodes and re-prefills); prompts must end on a text
+   token; the tower runs only on rank 0 (a second concurrent image request would queue behind
+   `sessions = 1`, as everything else).
