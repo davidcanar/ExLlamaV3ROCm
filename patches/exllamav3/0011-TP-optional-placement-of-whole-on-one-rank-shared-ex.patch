@@ -1,0 +1,89 @@
+From 355bb55b1340ab00cba6e31e04455f0db0d3da4a Mon Sep 17 00:00:00 2001
+From: David Canar <davidcanar@gmail.com>
+Date: Wed, 28 Oct 2026 18:54:40 -0600
+Subject: [PATCH 11/11] TP: optional placement of whole-on-one-rank shared
+ experts
+
+The TP allocator places each max_devices=1 component on the device with the
+most remaining memory. With unequal per-rank budgets that is the same device
+for every layer, so one rank carried all 40 shared experts of DS4.1 on top of
+its larger routed share.
+
+TPAllocation gains pin_device, and EXL3_TP_SHARED_EXPERT_DEVICE pins the
+shared experts that run whole on one rank (shared_coop_ok) to TP rank N, or
+alternates them by layer index ("alt"). It changes the TP plan, so every
+rank must see the same value. Unset keeps the previous placement.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ exllamav3/model/model_tp_alloc.py     |  7 ++++++-
+ exllamav3/modules/block_sparse_mlp.py | 19 +++++++++++++++++++
+ 2 files changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/exllamav3/model/model_tp_alloc.py b/exllamav3/model/model_tp_alloc.py
+index 559cd0fd..f58b2ccd 100644
+--- a/exllamav3/model/model_tp_alloc.py
++++ b/exllamav3/model/model_tp_alloc.py
+@@ -44,6 +44,9 @@ class TPAllocation:
+         # group leader) lands on: DSA "shared" indexer layers read the selection of the nearest
+         # preceding "full" layer out of that layer's process
+         self.affinity_key = affinity_key
++        # Whole-on-one-device components may be pinned to a device instead of the one with the
++        # most remaining memory (compute balance across unequal ranks, see BlockSparseMLP)
++        self.pin_device = None
+ 
+         self.current_split = []
+ 
+@@ -119,7 +122,9 @@ class TPAllocator:
+             dev_limit = self.dev_limits.get(c.limit_key) if c.limit_key else None
+             if c.max_devices is not None:
+                 dev_limit = c.max_devices if dev_limit is None else min(dev_limit, c.max_devices)
+-            if c.affinity_key is not None and c.affinity_key in affinity_dev:
++            if c.pin_device is not None and 0 <= c.pin_device < self.num_devices and max_mem[c.pin_device] > 0:
++                rem_mem_s = [max(r, 1) if i == c.pin_device else 0 for i, r in enumerate(rem_mem_s)]
++            elif c.affinity_key is not None and c.affinity_key in affinity_dev:
+                 # Pinned to the group leader's device, whatever the memory picture (the estimate
+                 # then overshoots there and the load's headroom checks catch a real shortfall)
+                 d = affinity_dev[c.affinity_key]
+diff --git a/exllamav3/modules/block_sparse_mlp.py b/exllamav3/modules/block_sparse_mlp.py
+index 3592e644..1c3b142a 100644
+--- a/exllamav3/modules/block_sparse_mlp.py
++++ b/exllamav3/modules/block_sparse_mlp.py
+@@ -81,6 +81,23 @@ _moe_shared_coop = os.environ.get("EXL3_MOE_SHARED_COOP", "1") != "0"
+ # use is on those paths except the grouped DS3 router (n_group > 1, Ling 3.x), which is still
+ # torch-composed (fp32 logits) and keeps the broadcast
+ _replicated_router_types = ("std", "std_bias", "dots", "sqrtsp", "sqrtsp_hash")
++
++# TP placement of whole-on-one-rank shared experts (shared_coop_ok). By default the allocator puts
++# each on the device with the most remaining memory, which with unequal budgets is the SAME device
++# for every layer, so that rank carries every shared expert's per-token work on top of its larger
++# routed share. EXL3_TP_SHARED_EXPERT_DEVICE=<n> pins them all to device (TP rank) n; "alt"
++# alternates by layer index. Must be identical on every rank (it changes the TP plan)
++_shared_expert_device = os.environ.get("EXL3_TP_SHARED_EXPERT_DEVICE", "").strip().lower()
++
++
++def _shared_expert_pin(key: str) -> int | None:
++    if not _shared_expert_device:
++        return None
++    if _shared_expert_device == "alt":
++        import re
++        m = re.search(r"layers\.(\d+)\.", key)
++        return int(m.group(1)) % 2 if m else None
++    return int(_shared_expert_device)
+ _routing_check_stats = {}
+ 
+ def _routing_check_compare(key, local_sel, local_w, sel, w):
+@@ -1558,8 +1575,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
+         if self.shared_experts:
+             sh = self.shared_experts.make_tp_allocation(options)
+             if self.shared_coop_ok():
++                pin = _shared_expert_pin(self.key)
+                 for t in sh:
+                     t.max_devices = 1
++                    t.pin_device = pin
+             tpa_list += sh
+         return tpa_list
+ 
+-- 
+2.54.0
+

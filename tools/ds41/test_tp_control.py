@@ -676,16 +676,25 @@ def test_spec_mode_switching_at_settled_boundaries():
         pair.stop()
 
 
-def test_spec_temperature_falls_back_to_plain_and_not_enabled_is_refused():
-    pair = Pair(ids_of("sampling falls back"), spec=True)
+def test_spec_temperature_drafts_and_not_enabled_is_refused(monkeypatch):
+    pair = Pair(ids_of("sampling drafts too"), spec=True)
     try:
         pair.start()
-        # temperature > 0: silent plain fallback (stochastic output is fine -- the mode is the point)
+        # temperature > 0: speculative sampling (stochastic output is fine -- the mode is the point)
+        out = "".join(pair.generate(ids_of("p!"), max_tokens=6, temperature=1.0, speculative=True))
+        st = pair.engine.last_stats
+        assert len(out) >= 4 and st["spec_used"] is True and st["new_tokens"] == 6
+        assert any(c[0] == "draft" for c in pair.be0.calls)                               # spec rounds ran
+        assert not any(c[0] == "forward" for c in pair.be0.calls)
+        assert mirrored(pair.be0) == mirrored(pair.be1)                                   # lockstep holds
+
+        # EXL3_TP_SPEC_SAMPLED=0: the old greedy-only rule, sampled requests run plain steps
+        monkeypatch.setattr(tp_engine, "SPEC_SAMPLED", False)
+        n_fwd = sum(1 for c in pair.be0.calls if c[0] == "forward")
         out = "".join(pair.generate(ids_of("p!"), max_tokens=6, temperature=1.0, speculative=True))
         st = pair.engine.last_stats
         assert len(out) >= 4 and st["spec_used"] is False and st["new_tokens"] == 6
-        assert not any(c[0] == "draft" for c in pair.be0.calls)                           # plain steps ran
-        assert sum(1 for c in pair.be0.calls if c[0] == "forward") == 6
+        assert sum(1 for c in pair.be0.calls if c[0] == "forward") - n_fwd == 6
     finally:
         pair.stop()
 
@@ -698,6 +707,39 @@ def test_spec_temperature_falls_back_to_plain_and_not_enabled_is_refused():
         assert plain.be0.calls == [] and plain.be1.calls == []                            # nothing reached rank 1
     finally:
         plain.stop()
+
+
+def test_accept_sampled_is_exact():
+    """Speculative sampling against a point-mass draft reproduces the target distribution: the
+    first emitted token of a round is distributed as p_0 whatever the draft, and acceptance is
+    p_0(draft). top_p truncation is applied to the target before acceptance."""
+    torch.manual_seed(1234)
+    V, N = 6, 40000
+    logits = torch.tensor([[2.0, 1.2, 0.4, 0.0, -1.0, -3.0],
+                           [0.0, 0.5, 1.0, 1.5, 2.0, 2.5]])
+    for top_p in (1.0, 0.8):
+        sampler = tp_engine.TopPSampler(1.0, top_p, None)
+        p0 = sampler.probs_rows(logits)[0]
+        for draft in (0, 1, 3):
+            counts = torch.zeros(V)
+            acc = 0
+            for _ in range(N):
+                a, bonus = tp_engine._accept_sampled(logits, [draft], 1, sampler)
+                first = draft if a == 1 else bonus
+                counts[first] += 1
+                acc += a
+            emp = counts / N
+            assert (emp - p0).abs().max() < 0.012, (top_p, draft, emp, p0)
+            assert abs(acc / N - float(p0[draft])) < 0.012
+    # no drafts: the bonus is a plain sample of row 0
+    sampler = tp_engine.TopPSampler(0.7, 1.0, None)
+    p0 = sampler.probs_rows(logits)[0]
+    counts = torch.zeros(V)
+    for _ in range(N):
+        a, bonus = tp_engine._accept_sampled(logits[:1], [], 0, sampler)
+        assert a == 0
+        counts[bonus] += 1
+    assert (counts / N - p0).abs().max() < 0.012
 
 
 def test_spec_warmup_exercises_both_paths():
@@ -902,8 +944,8 @@ def test_vendored_server_over_tp_engine_non_stream_and_stream():
 
 
 def test_vendored_server_spec_round_trip_and_equivalence():
-    """The per-request fields over HTTP: speculative:true drafts (stats say so), speculative:false
-    and temperature>0 fall back to plain, both produce the same tokens, bad fields are 400."""
+    """The per-request fields over HTTP: speculative:true drafts (stats say so, sampled requests
+    included), speculative:false runs plain, both produce the same tokens, bad fields are 400."""
     script = ids_of("quick check</think>spec and plain agree!")
     pair = Pair(script, ctx=2048, spec=True)
     pair.start()
@@ -934,12 +976,12 @@ def test_vendored_server_spec_round_trip_and_equivalence():
             drafts = [c for c in pair.be0.calls if c[0] == "draft"]
             assert all(d[3] <= 2 for d in drafts[-len(pair.be0.round_log):])
 
-            # temperature > 0 with speculative:true: silent plain fallback (sampled text, so the
+            # temperature > 0 with speculative:true: speculative sampling (sampled text, so the
             # mode and the token count are the observable contract)
             r = await client.post("/v1/chat/completions", json={**base, "speculative": True,
                                                               "temperature": 1.0, "max_tokens": 8})
             assert r.status == 200
-            assert pair.engine.last_stats["spec_used"] is False
+            assert pair.engine.last_stats["spec_used"] is True
             assert (await r.json())["usage"]["completion_tokens"] == 8
 
             for bad in ({"spec_k": 0}, {"spec_k": "two"}, {"speculative": "yes"}):

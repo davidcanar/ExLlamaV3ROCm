@@ -1,17 +1,21 @@
 # patches/exllamav3 — the `multi-node-rocm` branch of ExLlamaV3
 
-Seven commits on top of the PR #449 (`dsv41f`) base of ExLlamaV3 that add the
-cross-host tensor-parallel runtime this deployment runs on. Generated with:
+Eleven commits on top of the PR #449 (`dsv41f`) base of ExLlamaV3 that add the
+cross-host tensor-parallel runtime this deployment runs on and its decode
+performance work. Generated with:
 
     git format-patch d45e8961..multi-node-rocm
+
+(`0008`–`0011` were exported with `git format-patch --start-number 8
+0e259659..multi-node-rocm`.)
 
 Upstream / base:
 
 - Repository: <https://github.com/anoane/exllamav3-anemone> (fork of
   turboderp/ExLlamaV3, PR #449 "DeepseekV4.1: Tensor-parallel support")
 - Base commit: `d45e89611738e9134f72f5c9679cc9eae113bba8` (branch `dsv41f`)
-- Resulting branch head: `0e259659f09b47c79c04ac9157af284cc70a1604`
-  (`multi-node-rocm`), which includes the DSV4 per-worker recurrent-`wshift`
+- Resulting branch head: `355bb55b` (`multi-node-rocm`); `0e259659` is the
+  head after `0007`, which includes the DSV4 per-worker recurrent-`wshift`
   readback fix required for long-context serving.
 
 Commits (in order):
@@ -25,6 +29,12 @@ Commits (in order):
 7. `0007` TP: cross-host: read back recurrent wshift from the non-output rank
    worker (the long-context fix; source commit `0e259659` in the deployment
    README)
+8. `0008` TP: decode all-reduces over the OdinLink stream API (odl_ar2;
+   needs `odl_ar2/libodl_ar2.so`, enabled by `EXL3_TP_ODL_AR2=1`)
+9. `0009` DeepseekV41: Engram reads host ids and stages its rows at pass start
+10. `0010` DSV4Attention: candidate readers score per row without host syncs
+11. `0011` TP: optional placement of whole-on-one-rank shared experts
+    (`EXL3_TP_SHARED_EXPERT_DEVICE`)
 
 Apply with `git am` to preserve authorship and commit identity:
 

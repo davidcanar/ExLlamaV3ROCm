@@ -21,10 +21,20 @@ export EXLLAMA_MASTER_PORT=$MASTER_PORT
 export NCCL_SOCKET_IFNAME=thunderbolt0
 export NCCL_IB_DISABLE=1
 export NCCL_NET=ODL_TB5
+# Only the box1<->box2 link: another Thunderbolt host on a second USB4 port shows up as
+# /dev/odl_tb5_1 and must not be offered to RCCL (patched plugin, ODL_RCCL_DEVICES)
+export ODL_RCCL_DEVICES=${ODL_RCCL_DEVICES:-0}
 export NCCL_DEBUG=WARN
 # Transport defaults of scripts/run_rank.sh (multi-frame stream messages, 4 RCCL channels).
 export NCCL_MAX_NCHANNELS=${NCCL_MAX_NCHANNELS:-4}
 export EXL3_TP_NCCL_SYNC=${EXL3_TP_NCCL_SYNC:-stream}
+# Decode-sized all-reduces over the OdinLink stream API (odl_ar2, stream-ordered, ~35 us vs ~90 us
+# for RCCL at 10 KB); prefill-sized collectives stay on RCCL. Build: ~/exl3ds4/odl_ar2/build.sh.
+# EXL3_TP_ODL_AR2=0 restores RCCL for everything. Rank 1 listens on the rendezvous port.
+export EXL3_TP_ODL_AR2=${EXL3_TP_ODL_AR2:-1}
+export EXL3_TP_ODL_AR2_PEER=${EXL3_TP_ODL_AR2_PEER:-10.0.2.2}
+export EXL3_TP_ODL_AR2_PORT=${EXL3_TP_ODL_AR2_PORT:-29652}
+export EXL3_TP_ODL_AR2_LIB=${EXL3_TP_ODL_AR2_LIB:-$ROOT/odl_ar2/libodl_ar2.so}
 export LD_LIBRARY_PATH="$ODL_BUILD/rccl:$ODL_BUILD/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export LD_PRELOAD="$ROOT/.venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/libhsa-runtime64.so.1${LD_PRELOAD:+:$LD_PRELOAD}"
 export PYTHONPATH="$ROOT/src/exllamav3-dsv41f${PYTHONPATH:+:$PYTHONPATH}"

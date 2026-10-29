@@ -32,13 +32,15 @@ ranks, follows scripts/tp_ds41_dspark.py (the proven two-node path) op for op:
   - a spec request prefill exports the trunk taps at the DSpark target layers on both ranks;
     rank 0 projects them into the drafter's kv;
   - each round rank 0 drafts locally, sends `round` (the verify window), both ranks run one
-    multi-row verify forward (recurrent_history=True), rank 0 greedy-accepts, sends `accept`,
+    multi-row verify forward (recurrent_history=True), rank 0 accepts (greedy prefix match at
+    temperature 0, exact speculative sampling otherwise: `_accept_sampled`), sends `accept`,
     and both ranks rewind the state identically (`rewind(k - a)` is a mirrored TP dispatch);
-  - plain requests (`speculative: false`, sampled requests, or servers started without
-    EXL3_TP_DSPARK) use the unchanged plain `step` path; a request picks its mode once, at a
-    settled boundary (between requests, when both ranks are idle) -- never mid-round.
-Spec is greedy-only (temperature 0); per-request `speculative` / `spec_k` (1..5) reach the engine
-through two marked LOCAL additions in the vendored ds41_serve.py.
+  - plain requests (`speculative: false`, sampled requests when EXL3_TP_SPEC_SAMPLED=0, or
+    servers started without EXL3_TP_DSPARK) use the unchanged plain `step` path; a request
+    picks its mode once, at a settled boundary (between requests, when both ranks are idle) --
+    never mid-round.
+Per-request `speculative` / `spec_k` (1..5) reach the engine through two marked LOCAL additions in
+the vendored ds41_serve.py.
 
 Lockstep rule: every stop decision (eos token, stop string, max_tokens, cancel) happens on rank 0
 AFTER sampling a token and BEFORE sending its `step` frame. Once a `step` has been sent, the next
@@ -80,9 +82,10 @@ First-version limitations (documented in README.md):
   (exl3ds4.sh) raises it to the full 512K cache, and prompts/chunks of any size up to
   cache_tokens - 2 are accepted (validated at ~8K-token prompts with DSpark)
 - no rank-failure recovery: if either rank dies mid-request, both must be restarted
-- DSpark: greedy requests only (sampled requests silently use the plain path); `spec_k` caps the
-  draft window at the DSpark block size (5); acceptance is the script's greedy rule (bonus token
-  always emitted, EOS/stop/max cuts land on emitted-token boundaries even mid-round)
+- DSpark: greedy requests use the script's greedy rule; sampled requests (temperature > 0) use
+  exact speculative sampling against the greedy drafts (EXL3_TP_SPEC_SAMPLED=0 sends them down
+  the plain path instead); `spec_k` caps the draft window at the DSpark block size (5); the
+  bonus token is always emitted, EOS/stop/max cuts land on emitted-token boundaries even mid-round
 """
 from __future__ import annotations
 
@@ -179,6 +182,51 @@ class TopPSampler:
         p = self.probs(logits_row)
         noise = torch.empty_like(p).exponential_(1, generator=self.generator)
         return int(p.div_(noise).argmax())
+
+    def probs_rows(self, logits: Any) -> Any:
+        """probs() for every row of a (R, V) logits block at once."""
+        import torch
+        p = torch.softmax(logits.float() / max(self.temperature, 1e-5), dim=-1)
+        if self.top_p < 1.0:
+            sp, si = p.sort(dim=-1, descending=True)
+            cum = sp.cumsum(-1)
+            sp = sp.masked_fill((cum - sp) >= self.top_p, 0.0)
+            p = torch.zeros_like(p).scatter_(-1, si, sp)
+            p = p / p.sum(dim=-1, keepdim=True)
+        return p
+
+
+# Sampled (temperature > 0) requests also draft with DSpark: exact speculative sampling
+SPEC_SAMPLED = env_truthy("EXL3_TP_SPEC_SAMPLED", True)
+
+
+def _accept_sampled(logits: Any, drafts: list[int], k: int, sampler: TopPSampler) -> tuple[int, int]:
+    """Speculative sampling against deterministic (greedy) drafts: the round's output follows the
+    target's temperature/top-p distribution exactly, as with plain sampled decoding.
+
+    Draft i is accepted with probability p_i(d_i) (the proposal is a point mass, so min(1, p/q)
+    is just p). At the first rejection the token is drawn from p_i with d_i removed (the residual
+    max(0, p - q), renormalized); when every draft is accepted the bonus token is drawn from
+    p_k. The residual draw of every row is made up front from independent noise, so the whole
+    decision costs a single host sync. Returns (accepted, bonus)."""
+    import torch
+    p = sampler.probs_rows(logits[: k + 1])                              # (k + 1, V)
+    gen = sampler.generator if (sampler.generator is not None and
+                                getattr(sampler.generator, "device", None) == p.device) else None
+    q = p.clone()
+    if k:
+        d = torch.tensor(drafts[:k], dtype=torch.long).to(p.device, non_blocking=True)
+        rows = torch.arange(k, device=p.device)
+        pd = p[rows, d]
+        q[rows, d] = 0.0
+        u = torch.rand(k, device=p.device, generator=gen)
+        a = torch.cumprod((u < pd).to(torch.int32), dim=0).sum()
+    else:
+        a = torch.zeros((), dtype=torch.long, device=p.device)
+    noise = torch.empty_like(q).exponential_(1, generator=gen)
+    cand = q.div_(noise).argmax(dim=-1)                                  # residual draw per row
+    a_host, bonus = torch.stack((a.to(torch.long), cand[a])).tolist()
+    return int(a_host), int(bonus)
 
 
 class _Detok:
@@ -877,10 +925,11 @@ class TPEngine:
     contract demands. Stop conditions all land on token boundaries; the stats keys match the
     vendored server (`cached_tokens` is always 0: the first version re-prefills every request).
 
-    When the backend loaded DSpark (`EXL3_TP_DSPARK=1`), greedy requests (temperature 0) default
-    to speculative rounds (per-request `speculative: false` opts out, `spec_k` caps the draft
-    window); sampled requests always use the plain path. `speculative: true` on a server without
-    DSpark is refused before the job starts.
+    When the backend loaded DSpark (`EXL3_TP_DSPARK=1`), requests default to speculative rounds
+    (per-request `speculative: false` opts out, `spec_k` caps the draft window): greedy requests
+    accept by prefix match, sampled ones by exact speculative sampling (EXL3_TP_SPEC_SAMPLED=0
+    keeps them on the plain path). `speculative: true` on a server without DSpark is refused
+    before the job starts.
     """
 
     sessions = 1
@@ -1014,7 +1063,8 @@ class TPEngine:
 
     # -- one spec request (the model thread; mirrors the round/accept sequence of Rank1Worker)
     def _run_spec(self, ids: list[int], max_tokens: int, stops: list[str], cancel: asyncio.Event | None,
-                  emit: Callable[[str], None], spec_k: int | None, eos_id: int | None) -> dict[str, Any]:
+                  emit: Callable[[str], None], spec_k: int | None, eos_id: int | None,
+                  sampler: TopPSampler | None = None) -> dict[str, Any]:
         import torch                                                    # the whole request runs under inference_mode (as the script)
         self.channel.send({"op": "begin", "req": self.requests, "ids": [int(t) for t in ids], "spec": True})
         state = None
@@ -1059,11 +1109,14 @@ class TPEngine:
                     drafted_total += k
                     if logits is None:
                         raise RuntimeError("spec verify returned no logits on the output rank")
-                    greedy = [int(x) for x in logits.argmax(dim=-1)]
-                    a = 0
-                    while a < k and int(drafts[a]) == greedy[a]:
-                        a += 1
-                    bonus = greedy[a]
+                    if sampler is not None and sampler.stochastic:
+                        a, bonus = _accept_sampled(logits, drafts, k, sampler)
+                    else:
+                        greedy = logits.argmax(dim=-1).tolist()
+                        a = 0
+                        while a < k and int(drafts[a]) == greedy[a]:
+                            a += 1
+                        bonus = int(greedy[a])
                     self.channel.send({"op": "accept", "req": self.requests, "accepted": int(a)})
                     self.backend.rewind(state, k - a)
                     position += a + 1
@@ -1137,13 +1190,14 @@ class TPEngine:
                              f"{cache_cap - 2} usable tokens (EXL3_TP_CACHE_TOKENS={cache_cap}); "
                              f"refused before any rank dispatch")
         max_tokens = max(1, min(int(max_tokens), self.ctx - len(ids) - 1))
-        # Spec mode is chosen here, once per request, at the settled start boundary. Greedy only:
-        # a sampled request (or an explicit opt-out) runs the unchanged plain path whatever the
-        # server default is.
+        # Spec mode is chosen here, once per request, at the settled start boundary. Sampled
+        # requests draft too (exact speculative sampling, see _accept_sampled) unless
+        # EXL3_TP_SPEC_SAMPLED=0 restores the greedy-only rule; an explicit opt-out always runs
+        # the unchanged plain path whatever the server default is.
         spec = self.dspark if speculative is None else bool(speculative)
         if spec and not self.dspark:
             raise ValueError("speculative decoding is not enabled on this server (start both ranks with EXL3_TP_DSPARK=1)")
-        if spec and float(temperature) > 0.0:
+        if spec and float(temperature) > 0.0 and not SPEC_SAMPLED:
             spec = False
         if spec and spec_k is not None:
             if not isinstance(spec_k, int) or isinstance(spec_k, bool) or spec_k < 1:
@@ -1162,7 +1216,7 @@ class TPEngine:
                     if spec:
                         done = self._run_spec(ids, max_tokens, [s for s in (stop or []) if s],
                                               cancel, lambda piece: loop.call_soon_threadsafe(q.put_nowait, piece),
-                                              spec_k, eos_id)
+                                              spec_k, eos_id, sampler)
                     else:
                         done = self._run(ids, max_tokens, sampler, eos_id, [s for s in (stop or []) if s],
                                          cancel, lambda piece: loop.call_soon_threadsafe(q.put_nowait, piece))

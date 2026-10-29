@@ -1,0 +1,154 @@
+From 1afdb12f0eb1fc156a5633105451c93775c8014d Mon Sep 17 00:00:00 2001
+From: David Canar <davidcanar@gmail.com>
+Date: Wed, 28 Oct 2026 18:54:40 -0600
+Subject: [PATCH 10/11] DSV4Attention: candidate readers score per row without
+ host syncs
+
+Past candidate_topk_blocks * candidate_block_size pool entries, the V4.1
+indexer layers that read the candidate selection built the union of the
+rows' kept blocks with nonzero() and boolean indexing (two host syncs per
+layer, four layers) and gathered the union's keys into a copy.
+
+The source layer now also records each row's kept blocks as a fixed-width
+ascending list (past-the-end ids pad blocks a row could not keep), and the
+readers score every row against its own list in place through a virtual
+page table (dsa_indexer_scores_rows: the few-query kernel in MULTIROW mode,
+one row per job, EPP = block size). Columns past the row's causal bound or
+the pool are masked to -inf, which dsa_topk skips. Rows see the same
+candidate set and column order as the union path, and the single-row decode
+scores are bit-identical. EXL3_DSV4_CAND_ROWS=0 restores the union path.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ exllamav3/modules/attention_fn/dsa_triton.py | 42 ++++++++++++++++++++
+ exllamav3/modules/dsv4.py                    | 32 ++++++++++++++-
+ 2 files changed, 73 insertions(+), 1 deletion(-)
+
+diff --git a/exllamav3/modules/attention_fn/dsa_triton.py b/exllamav3/modules/attention_fn/dsa_triton.py
+index bce35847..abbadb12 100644
+--- a/exllamav3/modules/attention_fn/dsa_triton.py
++++ b/exllamav3/modules/attention_fn/dsa_triton.py
+@@ -1171,6 +1171,48 @@ def dsa_attn(
+     return out
+ 
+ 
++def dsa_indexer_scores_rows(
++    q_idx,                   # (R, H_i, D_i) fp16, rope applied
++    weights,                 # (R, H_i) fp16 raw head weights (H_i ** -0.5 folded in-kernel)
++    k_idx,                   # (N, D_i) fp16 flat (paged) key pool
++    vbt,                     # (R, P) int32 virtual page table: row r's j-th key block starts at
++                             # pool row vbt[r, j] * vpage (blocks of vpage contiguous rows)
++    vpage,                   # rows per virtual page (the candidate block size)
++    block_n = 128,
++    num_warps = 8,
++    num_stages = 2,
++):
++    """Indexer scores (R, P * vpage) fp16 where every query row scores ITS OWN key list, read in
++    place from the pool through a per-row virtual page table (no gathered key copy, no host sync,
++    fixed shapes). The few-query kernel in MULTIROW mode with one row per job; column j of row r
++    is the key at pool row vbt[r, j // vpage] * vpage + j % vpage. No causal bound is applied:
++    the caller masks columns it must not see."""
++    R, H_i, D_i = q_idx.shape
++    P = vbt.shape[1]
++    T = P * vpage
++    assert vbt.shape[0] == R and vbt.dtype == torch.int32 and vbt.is_contiguous()
++    S_stride = max(block_n, triton.next_power_of_2(T))
++    scores = torch.empty((R, S_stride), dtype = torch.half, device = q_idx.device)
++    # Per-job scalars (MULTIROW): every row sees all T columns
++    t_arr = torch.full((R,), T, dtype = torch.int32, device = q_idx.device)
++    with torch.cuda.device(q_idx.device):
++        f_args = (q_idx, weights, k_idx, scores, t_arr, R, t_arr, t_arr, vbt, P)
++        def f_consts(bn):
++            return dict(
++                H_i = H_i, H_pad = max(triton.next_power_of_2(H_i), 16), D_i = D_i,
++                S_stride = S_stride, compress_rate = 1, scale = D_i ** -0.5 * H_i ** -0.5,
++                BLOCK_N = bn, SEQ = 1, MULTIROW = 1, EPP = vpage,
++                DEBUG_BOUNDS = 0, DEBUG_PAGES = 0,
++            )
++        block_n = pick_config(
++            q_idx.device, "dsa_indexer_fewq_rows", (H_i, D_i, S_stride, vpage, num_warps, num_stages, block_n),
++            halving_ladder(block_n),
++            lambda bn: shared_bytes(_dsa_indexer_fewq_kernel, f_args, **f_consts(bn), num_warps = num_warps, num_stages = num_stages))
++        grid = (R, triton.cdiv(T, block_n))
++        _dsa_indexer_fewq_kernel[grid](*f_args, **f_consts(block_n), num_warps = num_warps, num_stages = num_stages)
++    return scores[:, :T]
++
++
+ def dsa_indexer_scores(
+     q_idx,                   # (R, H_i, D_i) fp16, rope applied
+     weights,                 # (R, H_i) fp16 raw head weights (H_i ** -0.5 folded in-kernel)
+diff --git a/exllamav3/modules/dsv4.py b/exllamav3/modules/dsv4.py
+index 65953a8e..e8676770 100644
+--- a/exllamav3/modules/dsv4.py
++++ b/exllamav3/modules/dsv4.py
+@@ -16,7 +16,7 @@ from ..util.device_copy import to_device
+ from .quant.exl3 import LinearEXL3
+ from ..cache.dsa import DSV4LayerState, CacheLayer_dsa
+ from .multilinear import MultiLinear
+-from .attention_fn.dsa_triton import dsa_attn, dsa_indexer_scores, dsa_debug_bounds
++from .attention_fn.dsa_triton import dsa_attn, dsa_indexer_scores, dsa_indexer_scores_rows, dsa_debug_bounds
+ from .attention_fn.bc_dsa import bc_dsa_enable, build_bc_dsa, build_bc_dsa_batch
+ 
+ # Multi-job decode via the batched path: one projection pass, one MULTIROW attention
+@@ -26,6 +26,10 @@ dsv4_batch_eager = os.environ.get("EXL3_DSV4_BATCH_EAGER", "1") != "0"
+ # Capture the batched step as one CUDA graph per (cache layer, B, S) after two warmup
+ # runs; EXL3_DSV4_BATCH_GRAPH=0 keeps the eager batched chain
+ dsv4_batch_graph = os.environ.get("EXL3_DSV4_BATCH_GRAPH", "1") != "0"
++# Candidate-reader indexer layers score per row from the source layer's fixed-width block lists
++# (no nonzero()/mask host syncs, no gathered key copy); EXL3_DSV4_CAND_ROWS=0 restores the
++# union-of-rows path
++_cand_rows = os.environ.get("EXL3_DSV4_CAND_ROWS", "1") != "0"
+ from ..constants import PAGE_SIZE
+ 
+ # Reference: transformers models/deepseek_v4 (paper §2)
+@@ -1287,14 +1291,38 @@ class DSV4Attention(Module):
+         mode = self.candidate_mode if ec > self.candidate_topk_blocks * bs else None
+         if mode == "source":
+             shared["cand"] = torch.ones((seq, ec // bs + 1), dtype = torch.bool, device = x.device)
++            # Each row's kept blocks as a fixed-width ascending list (past-the-end ids pad the
++            # blocks a row could not keep): the readers score per row from it without a host sync
++            shared["cand_blocks"] = torch.empty((seq, self.candidate_topk_blocks), dtype = torch.long, device = x.device)
+         elif mode == "use":
+             shared["cand"] = to_device(shared["cand"], x.device)
++            if "cand_blocks" in shared:
++                shared["cand_blocks"] = to_device(shared["cand_blocks"], x.device)
+         k = min(self.index_topk, ec)
+         K_pad = -(-k // 32) * 32
+         indices = torch.empty((seq, K_pad), dtype = torch.int32, device = x.device)
+ 
+         def slab(r0, r1):
+             sel, ninf = indices[r0:r1], -float("inf")
++            if mode == "use" and _cand_rows and shared.get("cand_blocks") is not None:
++                # Fixed-shape, sync-free reader: every row scores its own candidate blocks in place
++                # through a virtual page table (block b of the pool = rows starting at
++                # phys(b * bs)); columns past the row's causal bound or the pool are masked. Rows
++                # see the same candidate set and column order as the union path below
++                cb = shared["cand_blocks"][r0:r1]
++                ent = (cb.unsqueeze(-1) * bs + torch.arange(bs, device = x.device)).flatten(1)
++                vis = (pos0 + 1 + torch.arange(r0, r1, device = x.device)) // self.compress_rate
++                ok = ent < vis.clamp(max = ec).unsqueeze(1)
++                first = cb * bs
++                first = torch.where(first < ec, first, torch.zeros_like(first))
++                if block_table is not None:
++                    first = block_table.reshape(-1)[first // epp].long() * epp + first % epp
++                vbt = (first // bs).to(torch.int32)
++                scores = dsa_indexer_scores_rows(q_idx[0, r0:r1], wts[0, r0:r1], idx_pool, vbt, bs)
++                scores.masked_fill_(~ok, ninf)
++                ext.dsa_topk(scores, sel, min(k, ent.shape[1]), None, 0)
++                sel.copy_(torch.where(sel < 0, sel, ent.gather(1, sel.clamp(min = 0).long()).int()))
++                return
+             if mode == "use":
+                 # A row selects inside its candidate blocks: score only the blocks any row of the slab kept
+                 drop = shared["cand"][r0:r1]
+@@ -1319,6 +1347,8 @@ class DSV4Attention(Module):
+                 last = ((pos0 + 1 + torch.arange(r0, r1, device = x.device)) // self.compress_rate - 1).clamp_(min = 0)
+                 top = blk.scatter_(1, last.unsqueeze(1) // bs, float("inf")).topk(self.candidate_topk_blocks, dim = 1)
+                 shared["cand"][r0:r1].scatter_(1, top.indices, top.values == ninf)
++                kept = torch.where(top.values == ninf, torch.full_like(top.indices, nf + 1), top.indices)
++                shared["cand_blocks"][r0:r1] = kept.sort(dim = 1).values
+             ext.dsa_topk(scores, sel, k, None, 0)
+ 
+         # Row slabs bound the transient score matrix, as in MLAttention._indexer_topk: selection is
+-- 
+2.54.0
+

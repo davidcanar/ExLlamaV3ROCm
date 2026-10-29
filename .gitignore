@@ -27,3 +27,11 @@ __pycache__/
 # local-only configuration
 *.local.sh
 .env
+
+# profiling / benchmark output on the rig (perf/ keeps only the harness sources)
+perf/*.jsonl
+perf/*.log
+perf/*.out
+perf/backup-orig/
+perf/ds41_test/
+perf/commitmsgs/

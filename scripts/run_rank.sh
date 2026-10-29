@@ -24,6 +24,7 @@ export EXLLAMA_MASTER_PORT=$MASTER_PORT
 export NCCL_SOCKET_IFNAME=thunderbolt0
 export NCCL_IB_DISABLE=1
 export NCCL_NET=ODL_TB5
+export ODL_RCCL_DEVICES=${ODL_RCCL_DEVICES:-0}
 export NCCL_DEBUG=WARN
 # RCCL shards each collective across its channels and every shard becomes a
 # stream message on the ODL_TB5 plugin, so the ~26 default channels multiply

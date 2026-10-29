@@ -1,0 +1,124 @@
+From 275f11e1e7f18ee683bd329877598ac778ad0bd5 Mon Sep 17 00:00:00 2001
+From: David Canar <davidcanar@gmail.com>
+Date: Wed, 28 Oct 2026 18:54:40 -0600
+Subject: [PATCH 09/11] DeepseekV41: Engram reads host ids and stages its rows
+ at pass start
+
+The Engram layers copied the device input ids back to the host
+(.to("cpu")) to hash them, a full device sync in the middle of every module
+walk (layers 1 and 14). The TP worker now keeps a host copy of the ids
+(params["input_ids_cpu"]) and EngramLayer prefers it.
+
+EngramLayer also takes the prefetch_ids cap: the walk calls its prefetch()
+with the pass's ids before the first module, which builds the same token
+history forward() will build (without touching the ring) and stages the
+table rows on the row table's worker thread, so the CPU hashing and disk
+gather run behind the blocks in front of the layer. EXL3_ENGRAM_PREFETCH=0
+keeps the lookups inline. Outputs are bit-identical.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ exllamav3/model/model_tp_fn.py                |  4 ++
+ .../modules/arch_specific/deepseek_v41.py     | 46 +++++++++++++++----
+ 2 files changed, 42 insertions(+), 8 deletions(-)
+
+diff --git a/exllamav3/model/model_tp_fn.py b/exllamav3/model/model_tp_fn.py
+index 206873e9..fdc464ad 100644
+--- a/exllamav3/model/model_tp_fn.py
++++ b/exllamav3/model/model_tp_fn.py
+@@ -301,6 +301,10 @@ def mp_model_forward(
+     ]:
+         p = params.get(tensor_param)
+         if p is not None:
++            if tensor_param == "input_ids":
++                # Host copy for CPU-side consumers (Engram hashing): reading the device copy back
++                # would be a device sync in the middle of the module walk
++                params["input_ids_cpu"] = consumer.recv(p, cuda = False)
+             params[tensor_param] = consumer.recv(p, cuda = True)
+ 
+     p = params.get("indexed_embeddings")
+diff --git a/exllamav3/modules/arch_specific/deepseek_v41.py b/exllamav3/modules/arch_specific/deepseek_v41.py
+index b948333c..1eb73e01 100644
+--- a/exllamav3/modules/arch_specific/deepseek_v41.py
++++ b/exllamav3/modules/arch_specific/deepseek_v41.py
+@@ -13,6 +13,11 @@ from ...constants import PAGE_SIZE
+ from ...tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
+ 
+ 
++# Engram rows staged on a worker thread at the start of each pass (EngramLayer.prefetch);
++# EXL3_ENGRAM_PREFETCH=0 keeps the lookups inline in forward()
++_engram_prefetch = os.environ.get("EXL3_ENGRAM_PREFETCH", "1") != "0"
++
++
+ @lru_cache(maxsize = 1)
+ def engram_token_map(path: str) -> torch.Tensor:
+     tokenizer = Tokenizer.from_file(path)
+@@ -119,7 +124,9 @@ class EngramLayer(Module):
+ 
+         assert layer_idx < 0
+         self.layer_idx = layer_idx
+-        self.caps.update({"recurrent_cache": True})
++        # prefetch_ids: the forward walks stage this layer's table rows from the input ids at the
++        # start of the pass (prefetch()), so the disk gather overlaps the blocks in front of it
++        self.caps.update({"recurrent_cache": True, "prefetch_ids": _engram_prefetch})
+         self.layer_state_cls = EngramLayerState
+         self.recurrent_layers = []
+         self.tp_mode = False
+@@ -174,12 +181,12 @@ class EngramLayer(Module):
+         hc_flush(params)
+         return super().prepare_for_device(x, params)
+ 
+-    @override
+-    def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None):
+-        hc_flush(params)
+-        bsz, seq, H, D = x.shape
++    def _history(self, ids: torch.Tensor, params: dict, update: bool):
++        """(bsz, context + seq) mapped token history of a pass over ids (host tensors): the last
++        context_len ids before each job's position from the slot's ring, then the pass's own ids.
++        update=True also appends the pass's ids to the ring (forward); prefetch only reads it."""
++        bsz, seq = ids.shape
+         ctx = self.embed.context_len
+-        ids = params["input_ids"].to("cpu", torch.long)
+         mm = ids >= FIRST_MM_EMBEDDING_INDEX if params.get("indexed_embeddings") else None
+         if mm is not None:
+             ids = ids.masked_fill(mm, self.pad_token_id)
+@@ -195,11 +202,34 @@ class EngramLayer(Module):
+             for i, rs in enumerate(rsg[:bsz]):
+                 n = min(rs.position, ctx)
+                 hist[i, ctx - n:ctx] = ring[rs.slot, torch.arange(rs.position - n, rs.position) % R]
+-                p = torch.arange(max(rs.position, rs.position + seq - R), rs.position + seq)
+-                ring[rs.slot, p % R] = ids[i, -p.numel():]
++                if update:
++                    p = torch.arange(max(rs.position, rs.position + seq - R), rs.position + seq)
++                    ring[rs.slot, p % R] = ids[i, -p.numel():]
+         else:
+             assert params.get("position", 0) == 0, \
+                 "EngramLayer requires recurrent states for forwards past position 0"
++        return hist, mm
++
++    def prefetch(self, x: torch.Tensor, params: dict):
++        """Stage the table rows for the coming forward on the row table's worker thread: the ids and
++        the ring are final at the start of the pass, so forward()'s lookup finds the rows staged
++        and the CPU hashing + disk gather run behind the blocks in front of this layer. Decode-sized
++        passes included (NGramEmbedding.prefetch declines those on its own)."""
++        table = getattr(self.embed, "table", None)
++        if table is None or x.dim() != 2 or x.dtype != torch.long or x.is_cuda:
++            return
++        hist, _ = self._history(x.to(torch.long), params, update = False)
++        n = hist.shape[0] * (hist.shape[1] - self.embed.context_len) * self.embed.num_heads
++        table.prefetch(hist, n, self.embed._resolve)
++
++    @override
++    def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None):
++        hc_flush(params)
++        bsz, seq, H, D = x.shape
++        # TP workers keep a host copy of the ids (model_tp_fn); the device copy would need a sync
++        ids = params.get("input_ids_cpu")
++        ids = params["input_ids"].to("cpu", torch.long) if ids is None else ids.to(torch.long)
++        hist, mm = self._history(ids, params, update = True)
+         kv = self.wkv.forward(self.embed.forward(hist, params), params)
+         key = self.norm_key.forward(kv[..., :H * D].view(bsz, seq, H, D), params, out_dtype = torch.float)
+         query = self.norm_query.forward(x, params, out_dtype = torch.float)
+-- 
+2.54.0
+

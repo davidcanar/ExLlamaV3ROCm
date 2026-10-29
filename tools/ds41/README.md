@@ -70,10 +70,14 @@ keep DSpark: the chunked spec prefill exports the taps on every chunk (both rank
 dispatches) and rank 0 primes the drafter's kv rows at each chunk's absolute offset — the same
 per-position math as the proven single-shot priming, bounded to `EXL3_TP_SPAN` rows at a time.
 
-Per request (chat completions): `"speculative": true|false` (null = server default: **on** for
-greedy requests when enabled) and `"spec_k": 1..5` (cap on drafted tokens per round).
-Sampled requests (temperature > 0) always use the plain path; `"speculative": true` on a server
-without DSpark is a clean 400. Spec stats (`spec_rounds`, `accepted_draft_tokens`,
+Per request (chat completions): `"speculative": true|false` (null = server default: **on** when
+enabled, greedy and sampled requests alike) and `"spec_k": 1..5` (cap on drafted tokens per
+round). Sampled requests (temperature > 0) accept drafts by exact speculative sampling against
+the greedy drafts (`tp_engine._accept_sampled`): draft d_i is kept with probability p_i(d_i) under
+the request's temperature/top-p distribution, the first rejection draws from p_i with d_i
+removed, so the output distribution is exactly that of plain sampling. `EXL3_TP_SPEC_SAMPLED=0`
+(rank 0) restores the old rule (sampled requests on the plain path). `"speculative": true` on a
+server without DSpark is a clean 400. Spec stats (`spec_rounds`, `accepted_draft_tokens`,
 `rejected_draft_tokens`) land in `timings` and `/metrics` (llama.cpp spec-decode counters).
 
 ```bash
@@ -84,10 +88,11 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/
 ```
 
 Protocol: a spec request prefill exports the DSpark taps on both ranks; each round rank 0
-drafts, sends `round {window}`, both run one multi-row verify forward, rank 0 greedy-accepts,
-sends `accept {a}`, and both rewind identically (mirrored TP dispatch). Output is guaranteed
-equal to plain greedy (the acceptance rule emits the target's argmax as the bonus token); all
-stop decisions land on settled round boundaries. Knobs: `EXL3_TP_BUDGETS=95,104`,
+drafts, sends `round {window}`, both run one multi-row verify forward, rank 0 accepts (prefix
+match when greedy, speculative sampling otherwise), sends `accept {a}`, and both rewind
+identically (mirrored TP dispatch). Greedy output is guaranteed equal to plain greedy (the
+acceptance rule emits the target's argmax as the bonus token); all stop decisions land on
+settled round boundaries. Knobs: `EXL3_TP_BUDGETS=95,104`,
 `EXL3_TP_DSPARK_CONF` (draft confidence threshold, stock 0.5, maps to the engine's
 `EXL3_DSPARK_CONF` as `EXL3_DS41_CONF` does in the script).
 
@@ -219,10 +224,19 @@ DS41_REF_DIR=/home/davidcanar/exl3ds4/model ../../.venv/bin/python -m pytest -q 
 | `EXL3_TP_DSPARK_CONF` | 0.5 (stock) | draft confidence threshold (maps to `EXL3_DSPARK_CONF`) |
 | `EXL3_SERVE_WARMUP=0` | on | skip the tiny end-to-end warm-up requests (default + plain fallback when DSpark is on) |
 | `EXL3_TP_ACCEPT_TIMEOUT` | 1800 s | how long rank 0 waits for rank 1 to finish loading |
+| `EXL3_TP_SPEC_SAMPLED` | 1 | sampled requests draft too (exact speculative sampling); 0 = plain path for them (rank 0 only) |
+| `EXL3_TP_ODL_AR2` | 1 (launchers) | decode-sized all-reduces over the OdinLink stream API (`~/exl3ds4/odl_ar2`, stream-ordered, no host sync); 0 = RCCL for everything |
+| `EXL3_TP_ODL_AR2_PEER` / `_PORT` / `_MAX` | 10.0.2.2 / 29652 / 65536 | rank 1's address (it listens), rendezvous port, largest wire payload routed to odl_ar2 |
+| `ODL_RCCL_DEVICES` | 0 (launchers) | `/dev/odl_tb5_N` devices offered to RCCL (patched net plugin); keeps RCCL on the box1-box2 link when another Thunderbolt host is plugged in |
+| `EXL3_TP_SHARED_EXPERT_DEVICE` | unset | pin the whole-on-one-rank shared experts to TP rank N (`alt`: alternate by layer); unset = the allocator's choice (every one on the larger-budget rank) |
+| `EXL3_DSV4_CAND_ROWS` | 1 | candidate-reader indexer layers score per row from fixed-width block lists (no host syncs); 0 = union path |
+| `EXL3_ENGRAM_PREFETCH` | 1 | stage the Engram table rows on a worker thread at the start of each pass |
 
 `EXL3_TP_SPAN`, `EXL3_TP_CACHE_TOKENS`, `EXL3_TP_USE_PER_DEVICE` and `EXL3_TP_MEM_FLOOR` join
 the DSpark/env variables the launchers forward to Box2 (ssh forwards nothing): the chunk plan
-and the block-table sizing are derived from them on both ranks, so they must match.
+and the block-table sizing are derived from them on both ranks, so they must match. The same
+holds for `EXL3_TP_ODL_AR2*`, `EXL3_TP_SHARED_EXPERT_DEVICE` (it changes the TP plan) and
+`EXL3_DSV4_CAND_ROWS`, which `exl3ds4.sh` / `tp_serve_odl.sh` forward as well.
 
 ## First-version limitations (deliberate)
 
@@ -238,6 +252,6 @@ and the block-table sizing are derived from them on both ranks, so they must mat
    still wedges the peer.
 4. **Greedy by default** (`temperature 0`); `temperature/top_p > 0` sampling runs on rank 0 only
    (safe: sampling happens after the collectives). Vision and non-DSpark MTP are not wired into
-   the TP path; DSpark itself is greedy-only (sampled requests silently use the plain path).
+   the TP path; DSpark serves sampled requests through speculative sampling.
 5. The HTTP default bind is `0.0.0.0:8080` (the deployment binds `0.0.0.0:1234`); no
    authentication — keep it on the LAN, or pass `--host 127.0.0.1`.

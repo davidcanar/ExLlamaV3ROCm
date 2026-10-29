@@ -1,7 +1,7 @@
 # patches/odinlink — local OdinLink-Five driver + RCCL v7 plugin diff
 
-The complete local modification of OdinLink-Five against upstream, kept as a
-single 5-file diff:
+The local modification of OdinLink-Five against upstream. `0001` is a 5-file
+diff:
 
     git diff 4534f58 -- \
         driver/odl_tb5_core.h driver/odl_tb5_params.c driver/odl_tb5_proto.c \
@@ -27,12 +27,21 @@ What the diff does (summary):
   multi-frame + stream-scoped sync + four RCCL channels (`NCCL_MAX_NCHANNELS=4`)
   against the full-model and DSpark regressions.
 
-Apply with `git apply` (plain diff, no commit identity to preserve):
+`0002-rccl-plugin-ODL_RCCL_DEVICES-allow-list.patch` applies on top of
+`0001` (plugin only, MIT): `ODL_RCCL_DEVICES="0[,1...]"` limits the
+`/dev/odl_tb5_N` devices the plugin offers to RCCL, with an RCCL-device to
+`/dev/odl_tb5_N` map in the shared-handle open. A second Thunderbolt host on
+another USB4 port (a third machine) shows up as another odl_tb5 device; RCCL
+would otherwise see an asymmetric NIC count across the ranks and could open
+the wrong link. The launchers set `ODL_RCCL_DEVICES=0`; unset keeps the old
+behaviour.
+
+Apply with `git apply` (plain diffs, no commit identity to preserve):
 
     git clone https://github.com/Geramy/OdinLink-Five odinlink
     cd odinlink
     git checkout 4534f58
-    git apply /path/to/patches/odinlink/0001-odl-tb5-local-rccl-v7-multiframe-and-dma-fixes.patch
+    git apply /path/to/patches/odinlink/0001-odl-tb5-local-rccl-v7-multiframe-and-dma-fixes.patch               /path/to/patches/odinlink/0002-rccl-plugin-ODL_RCCL_DEVICES-allow-list.patch
 
 `setup.sh` performs the clone/patch/build automatically (default source
 location `$HOME/.cache/odinlink`, override with `EXL3_ODL_SRC`; the built

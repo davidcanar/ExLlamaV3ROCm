@@ -1,0 +1,57 @@
+--- a/rccl/src/odl_tb5_plugin.c
++++ b/rccl/src/odl_tb5_plugin.c
+@@ -122,6 +122,7 @@
+ 
+ static rcclDebugLogger_t odl_logger;
+ static char hw_ids[ODL_TB5_MAX_RCCL_DEVICES][64];
++static int dev_map[ODL_TB5_MAX_RCCL_DEVICES];   /* RCCL device -> /dev/odl_tb5_N */
+ static int num_devices;
+ 
+ static struct odl_rccl_stats *stats_map;
+@@ -256,7 +257,7 @@
+ 
+ 	pthread_mutex_lock(&g_lock);
+ 	if (!g_handle) {
+-		int rc = odl_tb5_open(&g_handle, dev);
++		int rc = odl_tb5_open(&g_handle, (dev >= 0 && dev < num_devices) ? dev_map[dev] : dev);
+ 
+ 		if (rc < 0) {
+ 			WARN("open /dev/odl_tb5_%d failed: %s",
+@@ -330,6 +331,24 @@
+ 	return rcclSuccess;
+ }
+ 
++/* ODL_RCCL_DEVICES="0[,1...]": expose only these /dev/odl_tb5_N to RCCL. A second
++ * Thunderbolt host on another port (a third machine) appears as another odl_tb5 device;
++ * RCCL would otherwise see an asymmetric NIC count across the ranks and the shared handle
++ * could open the wrong link. Unset = every device present (previous behaviour). */
++static int odl_dev_allowed(int i)
++{
++	const char *e = getenv("ODL_RCCL_DEVICES");
++	char buf[128], *tok, *save = NULL;
++
++	if (!e || !*e)
++		return 1;
++	snprintf(buf, sizeof(buf), "%s", e);
++	for (tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save))
++		if (atoi(tok) == i)
++			return 1;
++	return 0;
++}
++
+ static void odl_scan_devices(void)
+ {
+ 	num_devices = 0;
+@@ -337,10 +356,11 @@
+ 		char path[64];
+ 
+ 		snprintf(path, sizeof(path), "/dev/odl_tb5_%d", i);
+-		if (access(path, F_OK) != 0)
++		if (access(path, F_OK) != 0 || !odl_dev_allowed(i))
+ 			continue;
+ 		snprintf(hw_ids[num_devices], sizeof(hw_ids[0]),
+ 			 "odl_tb5_%d", i);
++		dev_map[num_devices] = i;
+ 		num_devices++;
+ 	}
+ }

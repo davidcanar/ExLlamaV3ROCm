@@ -120,8 +120,9 @@ def build_tp_engine(args: argparse.Namespace) -> Any:
     print(f"tp-serve: rank 1 connected and verified (vocab {backend.vocab_size}, "
           f"dspark {'on' if backend.dspark else 'off'})", flush=True)
     if backend.dspark:
+        which = "greedy and sampled requests" if tp_engine.SPEC_SAMPLED else "greedy requests (temperature 0)"
         print(f"tp-serve: DSpark speculative decoding on (block {backend.dspark_block}, max_history "
-              f"{tp_engine.MAX_HISTORY}); greedy requests (temperature 0) draft by default -- "
+              f"{tp_engine.MAX_HISTORY}); {which} draft by default -- "
               f"send \"speculative\": false per request to opt out, \"spec_k\": 1..{backend.dspark_block} to cap",
               flush=True)
     tokenizer = ds41_engine.HFTokenizer(Path(args.model).expanduser() / "tokenizer.json")

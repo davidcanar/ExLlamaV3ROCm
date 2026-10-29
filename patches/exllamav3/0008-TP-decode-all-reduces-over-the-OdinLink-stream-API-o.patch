@@ -1,0 +1,177 @@
+From 9c751b4b2873a330bb74623bf19bb704b5461b18 Mon Sep 17 00:00:00 2001
+From: David Canar <davidcanar@gmail.com>
+Date: Wed, 28 Oct 2026 18:54:40 -0600
+Subject: [PATCH 08/11] TP: decode all-reduces over the OdinLink stream API
+ (odl_ar2)
+
+Cross-host decode collectives are tiny (5120 x rows fp32) and latency-bound.
+RCCL over the ODL_TB5 net plugin needs ~88 us per 10 KB all-reduce on an idle
+link plus a host stream sync after every op, so a decode token paid 80 host
+round trips. With EXL3_TP_ODL_AR2=1 the backend routes all-reduces whose wire
+payload fits the driver's 64 KiB latency path (EXL3_TP_ODL_AR2_MAX) through
+libodl_ar2.so instead: a stream-ordered [stage -> doorbell -> GPU wait+add]
+sequence with a CPU progress thread moving the bytes over OdinLink streams.
+~34 us per 10 KB op, ~97 us per 60 KB op (6-row verify), and no host sync,
+so the host queues the following layers while the exchange is in flight.
+
+fp32 tensors travel as bf16 and come back exactly as the RCCL path rounds
+them (fp32 -> bf16, bf16 sum with fp32 accumulation, -> fp32); both ranks
+add src + peer, so the reduced tensors stay bit-identical across ranks
+(the replicated MoE routing relies on it). Greedy outputs are unchanged.
+Larger collectives (prefill) stay on RCCL.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ exllamav3/model/model_tp_backend.py | 18 +++++++
+ exllamav3/model/model_tp_odl.py     | 82 +++++++++++++++++++++++++++++
+ 2 files changed, 100 insertions(+)
+ create mode 100644 exllamav3/model/model_tp_odl.py
+
+diff --git a/exllamav3/model/model_tp_backend.py b/exllamav3/model/model_tp_backend.py
+index 49354f45..2e3e8011 100644
+--- a/exllamav3/model/model_tp_backend.py
++++ b/exllamav3/model/model_tp_backend.py
+@@ -34,6 +34,9 @@ if _nccl_sync not in ("0", "1", "stream"):
+     print(f" -- Unknown EXL3_TP_NCCL_SYNC=\"{_nccl_sync}\", using 1 (device sync)", flush = True)
+     _nccl_sync = "1"
+ _gather_chunk_bytes = int(os.environ.get("EXL3_TP_GATHER_CHUNK_BYTES", str(64 * 1024 ** 2)))
++# Cross-host decode all-reduces over OdinLink streams instead of RCCL (model_tp_odl.py): stream-
++# ordered, so those ops need no host sync; larger collectives stay on RCCL
++_odl_ar2 = os.environ.get("EXL3_TP_ODL_AR2", "0") != "0"
+ # 17 slots (16 devices + accumulator) x 2MB: 8 ring stages of the 256KB reduce chunk size
+ SHBUF_SIZE_R = 17 * 8 * 256 * 1024
+ SHBUF_SIZE_S = 16 * 1024
+@@ -118,6 +121,7 @@ class TPBackendNCCL:
+         self.cross_host = cross_host
+         self.fallback = None
+         self.trace_seq = 0
++        self.odl = None
+         if cross_host:
+             if rank is None or world_size is None:
+                 raise ValueError("Cross-host NCCL requires explicit rank and world_size")
+@@ -140,6 +144,13 @@ class TPBackendNCCL:
+             init_method = init_method,
+         )
+         self.mp_warmup_nccl(device)
++        if cross_host and _odl_ar2:
++            if self.world_size != 2:
++                raise ValueError("EXL3_TP_ODL_AR2 supports exactly two cross-host ranks")
++            from .model_tp_odl import OdlAllReduce
++            self.odl = OdlAllReduce(self.rank, fp32_wire = _nccl_fp32)
++            print(f" -- odl_ar2: rank {self.rank} decode all-reduces over OdinLink streams "
++                  f"(<= {self.odl.max_wire} wire bytes)", flush = True)
+         if not cross_host:
+             self.fallback = TPBackendNative(
+                 device,
+@@ -207,6 +218,10 @@ class TPBackendNCCL:
+             return
+ 
+         dist.barrier()
++        if self.odl is not None:
++            torch.cuda.synchronize(self.device)
++            self.odl.close()
++            self.odl = None
+         if self.fallback is not None:
+             self.fallback.close()
+         dist.destroy_process_group()
+@@ -229,6 +244,9 @@ class TPBackendNCCL:
+     def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
+         if self.cross_host:
+             self._trace_collective("all_reduce", tensor, f"contribution={contribution}")
++            # Decode-sized: OdinLink stream all-reduce, stream-ordered (no host sync needed)
++            if self.odl is not None and self.odl.try_all_reduce_(tensor):
++                return
+         # fp32 payloads normally go over a bf16 wire like the native backend; EXL3_TP_NCCL_FP32=1
+         # reduces them in fp32 (A/B testing of the wire rounding)
+         if tensor.dtype == torch.float32 and not _nccl_fp32:
+diff --git a/exllamav3/model/model_tp_odl.py b/exllamav3/model/model_tp_odl.py
+new file mode 100644
+index 00000000..e9d9facd
+--- /dev/null
++++ b/exllamav3/model/model_tp_odl.py
+@@ -0,0 +1,82 @@
++import ctypes
++import os
++import torch
++
++"""
++OdinLink decode all-reduce for the cross-host TP backend (libodl_ar2.so, ~/exl3ds4/odl_ar2).
++
++Two ranks, SUM, fully stream-ordered: the library enqueues [stage into a pinned send slot] ->
++[doorbell] -> [GPU wait + add] on the current stream and a CPU progress thread moves the bytes over
++the OdinLink stream API. Nothing blocks the host, so the backend skips its post-collective sync for
++these ops and the host can queue the following layers while the exchange is in flight.
++
++fp32 tensors travel as bf16 (dtype 3) and come back exactly as the RCCL path rounds them (fp32 ->
++bf16, bf16 sum with fp32 accumulation, -> fp32); EXL3_TP_NCCL_FP32=1 sends fp32 instead. Both ranks
++compute src + peer with commutative IEEE adds, so the reduced tensors stay bit-identical across
++ranks, which the replicated MoE routing relies on.
++
++env: EXL3_TP_ODL_AR2=1 enables it (both ranks), EXL3_TP_ODL_AR2_PEER (rank 1's address, default
++10.0.2.2; rank 1 listens), EXL3_TP_ODL_AR2_PORT (rendezvous, default 29652), EXL3_TP_ODL_AR2_DEV
++(OdinLink device index, default 0), EXL3_TP_ODL_AR2_MAX (largest wire payload in bytes routed here,
++default 64 KiB: the driver's single-ioctl latency path; larger collectives stay on RCCL),
++EXL3_TP_ODL_AR2_LIB (library path).
++"""
++
++_DEFAULT_LIB = os.path.expanduser("~/exl3ds4/odl_ar2/libodl_ar2.so")
++_DT_BF16, _DT_FP16, _DT_FP32, _DT_FP32_BF16WIRE = 0, 1, 2, 3
++
++
++class OdlAllReduce:
++
++    def __init__(self, rank: int, fp32_wire: bool = False):
++        path = os.environ.get("EXL3_TP_ODL_AR2_LIB", _DEFAULT_LIB)
++        lib = ctypes.CDLL(path)
++        lib.odl2_init.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
++        lib.odl2_init.restype = ctypes.c_int
++        lib.odl2_enqueue.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int]
++        lib.odl2_enqueue.restype = ctypes.c_int
++        lib.odl2_last_error.restype = ctypes.c_int
++        lib.odl2_max_bytes.restype = ctypes.c_uint32
++        lib.odl2_shutdown.restype = None
++        peer = os.environ.get("EXL3_TP_ODL_AR2_PEER", "10.0.2.2")
++        port = int(os.environ.get("EXL3_TP_ODL_AR2_PORT", "29652"))
++        dev = int(os.environ.get("EXL3_TP_ODL_AR2_DEV", "0"))
++        if lib.odl2_init(int(rank), dev, peer.encode(), port) != 0:
++            raise RuntimeError(f"odl_ar2: init failed (rank {rank}, peer {peer}:{port}, device {dev})")
++        self.lib = lib
++        self.fp32_wire = fp32_wire
++        self.max_wire = min(int(lib.odl2_max_bytes()), int(os.environ.get("EXL3_TP_ODL_AR2_MAX", str(64 * 1024))))
++        self.ops = 0
++
++    def _dtype(self, t: torch.Tensor):
++        if t.dtype == torch.float32:
++            return (_DT_FP32, 4) if self.fp32_wire else (_DT_FP32_BF16WIRE, 2)
++        if t.dtype == torch.bfloat16:
++            return _DT_BF16, 2
++        if t.dtype == torch.float16:
++            return _DT_FP16, 2
++        return None, 0
++
++    def try_all_reduce_(self, t: torch.Tensor) -> bool:
++        """In-place SUM all-reduce of t when it fits the latency path; False = caller uses RCCL.
++        Both ranks see the same shapes in the same order, so they always take the same route."""
++        if not (t.is_cuda and t.is_contiguous()):
++            return False
++        code, wire_elt = self._dtype(t)
++        if code is None or t.numel() * wire_elt > self.max_wire:
++            return False
++        if self.lib.odl2_last_error():
++            raise RuntimeError("odl_ar2: transport error latched by a previous all-reduce "
++                               "(peer gone or link down); restart both ranks")
++        stream = torch.cuda.current_stream(t.device).cuda_stream
++        rc = self.lib.odl2_enqueue(ctypes.c_void_p(stream), ctypes.c_void_p(t.data_ptr()),
++                                   ctypes.c_void_p(t.data_ptr()), t.numel() * t.element_size(), code)
++        if rc != 0:
++            raise RuntimeError(f"odl_ar2: enqueue failed ({rc})")
++        self.ops += 1
++        return True
++
++    def close(self):
++        if self.lib is not None:
++            self.lib.odl2_shutdown()
++            self.lib = None
+-- 
+2.54.0
+

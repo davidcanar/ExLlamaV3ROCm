@@ -65,6 +65,13 @@ Working now (validated on the rig):
   readback is fixed (patch `0007`, source commit `0e259659`), and
   >750-token needle/counting tests pass with and without DSpark. The 512K
   allocation leaves >10 GiB free on each node.
+- Decode profiling pass (patches `0008`–`0011`, `odl_ar2/`, see
+  [Decode performance](#decode-performance-2026-10-28-profiling-pass)):
+  decode all-reduces over the OdinLink stream API instead of RCCL, no device
+  syncs in the module walk, and DSpark for sampled requests (they used plain
+  decoding before). Over HTTP at a 62.8K-token context: **22.4 tok/s greedy,
+  23.1 tok/s at T=0.6, 25.1 tok/s at T=1.0** (sampled requests were ~11.5
+  tok/s), plain decoding 13.8 tok/s.
 
 Not done yet: vision support and full 512K prefill performance measurement.
 GPU zero-copy is not required; see the performance notes below.
@@ -77,8 +84,10 @@ exl3ds4.sh             controller: start|stop|restart|status|logs for both boxes
 setup.sh               one-shot installer (venv, wheels, clones, patches, builds, model)
 scripts/               build script, rank launcher, smoke/bench harnesses, model sync
 tools/ds41/            OpenAI-compatible server + CPU test suite (Kyojin-vendored layer)
-patches/exllamav3/     7-commit 'multi-node-rocm' series on PR #449 base d45e8961
-patches/odinlink/      5-file local diff of OdinLink-Five @ 4534f58
+patches/exllamav3/     11-commit 'multi-node-rocm' series on PR #449 base d45e8961
+patches/odinlink/      local diffs of OdinLink-Five @ 4534f58 (multi-frame + RCCL device allow-list)
+odl_ar2/               OdinLink stream all-reduce for decode collectives (HIP; build.sh per box)
+perf/                  profiler (tp_prof.py + prof_hooks.py), link and HTTP benchmarks
 requirements/          exact dependency pins (ROCm wheel index + PyPI freeze)
 LICENSE / NOTICE       MIT + third-party attribution (Kyojin, ExLlamaV3, OdinLink, …)
 ```
@@ -228,6 +237,11 @@ rank. `/tp/status` reports ctx 524286. `stop` is cmdline-verified and scoped
 to this stack only: foreign jobs and foreign port holders are reported,
 never touched.
 
+With DSpark on, sampled requests (`temperature > 0`) draft too: drafts are
+accepted by exact speculative sampling, so the output distribution is that of
+plain sampling (`EXL3_TP_SPEC_SAMPLED=0` sends sampled requests down the
+plain path again).
+
 Context and memory: 512K tokens is the configured and supported context.
 >750-token needle/counting tests pass with and without DSpark, and the 512K
 allocation leaves >10 GiB free on each node. Full 512K prefill performance is
@@ -294,6 +308,10 @@ Implementation notes:
   `NCCL_MAX_NCHANNELS=4`, validated against full-model and DSpark runs.
   `EXL3_TP_NCCL_SYNC=1` restores full-device synchronization; `0` remains
   experimental.
+- Decode-sized all-reduces (wire payload <= 64 KiB) bypass RCCL through
+  `odl_ar2` (`EXL3_TP_ODL_AR2=1` in the launchers): stream-ordered, so they
+  need no host sync. `ODL_RCCL_DEVICES=0` keeps RCCL on the Box1–Box2 link
+  when another Thunderbolt host is plugged into a box.
 - `EXL3_TP_TRACE_COLLECTIVES=1` enables ordered collective diagnostics;
   `EXL3_TP_STREAM_HASH=N` enables residual-stream hashes.
 - Basic cached prefill/decode passes. Cross-host CPU/disk cache tiers are
@@ -348,6 +366,58 @@ Measured examples: DSpark counting/structured output reached **21.40 tok/s vs
 **16.22 tok/s vs 13.11 plain (1.24×)**. DSpark is not universally faster;
 short or unpredictable outputs can lose to plain decoding.
 
+## Decode performance (2026-10-28 profiling pass)
+
+Tools: `perf/tp_prof.py` + `perf/prof_hooks.py` (rank-0 synchronized per-op
+timing by monkeypatching, no library edits), launched with
+`perf/run_prof.sh <tag>` while the server is stopped (results in
+`perf/prof_*.jsonl`); `perf/run_bench.sh` (cross-box all-reduce latency) and
+`perf/bench_ctx.py` (the running server over HTTP).
+
+Findings:
+
+- Decode did not degrade with context in a fresh process: plain decoding cost
+  ~87 ms/token at 2K and at 60K. The 6.6 tok/s once measured at 63K came from a
+  long-running server with ~10 GiB swapped out (both boxes keep only ~2 GiB of
+  RAM available).
+- Real traffic was mostly sampled (the server default is temperature 1.0), and
+  sampled requests bypassed DSpark entirely.
+- Per plain token: ~31 ms MoE kernels, ~25 ms in 80 all-reduces (~313 µs each
+  in the model vs ~88 µs on an idle link: mostly rank 0 waiting on rank 1),
+  ~13 ms attention linears, ~5 ms Engram CPU lookups, ~6 ms attention and
+  indexer launches, ~9 ms mHC and norms.
+- Box2's GPU sustains ~1585 MHz vs ~1748 MHz on Box1 at the same ~78 W under the
+  2100 MHz OD cap (~14% less GEMM throughput), and with the 95/104 GiB budgets
+  the allocator puts all 40 shared experts and 201 of 384 routed experts on
+  rank 1.
+
+Changes:
+
+- `odl_ar2` (`odl_ar2/`, patch `0008`): adapted from the vLLM stack's OdinLink
+  stream all-reduce, bf16 wire bit-identical to the RCCL path, per-slot round
+  sizes. 10 KB: 34 µs vs 88 µs (RCCL); 60 KB: 97 µs vs 131 µs.
+- No device syncs in the module walk (patches `0009`, `0010`): Engram hashes a
+  host copy of the ids and stages its rows at the start of the pass
+  (`EXL3_ENGRAM_PREFETCH`); the candidate-reader indexer layers score each
+  row's own blocks in place (`EXL3_DSV4_CAND_ROWS`). Bit-identical outputs.
+- DSpark for sampled requests (`tools/ds41/tp_engine.py`,
+  `EXL3_TP_SPEC_SAMPLED`).
+- `EXL3_TP_SHARED_EXPERT_DEVICE` (patch `0011`) pins the shared experts;
+  measured neutral (plain −2 ms, DSpark +3 ms at 60K), so it is unset.
+- `ODL_RCCL_DEVICES` (patch `odinlink/0002`).
+
+Over HTTP (`perf/bench_ctx.py`, 120 generated tokens, one run each; tok/s):
+
+| prompt tokens | DSpark greedy | plain | sampled T=0.6 / T=1.0 |
+|---:|---|---|---|
+| 847 | 19.3 → **21.4** | 12.0 → **14.1** | 12.0 (plain) → **19.5 / 21.2** |
+| 25,669 | 21.2 → **23.8** | 11.7 → **13.8** | 11.7 (plain) → **22.1 / 20.8** |
+| 62,822 | 19.8 → **22.4** | 6.6 → **13.8** | 6.6 (plain) → **23.1 / 25.1** |
+
+Rollback switches: `EXL3_TP_ODL_AR2=0`, `EXL3_TP_SPEC_SAMPLED=0`,
+`EXL3_DSV4_CAND_ROWS=0`, `EXL3_ENGRAM_PREFETCH=0`. Largest remaining costs:
+the MoE kernels and the 12 ms rank-0-only draft per DSpark round.
+
 ## Tests (CPU only, no GPU/model needed except one tokenizer read)
 
 ```bash
@@ -357,13 +427,14 @@ DS41_REF_DIR=~/exl3ds4/model ../../.venv/bin/python -m pytest -q \
     test_tp_chunked_prefill.py test_serve_compat.py
 ```
 
-Last run on the staged repository copy: 508 passed, 6 skipped (the skips need
-the real model tokenizer; set `DS41_REF_DIR` to remove them).
+Last run (whole `tools/ds41` suite on Box1): 509 passed, 6 skipped (the skips
+need the real model tokenizer; set `DS41_REF_DIR` to remove them).
 
 ## Remaining work
 
-1. Add sampled-output speculative decoding and broader DSpark acceptance
-   benchmarks; tune per-workload policy.
+1. MoE decode kernels (~31 ms/token, well below the GPU's 182 GB/s), the
+   rank-0-only DSpark draft (~12 ms/round), per-temperature draft thresholds,
+   and a prefix cache (every request re-prefills at ~310 tok/s).
 2. Measure full 512K prefill performance and test cache-slot reuse at large
    contexts; the DSV4 recurrent-state readback fix and long-context
    validation are done (source commit `0e259659`).
