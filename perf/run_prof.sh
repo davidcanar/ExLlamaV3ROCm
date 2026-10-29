@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Two-node profiling run: rank 1 = stock tools/ds41/tp_rank1.sh on Box2, rank 0 = perf/tp_prof.py here.
 # Same environment as exl3ds4.sh / tp_serve_rank0.sh. The exl3ds4 server must be stopped first.
-# usage: run_prof.sh [tag]   (PROF_* and EXL3_* variables pass through; EXL3_* also go to rank 1)
+# usage: run_prof.sh [tag]   (PROF_* and EXL3_* variables pass through; EXL3_* also go to rank 1;
+#        PROF_DRIVER=prefix_logits.py runs that rank-0 driver instead of tp_prof.py)
 set -uo pipefail
 
 TAG=${1:-prof}
@@ -47,7 +48,7 @@ export LD_PRELOAD="$ROOT/.venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/
 export PYTHONPATH="$ROOT/src/exllamav3-dsv41f${PYTHONPATH:+:$PYTHONPATH}"
 cd "$ROOT/src/exllamav3-dsv41f"
 echo "[run_prof] rank 0 -> $LOG0"
-"$ROOT/.venv/bin/python" "$ROOT/perf/tp_prof.py" > "$LOG0" 2>&1
+"$ROOT/.venv/bin/python" "$ROOT/perf/${PROF_DRIVER:-tp_prof.py}" > "$LOG0" 2>&1
 rc=$?
 echo "[run_prof] rank 0 exited $rc"
 sleep 5

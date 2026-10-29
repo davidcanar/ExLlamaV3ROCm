@@ -72,6 +72,13 @@ Working now (validated on the rig):
   decoding before). Over HTTP at a 62.8K-token context: **22.4 tok/s greedy,
   23.1 tok/s at T=0.6, 25.1 tok/s at T=1.0** (sampled requests were ~11.5
   tok/s), plain decoding 13.8 tok/s.
+- Second pass (patch `0012` and a prefix cache, see
+  [Second pass](#second-pass-moe-decode-kernels-on-the-tp-ranks) and
+  [Prefix cache](#prefix-cache)): the TP ranks run the RDNA MoE decode kernels
+  instead of the cooperative ones, and follow-up turns reuse the cached prompt.
+  Over HTTP at 62.8K tokens: **35.6 tok/s greedy, 35.0 at T=0.6, 33.2 at
+  T=1.0, plain 24.3**; the next turn of a 19.8K-token conversation starts
+  generating after **0.47 s instead of 65 s**.
 
 Not done yet: vision support and full 512K prefill performance measurement.
 GPU zero-copy is not required; see the performance notes below.
@@ -87,7 +94,7 @@ tools/ds41/            OpenAI-compatible server + CPU test suite (Kyojin-vendore
 patches/exllamav3/     11-commit 'multi-node-rocm' series on PR #449 base d45e8961
 patches/odinlink/      local diffs of OdinLink-Five @ 4534f58 (multi-frame + RCCL device allow-list)
 odl_ar2/               OdinLink stream all-reduce for decode collectives (HIP; build.sh per box)
-perf/                  profiler (tp_prof.py + prof_hooks.py), link and HTTP benchmarks
+perf/                  profiler (tp_prof.py + prof_hooks.py), link, HTTP, MoE-layer and prefix-cache checks
 requirements/          exact dependency pins (ROCm wheel index + PyPI freeze)
 LICENSE / NOTICE       MIT + third-party attribution (Kyojin, ExLlamaV3, OdinLink, …)
 ```
@@ -245,8 +252,9 @@ plain path again).
 Context and memory: 512K tokens is the configured and supported context.
 >750-token needle/counting tests pass with and without DSpark, and the 512K
 allocation leaves >10 GiB free on each node. Full 512K prefill performance is
-unmeasured. The server still serves one in-flight request and does not use a
-prefix cache.
+unmeasured. The server serves one in-flight request; follow-up turns reuse
+the cached prompt prefix ([Prefix cache](#prefix-cache); `cache_prompt: false`
+opts a request out, a new `cache_salt` drops the cache).
 
 `tools/ds41/tp_serve_odl.sh` remains available as an optional lower-level,
 foreground launcher (defaults: HTTP 8080, TP master 29650, control 29651;
@@ -415,8 +423,92 @@ Over HTTP (`perf/bench_ctx.py`, 120 generated tokens, one run each; tok/s):
 | 62,822 | 19.8 → **22.4** | 6.6 → **13.8** | 6.6 (plain) → **23.1 / 25.1** |
 
 Rollback switches: `EXL3_TP_ODL_AR2=0`, `EXL3_TP_SPEC_SAMPLED=0`,
-`EXL3_DSV4_CAND_ROWS=0`, `EXL3_ENGRAM_PREFETCH=0`. Largest remaining costs:
-the MoE kernels and the 12 ms rank-0-only draft per DSpark round.
+`EXL3_DSV4_CAND_ROWS=0`, `EXL3_ENGRAM_PREFETCH=0`.
+
+### Second pass: MoE decode kernels on the TP ranks
+
+The ~31 ms/token of MoE kernels came from the wrong kernels: ExLlamaV3's RDNA
+MoE decode path (`exl3_rocm_moe_decode`) was only taken when every expert is
+local, and a TP rank holds an expert range, so both ranks ran the cooperative
+kernels. `perf/moe_bench.py` (one layer on one GPU, sharded the way a rank
+holds it) measured them 2.9× slower: 455 vs 1317 µs at 1 row, 1328 vs 4181 µs
+at the 6-row verify. Patch `0012` gives the RDNA kernels the expert range
+(out-of-range picks contribute exact zeros; the down GEMV still runs its
+split-K arrival protocol with a zero partial) and fixes a scratch buffer that
+sent every 6-row verify back to the cooperative kernels. `moe_bench.py
+--check`: the two half-range shards sum to the full module within 1.4e-7
+relative, and the range path matches the cooperative kernels within 1e-3.
+
+In the TP profile, plain decoding now costs ~40 ms/token at 2K and at 60K
+(~71 ms after the first pass, 87 ms before it), and a greedy DSpark round
+108 ms at 2K and 97 ms at 60K (draft 11–12 ms, verify 84–96 ms).
+Over HTTP (`perf/bench_ctx.py`, 120 generated tokens, one run each; tok/s,
+previous pass → now):
+
+| prompt tokens | DSpark greedy | plain | sampled T=0.6 / T=1.0 |
+|---:|---|---|---|
+| 847 | 21.4 → **34.8** | 14.1 → **25.4** | 19.5 / 21.2 → **34.7 / 34.5** |
+| 25,669 | 23.8 → **36.4** | 13.8 → **24.5** | 22.1 / 20.8 → **31.5 / 30.4** |
+| 62,822 | 22.4 → **35.6** | 13.8 → **24.3** | 23.1 / 25.1 → **35.0 / 33.2** |
+
+Rollback switch: `EXL3_ROCM_MOE_DECODE_RANGE=0` (cooperative kernels).
+
+What is left per DSpark round at 60K, from the synchronized profile (which
+stretches the 97 ms round to 131 ms): ~45 ms MoE (six rows), ~21 ms other
+linears, ~16 ms in all-reduces (still mostly rank 0 waiting on the slower
+Box2 GPU), ~8 ms attention, ~7 ms Engram, and the 11–12 ms draft, which runs
+on rank 0 between verifies and does not shrink with context. Shorter drafts
+for sampled requests would not pay: at the measured acceptance (≈0.73 per
+draft at T=1.0) dropping from 5 to 3 or 4 drafts loses about as many
+accepted tokens as the smaller verify saves.
+
+### Prefix cache
+
+Every request used to re-prefill its whole prompt at ~310 tok/s, so each turn
+of a long conversation waited minutes before its first token (a 189K-token
+context, ~10 minutes). The TP engine now keeps prompt reuse across requests
+(`tools/ds41/tp_engine.py`, `PrefixCache`; details in
+[`tools/ds41/README.md`](tools/ds41/README.md#prefix-cache-2026-10-28)): the
+DSA pools are position-indexed and still hold a finished request's tokens, so
+both ranks only checkpoint the recurrent state (SWA ring, compressor windows,
+Engram ids) after each prefill and at the end of each reply, and a follow-up
+turn restores the longest valid checkpoint and prefills just the new tokens.
+
+`perf/prefix_check.py` (a 19.8K-token code conversation over HTTP, DSpark,
+greedy): turn 2 reused 19,786 of its 19,811 prompt tokens and began
+generating after **0.47 s** (a fresh prefill takes 65 s); turn 3 reused 19,810
+of 19,830 in 0.63 s.
+
+`perf/prefix_logits.py` (a rank-0 driver, server stopped) compares the logits
+of the first generated token. Two fresh prefills of the same prompt are
+bit-identical, so any difference comes from the cache path. With the
+checkpoint on a 2048-token chunk boundary, restore plus partial prefill is
+**bit-identical** to a fresh prefill, in plain and spec mode, for the
+follow-up turn and for a retry: the restore is exact. Normally the checkpoint
+sits mid-chunk, and the continued prefill starts its 2048-row chunks there
+rather than at multiples of 2048, which reorders float sums: max |Δlogit| 1.2,
+KL 0.005 nats, top-1 and top-5 unchanged (12K-token turn 1, 3K new tokens). So
+greedy replies can differ from a cache-free run where two tokens are nearly
+tied (2.5K-token smoke test: turn 2 differed 13 characters in, turn 3
+matched). Costs: stash 1–12 ms, restore 2–6 ms, 32 MiB of host RAM per
+checkpoint and rank; the follow-up turn's 3,038 new tokens prefilled in
+10.5–12.3 s instead of 43–52 s, and a retry of the same prompt took
+0.05–0.27 s.
+
+Two properties of this stack showed up on the way:
+
+- Greedy decoding is not always bit-reproducible run to run. Prefill and the
+  first token are (the logit check above), but a 19.8K-token DSpark request
+  sent twice with no cache involved diverged after ~140 characters (a
+  2.5K-token one repeated exactly), so something on the decode path varies
+  between runs; not tracked down yet. Compare logits, not text, when
+  validating kernels or caching.
+- Host RAM is the scarce resource. Each box runs with ~1.8 GiB available and
+  the rank-0 process had ~8.5 GiB swapped out right after a restart (the
+  unified-memory GPU allocations take the rest). A checkpoint costs
+  32 MiB of host RAM on each rank, so the default keeps 2
+  (`EXL3_TP_PREFIX_SLOTS`): the last prompt and the last reply end, which is
+  what a chat or tool loop resumes from.
 
 ## Tests (CPU only, no GPU/model needed except one tokenizer read)
 
@@ -424,23 +516,34 @@ the MoE kernels and the 12 ms rank-0-only draft per DSpark round.
 cd ~/exl3ds4/tools/ds41
 DS41_REF_DIR=~/exl3ds4/model ../../.venv/bin/python -m pytest -q \
     test_ds41_chat.py test_ds41_parse.py test_ds41_serve.py test_tp_control.py \
-    test_tp_chunked_prefill.py test_serve_compat.py
+    test_tp_chunked_prefill.py test_tp_prefix_cache.py test_serve_compat.py
 ```
 
-Last run (whole `tools/ds41` suite on Box1): 509 passed, 6 skipped (the skips
+Last run (whole `tools/ds41` suite on Box1): 525 passed, 6 skipped (the skips
 need the real model tokenizer; set `DS41_REF_DIR` to remove them).
 
 ## Remaining work
 
-1. MoE decode kernels (~31 ms/token, well below the GPU's 182 GB/s), the
-   rank-0-only DSpark draft (~12 ms/round), per-temperature draft thresholds,
-   and a prefix cache (every request re-prefills at ~310 tok/s).
-2. Measure full 512K prefill performance and test cache-slot reuse at large
+1. OdinLink `odl_tb5` RX pool: during large prefills the per-stream pool of
+   spare assembly buffers (`rx_asm_pool`, 4 × 2 MiB) runs dry routinely
+   (`rx_asm pool empty` in the kernel log), and the fallback is an order-8
+   `GFP_ATOMIC` allocation. On a fragmented host it fails and drops the
+   message, which hangs both ranks inside RCCL until restart (seen twice on
+   2026-10-28, once while a CPU-heavy job ran on Box1). Mitigation: a larger
+   pool (`options odl_tb5 rx_asm_pool=16` in `/etc/modprobe.d/`, module reload;
+   32 MiB of kernel memory per stream). Fix: the driver should defer the copy
+   to process context instead of allocating in the RX callback.
+2. Decode: MoE at six rows (~45 ms per DSpark round), all-reduce waits from
+   Box2's ~10% lower GPU clock, and the 11–12 ms rank-0 draft.
+3. A multi-sequence prefix cache (paged block tables, the library's page
+   table), so a client's side requests do not overwrite the main
+   conversation's cached tokens.
+4. Measure full 512K prefill performance and test cache-slot reuse at large
    contexts; the DSV4 recurrent-state readback fix and long-context
    validation are done (source commit `0e259659`).
-3. Profile sustained decode/prefill against the existing GGUF runtime;
+5. Profile sustained decode/prefill against the existing GGUF runtime;
    evaluate offline weight packing, fixed-shape graphs, and symmetric clocks.
-4. Validate vision, non-default output-rank topologies, and uneven memory
+6. Validate vision, non-default output-rank topologies, and uneven memory
    splits. GPU DMA-buf zero-copy remains a later bulk-transfer experiment.
 
 PR #449 and Kyojin are each single-host as supplied. Multi-node execution

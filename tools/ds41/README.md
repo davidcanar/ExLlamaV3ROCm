@@ -56,7 +56,7 @@ Inherited verbatim from the vendored layer: `GET /health`, `GET /v1/models`, `GE
 `POST /tokenize`, `POST /apply-template`. Added: `GET /tp/status` (rank-1 liveness, request
 count, context). `/health` answers with load progress (503 + stage) while the model loads.
 Thinking mode, `reasoning_effort` (numeric and levels), tool schemas, tool-call round trips,
-`cache_salt` (refused: no prefix cache), `stop` strings, `max_tokens`, client-disconnect
+`cache_salt` (a new salt drops the prefix cache, so namespaces never share checkpoints), `stop` strings, `max_tokens`, client-disconnect
 cancellation — all inherited from the vendored, golden-tested layer.
 
 ## DSpark (MTP speculative decoding) — optional, opt-in
@@ -141,12 +141,42 @@ after both loads; then per request `begin {ids, spec}` → fresh state, prefill 
 tap export on spec requests), and in spec mode forward #1 of the last prompt token only on
 plain requests; `step {token}` per plain token, or `round {k, window}` + `accept {a}` per spec
 round (one multi-row verify + one mirrored rewind); `end` → both release the state.
-`ping`/`pong` for `/tp/status`, `shutdown` for clean exit.
+`ping`/`pong` for `/tp/status`, `shutdown` for clean exit. Protocol 3 adds the prefix-cache
+fields: `begin` may carry `restore`/`start` (restore checkpoint K at position S and prefill only
+`ids[S:]`), `drop`, `save` and `drop_all`; `end` may carry `drop`, `rewind` and `save`. Rank 0
+decides all of them and rank 1 applies them in the same order (restore, drops, prefill, save;
+end: drops, rewind, save, release); a protocol-2 rank 1 is refused at the handshake.
 
 **Lockstep rule:** every stop decision (eos, stop string, `max_tokens`, cancel) happens on
 rank 0 *after* sampling a token and *before* sending its `step`. Once a `step` is sent the next
 forward is committed on both ranks, so the collective sequences never diverge
 (`test_tp_control.py` asserts call-for-call equality of the two ranks' model calls).
+
+## Prefix cache (2026-10-28)
+
+Follow-up turns skip the part of the prompt the cache already holds. Every trunk call uses the
+identity block table over the whole cache, so the paged DSA pools are position-indexed and
+after a request positions `[0, E)` still hold the kv of the `E` tokens it committed. What a
+new request cannot rebuild from the pools is the per-slot recurrent state (SWA ring,
+compressor windows and overlaps, Engram id ring), so both ranks stash it (`DSV4State.stash`,
+host memory, no collectives) after each prefill (position `len(ids) - 1`, which with the
+DS4.1 template runs through `<｜Assistant｜>`: the part the next turn renders identically,
+since it drops the old turn's reasoning) and at the end of each reply (spec requests rewind
+the accepted drafts past the emitted text first). For a new prompt, rank 0 restores the
+longest checkpoint inside the common prefix of the prompt and the committed sequence, and
+both ranks prefill only the rest; `cached_tokens` / `timings.cache_n` report the reuse.
+
+- `PrefixCache` (rank 0) keeps the invariant that every retained checkpoint's tokens are a
+  prefix of the committed sequence: after each request it drops the checkpoints the request's
+  writes invalidated (any request, `cache_prompt: false` included), and evicts the least
+  recently used when the slots are full.
+- The drafter's main-kv (rank 0) is position-indexed too, but only spec requests write it:
+  spec requests restore at most as far as the last spec request's sequence (`draft_ids`).
+- `cache_prompt: false` skips restore and checkpoints for that request; a new `cache_salt`
+  drops every checkpoint (`reset_prefix_cache`).
+- One linear sequence: a request that diverges early (a client's side request for a title,
+  say) overwrites the cached tokens past the shared prefix, and the next turn of the main
+  conversation re-prefills from there.
 
 ## Launch (from Box1)
 
@@ -185,7 +215,7 @@ layer: `/home/davidcanar/exl3ds4/.venv/bin/python tp_serve.py --loader stub --po
 cd /home/davidcanar/exl3ds4/tools/ds41
 DS41_REF_DIR=/home/davidcanar/exl3ds4/model ../../.venv/bin/python -m pytest -q \
     test_ds41_chat.py test_ds41_parse.py test_ds41_serve.py test_tp_control.py \
-    test_tp_chunked_prefill.py test_serve_compat.py
+    test_tp_chunked_prefill.py test_tp_prefix_cache.py test_serve_compat.py
 ```
 
 - `test_ds41_chat.py` — golden: rendered prompts byte- and token-identical to the official
@@ -206,6 +236,12 @@ DS41_REF_DIR=/home/davidcanar/exl3ds4/model ../../.venv/bin/python -m pytest -q 
   drafter-kv priming at chunk offsets, cache-bound refusals on rank 0 (before dispatch) and
   rank 1 (clean error frame), the startup memory-floor guard, and the chunk-for-chunk rank-0 vs
   rank-1 mirror over a real loopback control channel.
+- `test_tp_prefix_cache.py` - prompt reuse with stand-ins that model the cache semantics
+  (position-indexed kv that survives requests, a hash-chain recurrent state, verify rows of
+  rejected drafts left behind): every scenario (multi-turn, retry, verbatim continuation,
+  divergence, plain/spec mixes, `cache_prompt: false`, LRU eviction, a rank-0 failure
+  mid-request, `cache_salt`) runs with the cache on and off and the replies must be identical;
+  both ranks' model calls and checkpoint tables must match.
 
 ## Knobs and defaults
 
@@ -231,6 +267,12 @@ DS41_REF_DIR=/home/davidcanar/exl3ds4/model ../../.venv/bin/python -m pytest -q 
 | `EXL3_TP_SHARED_EXPERT_DEVICE` | unset | pin the whole-on-one-rank shared experts to TP rank N (`alt`: alternate by layer); unset = the allocator's choice (every one on the larger-budget rank) |
 | `EXL3_DSV4_CAND_ROWS` | 1 | candidate-reader indexer layers score per row from fixed-width block lists (no host syncs); 0 = union path |
 | `EXL3_ENGRAM_PREFETCH` | 1 | stage the Engram table rows on a worker thread at the start of each pass |
+| `EXL3_ROCM_MOE_DECODE_RANGE` | 1 | TP expert-range shards use the RDNA MoE decode kernels; 0 = the cooperative kernels (patch `0012`) |
+| `EXL3_TP_PREFIX_CACHE` | 1 | reuse cached prompt prefixes across requests (rank 0 only; rank 1 follows the frames) |
+| `EXL3_TP_PREFIX_SLOTS` | 2 | recurrent-state checkpoints kept (LRU; 32 MiB of host RAM each, on both ranks: the last prompt and the last reply end) |
+| `EXL3_TP_PREFIX_MIN` | 256 | shortest prefix worth a checkpoint, in tokens |
+| `EXL3_TP_PREFIX_END` | 1 | also checkpoint the end of each reply (useful when clients echo replies verbatim, e.g. tool calls) |
+| `EXL3_TP_PREFIX_LOG` | 0 | log one line per request: reused tokens and the checkpoint positions |
 
 `EXL3_TP_SPAN`, `EXL3_TP_CACHE_TOKENS`, `EXL3_TP_USE_PER_DEVICE` and `EXL3_TP_MEM_FLOOR` join
 the DSpark/env variables the launchers forward to Box2 (ssh forwards nothing): the chunk plan
@@ -240,10 +282,10 @@ holds for `EXL3_TP_ODL_AR2*`, `EXL3_TP_SHARED_EXPERT_DEVICE` (it changes the TP 
 
 ## First-version limitations (deliberate)
 
-1. **One in-flight request, no prompt cache.** Every request re-prefills into a fresh state
-   (up to the full cache: prefill is chunked at `EXL3_TP_SPAN`, block tables span the cache,
-   and prompts past `cache_tokens - 2` are a clean 400 before any rank dispatch). Requests
-   with `cache_salt` get a clean 400.
+1. **One cached sequence.** The prefix cache follows one conversation at a time (see Prefix
+   cache). Prompts are prefilled up to the full cache: prefill is chunked at `EXL3_TP_SPAN`,
+   block tables span the cache, and prompts past `cache_tokens - 2` are a clean 400 before
+   any rank dispatch.
 2. **One in-flight request** (`sessions = 1`); others queue in the server.
 3. **No rank-failure recovery.** If either rank fails mid-request, RCCL wedges; restart both
    (`pkill -f tp_serve.py; pkill -f tp_rank1.py`, then relaunch). `/tp/status` surfaces rank-1

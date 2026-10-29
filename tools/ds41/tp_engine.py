@@ -47,17 +47,35 @@ AFTER sampling a token and BEFORE sending its `step` frame. Once a `step` has be
 forward is committed on both ranks, so the two ranks always issue the same number of collectives.
 
 Control protocol (framed JSON over TCP: 4-byte little-endian length prefix, then UTF-8 bytes):
-  rank 0 -> rank 1: {"op": "hello", "proto": 2, "vocab_size": V, "dspark": B}   handshake after both loads
+  rank 0 -> rank 1: {"op": "hello", "proto": 3, "vocab_size": V, "dspark": B}   handshake after both loads
                     {"op": "begin", "req": N, "ids": [int, ...], "spec": B}     new request (fresh state)
+                      + "restore": K, "start": S   prefix cache: restore checkpoint K (position S)
+                                                   and prefill only ids[S:]
+                      + "drop": [K, ...]           drop these checkpoints (after the restore)
+                      + "save": K                  checkpoint the state after the prefill as K
+                      + "drop_all": true           first drop every checkpoint (cache_salt reset)
                     {"op": "step", "req": N, "token": T}                        plain decode: feed T next
                     {"op": "round", "req": N, "k": K, "window": [int, ...]}     spec: verify [anchor, drafts]
                     {"op": "accept", "req": N, "accepted": A}                   spec: settle, rewind(k - A)
                     {"op": "end", "req": N}                                    request over, release state
+                      + "drop": [K, ...], "save": K   (drop, then checkpoint the final state, then release;
+                        "rewind": R first rolls a spec request back to the end of its emitted reply;
+                        "drop_all": true clears every checkpoint after a rank-0 bookkeeping failure)
                     {"op": "ping"}                                             liveness probe (idle only)
                     {"op": "shutdown"}                                         clean exit
-  rank 1 -> rank 0: {"op": "hello_ok", "proto": 2, "rank": 1, "vocab_size": V, "dspark": B}
+  rank 1 -> rank 0: {"op": "hello_ok", "proto": 3, "rank": 1, "vocab_size": V, "dspark": B}
                     {"op": "pong"}
                     {"op": "error", "message": "..."}                          rank 1 failed; restart both
+
+Prefix cache (2026-10-28, `PrefixCache`; EXL3_TP_PREFIX_CACHE=0 turns it off on rank 0):
+- the trunk cache is one linear sequence (identity block table over the whole cache), so after a
+  request the DSA pools still hold the kv of every token it committed; a prompt sharing a prefix
+  with them needs only the recurrent state at the restart point, a checkpoint both ranks stash
+  (DSV4State.stash: SWA ring, compressor windows, Engram id ring, host memory) after each prefill
+  and at the end of each request. Rank 0 picks the longest valid checkpoint, and both ranks
+  restore it and prefill the rest. Rank 0 decides everything; rank 1 only obeys the frames.
+- checkpoints are local copies on each rank (no collectives); the drafter's main-kv only counts
+  as valid up to the sequence the last spec request wrote (`draft_ids`)
 
 Long prompts (2026-10-28 fix, test_tp_chunked_prefill.py):
 - every trunk call (prefill chunks, decode steps, spec verifies) carries batch_shape =
@@ -77,7 +95,9 @@ Long prompts (2026-10-28 fix, test_tp_chunked_prefill.py):
   memory floor (EXL3_TP_MEM_FLOOR, default 2 GiB) so a starved rank refuses to serve
 
 First-version limitations (documented in README.md):
-- one in-flight request; no prefix/prompt cache reuse between requests (each request re-prefills)
+- one in-flight request; prompt reuse covers one conversation at a time (a request that diverges
+  early, say a client's side request for a title, overwrites the cached sequence past the shared
+  prefix, and the next turn of the main conversation re-prefills from there)
 - serving context defaults to ~750 tokens (EXL3_TP_SAFE_CTX, tp_serve.py); the deployment
   (exl3ds4.sh) raises it to the full 512K cache, and prompts/chunks of any size up to
   cache_tokens - 2 are accepted (validated at ~8K-token prompts with DSpark)
@@ -97,11 +117,12 @@ import socket
 import struct
 import threading
 import time
+from array import array
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 
-PROTO = 2
+PROTO = 3                    # 3: prefix-cache fields on begin/end (a proto-2 rank 1 would desync)
 MAX_FRAME = 1 << 26          # 64 MiB frame guard
 MAX_HISTORY = 8              # recurrent rollback capacity of the spec path (as the proven script)
 
@@ -580,6 +601,32 @@ class TPModelBackend:
     def release_state(self, state) -> None:
         self.cache.release_state(state)
 
+    # ---- prefix cache: recurrent-state checkpoints (local to this rank, no collectives) ----
+    #
+    # The paged DSA pools are position-indexed, so after a request the pages for positions below
+    # the state's end still hold that request's tokens. What a later request cannot rebuild from
+    # the pages is the per-slot recurrent state (SWA ring, compressor partial windows, Engram id
+    # ring), which DSV4State.stash() copies to host memory on every TP worker. Restoring a stash
+    # at position c and prefilling only ids[c:] reproduces the state of a full prefill, provided no
+    # request wrote positions below c since (TPEngine tracks that).
+
+    def stash(self, state):
+        import torch
+        with torch.inference_mode():
+            return state.stash()
+
+    def restore(self, stashed, position: int):
+        import torch
+        with torch.inference_mode():
+            return self.cache.new_from_stashed(stashed, int(position))
+
+    def drop_stash(self, stashed) -> None:
+        handle = stashed.get("tp_handle") if isinstance(stashed, dict) else None
+        if handle is None or not getattr(self.model, "loaded_tp", False):
+            return
+        from exllamav3.cache.recurrent import mp_cache_recurrent_del
+        self.model.tp_dispatch_all(mp_cache_recurrent_del, (id(self.cache), handle))
+
     def trim_memory(self) -> None:
         """Return the caching allocator's unused reserved segments to the GTT pool (both ranks).
 
@@ -594,9 +641,10 @@ class TPModelBackend:
         except Exception:                                                   # noqa: BLE001  (CPU tests, no GPU)
             pass
 
-    def prefill(self, ids: list[int], state, spec: bool = False):
+    def prefill(self, ids: list[int], state, spec: bool = False, start: int = 0):
         """Cached prefill of all but the last prompt token (the decode loop feeds that one),
-        in `span`-row chunks.
+        in `span`-row chunks, from position `start` (a restored prefix-cache checkpoint; the
+        state must be at that position, 0 for a fresh state).
 
         Every chunk carries `batch_shape = (1, cache_tokens)`: the library sizes the DSA pool's
         block table from batch_shape (attn.prepare_flash_attn), and the old `(1, span)` table
@@ -618,8 +666,10 @@ class TPModelBackend:
         n = len(ids) - 1
         if n < 1:
             raise ValueError("prefill needs at least 2 token ids (all but the last are fed here)")
+        if not 0 <= int(start) <= n:
+            raise ValueError(f"prefill start {start} outside 0..{n}")
         last_params: dict | None = None
-        for a in range(0, n, self.span):
+        for a in range(int(start), n, self.span):
             b = min(a + self.span, n)
             params = {
                 "attn_mode": "flash_attn",
@@ -746,6 +796,13 @@ class TPModelBackend:
         return logits[0, -1, : self.vocab_size]
 
 
+def _prefill(backend, ids: list[int], state, spec: bool, start: int):
+    """backend.prefill from `start` (the CPU stand-ins without prefix-cache support never get one)."""
+    if start:
+        return backend.prefill(ids, state, spec=spec, start=start)
+    return backend.prefill(ids, state, spec=spec)
+
+
 # ---- rank 1: the persistent mirror -------------------------------------------------------------------------
 
 
@@ -771,7 +828,8 @@ class Rank1Worker:
         self.requests_served = 0
         self.spec = False          # the active request's mode (plain steps vs spec rounds)
         self.round_k = None        # k of the round frame awaiting its accept
-        self.prompt_len = 0        # ids of the active request (memory-trim gating at end)
+        self.prompt_len = 0        # prefilled rows of the active request (memory-trim gating at end)
+        self.stashes: dict[int, tuple[int, Any]] = {}   # prefix-cache checkpoints: key -> (position, stash)
 
     def handshake(self) -> dict:
         hello = self.channel.recv()
@@ -806,7 +864,7 @@ class Rank1Worker:
                 elif op == "accept":
                     self._accept(msg)
                 elif op == "end":
-                    self._end()
+                    self._end(msg)
                 elif op == "ping":
                     self.channel.send({"op": "pong"})
                 elif op == "shutdown":
@@ -842,12 +900,29 @@ class Rank1Worker:
         spec = bool(msg.get("spec"))
         if spec and not getattr(self.backend, "dspark", False):
             raise ProtocolError("rank 1: spec request but this rank did not load DSpark (EXL3_TP_DSPARK)")
+        if msg.get("drop_all"):
+            self._drop(list(self.stashes))           # rank 0 reset its prefix cache (cache_salt change)
+        start = int(msg.get("start") or 0)
+        restore = msg.get("restore")
+        if restore is not None:
+            entry = self.stashes.get(int(restore))
+            if entry is None:
+                raise ProtocolError(f"rank 1: restore of unknown checkpoint {restore}")
+            if entry[0] != start or not 0 < start <= len(ids) - 1:
+                raise ProtocolError(f"rank 1: checkpoint {restore} is at position {entry[0]}, "
+                                    f"begin says start {start} (prompt of {len(ids)})")
+        elif start:
+            raise ProtocolError("rank 1: begin with a start position but no checkpoint to restore")
         self.spec = spec
         self.request_id = msg.get("req")
-        self.prompt_len = len(ids)
-        self.state = self.backend.new_state()
-        self.backend.prefill(ids, self.state, spec=spec)
+        self.prompt_len = len(ids) - start
+        # the same order as rank 0: restore (or a fresh state), drops, prefill, save
+        self.state = self.backend.restore(entry[1], start) if restore is not None else self.backend.new_state()
+        self._drop(msg.get("drop"))
+        _prefill(self.backend, ids, self.state, spec, start)
         self.position = len(ids) - 1
+        if msg.get("save") is not None:
+            self._save(int(msg["save"]))
         if not spec:
             self.backend.forward(ids[-1], self.position, self.state)
             self.position += 1
@@ -883,11 +958,34 @@ class Rank1Worker:
         self.position += a + 1
         self.round_k = None
 
-    def _end(self) -> None:
+    def _save(self, key: int) -> None:
+        if key in self.stashes:
+            raise ProtocolError(f"rank 1: checkpoint {key} already exists")
+        self.stashes[key] = (self.position, self.backend.stash(self.state))
+
+    def _drop(self, keys) -> None:
+        # unknown keys are fine: rank 0 also drops what a failed request may or may not have saved here
+        for key in keys or ():
+            entry = self.stashes.pop(int(key), None)
+            if entry is not None:
+                self.backend.drop_stash(entry[1])
+
+    def _end(self, msg: dict | None = None) -> None:
         if self.state is None:
             raise ProtocolError("rank 1: end without begin")
         if self.round_k is not None:
             raise ProtocolError("rank 1: end with a round still awaiting its accept")
+        msg = msg or {}
+        self._drop(list(self.stashes) if msg.get("drop_all") else msg.get("drop"))
+        if msg.get("save") is not None:
+            back = int(msg.get("rewind") or 0)
+            limit = min(self.position, int(getattr(self.backend, "dspark_block", 5)))
+            if not 0 <= back <= limit:
+                raise ProtocolError(f"rank 1: end rewind {back} outside 0..{limit}")
+            if back:
+                self.backend.rewind(self.state, back)      # to the end of the emitted reply (spec)
+                self.position -= back
+            self._save(int(msg["save"]))
         self.backend.release_state(self.state)
         self.state = None
         self.position = -1
@@ -914,6 +1012,135 @@ class Rank1Worker:
         self.prompt_len = 0
 
 
+# ---- rank 0: prompt reuse across requests ------------------------------------------------------------------
+
+
+def _common_prefix(a: array, b: array) -> int:
+    """Length of the common prefix of two int arrays (slice compares run at C speed)."""
+    n = min(len(a), len(b))
+    i = 0
+    while i < n:
+        j = min(i + 4096, n)
+        if a[i:j] != b[i:j]:
+            while a[i] == b[i]:
+                i += 1
+            return i
+        i = j
+    return n
+
+
+class Checkpoint:
+    """One stashed recurrent state: the trunk state after its first `pos` tokens (`ids`)."""
+
+    __slots__ = ("key", "pos", "ids", "stash", "used")
+
+    def __init__(self, key: int, pos: int, ids: array, stash: Any, used: int):
+        self.key = key
+        self.pos = pos
+        self.ids = ids
+        self.stash = stash
+        self.used = used
+
+
+class PrefixCache:
+    """Rank 0's record of what the trunk cache holds, for prompt reuse across requests.
+
+    The cache is one linear sequence: every trunk call uses the identity block table over the
+    whole cache, so the paged DSA pools are position-indexed and after a request positions
+    [0, E) still hold the kv of the E tokens it committed (`kv_ids`). A new prompt that shares a
+    prefix with them only needs the recurrent state at the restart point (SWA ring, compressor
+    windows and overlaps, Engram id ring) to skip that prefix: a checkpoint, stashed by both
+    ranks after each prefill (position len(ids) - 1: through `<｜Assistant｜>`, the part of the
+    prompt the next turn's template renders identically) and at the end of each request (the
+    reply too, for templates that echo it verbatim, e.g. tool conversations). The drafter's
+    main-kv (rank 0) is position-indexed as well, but only spec requests write it, so
+    `draft_ids` records the sequence its rows hold and spec requests restore at most that far.
+
+    Invariant: the token prefix of every retained checkpoint is a prefix of `kv_ids`, so a
+    checkpoint at pos <= common_prefix(kv_ids, prompt) is valid for the prompt. `finish` drops
+    the checkpoints a request's writes invalidated; `reserve` evicts the least recently used
+    one when all `slots` are taken."""
+
+    def __init__(self, *, slots: int = 2, min_tokens: int = 256, save_end: bool = True):
+        self.slots = max(1, int(slots))
+        self.min_tokens = max(1, int(min_tokens))
+        self.save_end = bool(save_end)
+        self.kv_ids = array("i")
+        self.draft_ids = array("i")
+        self.ckpts: list[Checkpoint] = []
+        self._key = 0
+        self._tick = 0
+
+    @classmethod
+    def from_env(cls) -> "PrefixCache | None":
+        if not env_truthy("EXL3_TP_PREFIX_CACHE", True):
+            return None
+        # 2 slots: the last prompt and the last reply end, which is what a chat or tool loop
+        # resumes from. Each checkpoint is 32 MiB of host RAM per rank, and both boxes run with
+        # under 2 GiB available (the unified-memory GPU allocations take the rest)
+        return cls(slots=env_int("EXL3_TP_PREFIX_SLOTS", 2), min_tokens=env_int("EXL3_TP_PREFIX_MIN", 256),
+                   save_end=env_truthy("EXL3_TP_PREFIX_END", True))
+
+    def _touch(self, c: Checkpoint) -> None:
+        self._tick += 1
+        c.used = self._tick
+
+    def plan(self, ids: array, spec: bool) -> Checkpoint | None:
+        """The longest checkpoint valid for this prompt's prefill (ids[:-1]), or None."""
+        limit = min(_common_prefix(self.kv_ids, ids), len(ids) - 1)
+        if spec:
+            limit = min(limit, _common_prefix(self.draft_ids, ids))
+        best = None
+        for c in self.ckpts:
+            if c.pos <= limit and (best is None or c.pos > best.pos):
+                best = c
+        if best is not None:
+            self._touch(best)
+        return best
+
+    def reserve(self, protect: Checkpoint | None = None) -> tuple[int, list[Checkpoint]]:
+        """A key for one new checkpoint, and the checkpoints evicted (LRU) to make room."""
+        evicted = []
+        while len(self.ckpts) >= self.slots:
+            pool = [c for c in self.ckpts if c is not protect]
+            if not pool:
+                break
+            victim = min(pool, key=lambda c: c.used)
+            self.ckpts.remove(victim)
+            evicted.append(victim)
+        self._key += 1
+        return self._key, evicted
+
+    def add(self, key: int, ids: array, stash: Any) -> Checkpoint:
+        c = Checkpoint(key, len(ids), ids, stash, 0)
+        self._touch(c)
+        self.ckpts.append(c)
+        return c
+
+    def finish(self, committed: array, spec: bool) -> list[Checkpoint]:
+        """A request committed `committed` (positions [0, E)); returns the checkpoints it invalidated."""
+        self.kv_ids = committed
+        if spec:
+            self.draft_ids = committed                  # the drafter rows track every committed token
+        dead = [c for c in self.ckpts if c.pos > len(committed) or committed[:c.pos] != c.ids]
+        for c in dead:
+            self.ckpts.remove(c)
+        return dead
+
+    def fail(self, start: int, spec: bool) -> list[Checkpoint]:
+        """A request failed after writing from `start`: only positions below it are still known."""
+        self.kv_ids = self.kv_ids[:start]
+        if spec:
+            self.draft_ids = self.draft_ids[:start]
+        dead = [c for c in self.ckpts if c.pos > start]
+        for c in dead:
+            self.ckpts.remove(c)
+        return dead
+
+
+PREFIX_LOG = env_truthy("EXL3_TP_PREFIX_LOG", False)
+
+
 # ---- rank 0: the engine the vendored server talks to -------------------------------------------------------
 
 
@@ -923,7 +1150,8 @@ class TPEngine:
     `generate` yields the decoded text of the reply with special tokens included (the vendored
     parser splits `</think>` and the DSML tool markup out of that text), exactly like the engine
     contract demands. Stop conditions all land on token boundaries; the stats keys match the
-    vendored server (`cached_tokens` is always 0: the first version re-prefills every request).
+    vendored server (`cached_tokens` counts the prompt tokens a prefix-cache checkpoint skipped;
+    `cache_prompt: false` on a request turns reuse off for that request only).
 
     When the backend loaded DSpark (`EXL3_TP_DSPARK=1`), requests default to speculative rounds
     (per-request `speculative: false` opts out, `spec_k` caps the draft window): greedy requests
@@ -935,7 +1163,8 @@ class TPEngine:
     sessions = 1
 
     def __init__(self, backend, channel, tokenizer, *, ctx: int, eos_id: int | None = None,
-                 seed: int | None = None, log: Callable[[str], None] = print):
+                 seed: int | None = None, log: Callable[[str], None] = print,
+                 prefix: "PrefixCache | bool | None" = None):
         self.backend = backend
         self.channel = channel
         self.tk = tokenizer
@@ -949,6 +1178,13 @@ class TPEngine:
         self._gen = _torch_generator(seed)
         self._pool = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="tp-model")
         self._busy = threading.Lock()     # held while a request drives rank 1; pings wait it out
+        # prompt reuse needs the backend's checkpoint ops (the CPU stand-ins mostly have none)
+        if prefix is None or prefix is True:
+            prefix = PrefixCache.from_env()
+        self.prefix = prefix or None
+        if self.prefix is not None and not all(hasattr(backend, op) for op in ("stash", "restore", "drop_stash")):
+            self.prefix = None
+        self._drop_all_next = False       # reset_prefix_cache ran: rank 1 drops its copies at the next begin
 
     # -- tokenization (Kyojin HFTokenizer semantics: specials parsed from the prompt text, no extra BOS)
     def count_tokens(self, text: str) -> int:
@@ -997,11 +1233,96 @@ class TPEngine:
             asyncio.run(go(False))
         return time.perf_counter() - t0
 
+    # -- prefix cache (rank 0 decides; rank 1 mirrors the begin/end frame fields in the same order:
+    #    restore or fresh state, drops, prefill, save ... end: drops, save, release)
+    def _prefix_begin(self, ids: list[int], spec: bool, use_cache: bool, frame: dict):
+        """Plan the request's prompt reuse and add it to the begin frame. Returns (checkpoint to
+        restore or None, start position, key to save the post-prefill state under or None,
+        checkpoints evicted to make room for it)."""
+        px = self.prefix
+        if self._drop_all_next:
+            frame["drop_all"] = True
+            self._drop_all_next = False
+        if px is None or not use_cache:
+            return None, 0, None, []
+        ck = px.plan(array("i", ids), spec)
+        start = ck.pos if ck is not None else 0
+        save, evicted = None, []
+        if len(ids) - 1 >= px.min_tokens and len(ids) - 1 > start:
+            save, evicted = px.reserve(protect=ck)
+        if ck is not None:
+            frame["restore"], frame["start"] = ck.key, start
+        if evicted:
+            frame["drop"] = [c.key for c in evicted]
+        if save is not None:
+            frame["save"] = save
+        return ck, start, save, evicted
+
+    def _prefix_state(self, ck: Checkpoint | None, start: int, evicted: list[Checkpoint]):
+        state = self.backend.restore(ck.stash, start) if ck is not None else self.backend.new_state()
+        for c in evicted:
+            self.backend.drop_stash(c.stash)
+        return state
+
+    def _prefix_save(self, key: int | None, state, ids: list[int]) -> None:
+        if key is not None:
+            self.prefix.add(key, array("i", ids[: len(ids) - 1]), self.backend.stash(state))
+
+    def _prefix_end(self, state, frame: dict, start: int, spec: bool, committed: list[int] | None,
+                    pending: int | None, use_cache: bool, end_pos: int | None = None) -> None:
+        """Settle the record after a request, before its state is released: `committed` is the
+        token sequence now at positions [0, E) (None: the request failed). Drops the checkpoints
+        its writes invalidated, saves the final state, and adds both to the end frame. Runs for
+        every request, cache_prompt or not: any request overwrites the cached sequence.
+
+        `end_pos` (spec requests) is where the emitted reply ends: a round cut short by eos /
+        stop / max_tokens committed up to `dspark_block` accepted drafts past it, which the
+        client never sees and so never sends back. The state rewinds there before the save
+        (both ranks: the end frame's "rewind"), so the checkpoint matches the next turn."""
+        px = self.prefix
+        if px is None:
+            return
+        if committed is None:
+            dead = px.fail(start, spec)
+            keys = [c.key for c in dead] + ([pending] if pending is not None else [])
+        else:
+            seq = array("i", committed)
+            dead = px.finish(seq, spec)
+            keys = [c.key for c in dead]
+        for c in dead:
+            self.backend.drop_stash(c.stash)
+        save_at = None
+        if committed is not None:
+            save_at = len(committed) if end_pos is None else min(int(end_pos), len(committed))
+        if (save_at is not None and state is not None and use_cache and px.save_end
+                and save_at >= px.min_tokens and all(c.pos != save_at for c in px.ckpts)):
+            key, evicted = px.reserve()
+            for c in evicted:
+                self.backend.drop_stash(c.stash)
+            keys += [c.key for c in evicted]
+            back = len(seq) - save_at
+            if back:
+                self.backend.rewind(state, back)
+                frame["rewind"] = back
+            px.add(key, seq[:save_at], self.backend.stash(state))
+            frame["save"] = key
+        if keys:
+            frame["drop"] = keys
+        if PREFIX_LOG:
+            self.log(f"tp: prefix cache: request {self.requests} reused {start} of {len(committed or ())} "
+                     f"committed tokens; checkpoints at {sorted(c.pos for c in px.ckpts)}"
+                     f"{f', dropped {keys}' if keys else ''}")
+
     # -- one request (the model thread; the op sequence Rank1Worker mirrors)
     def _run(self, ids: list[int], max_tokens: int, sampler: TopPSampler, eos_id: int | None,
-             stops: list[str], cancel: asyncio.Event | None, emit: Callable[[str], None]) -> dict[str, Any]:
-        self.channel.send({"op": "begin", "req": self.requests, "ids": [int(t) for t in ids]})
+             stops: list[str], cancel: asyncio.Event | None, emit: Callable[[str], None],
+             use_cache: bool = True) -> dict[str, Any]:
+        begin = {"op": "begin", "req": self.requests, "ids": [int(t) for t in ids]}
+        ck, start, pending, evicted = self._prefix_begin(ids, False, use_cache, begin)
+        self.channel.send(begin)
+        end = {"op": "end", "req": self.requests}
         state = None
+        committed = None
         n_new = 0
         eos = False
         reason = "max_new_tokens"
@@ -1010,9 +1331,12 @@ class TPEngine:
         detok = _Detok(getattr(self.tk, "_tk", self.tk))
         text = ""
         try:
-            state = self.backend.new_state()
-            self.backend.prefill(ids, state)
+            state = self._prefix_state(ck, start, evicted)
+            _prefill(self.backend, ids, state, False, start)
+            self._prefix_save(pending, state, ids)
+            pending = None
             cur, pos = int(ids[-1]), len(ids) - 1
+            fed = list(ids)              # the tokens at positions [0, pos) once `cur` is forwarded
             # Lockstep rule: every stop decision happens after sampling, before the step frame.
             while True:
                 row = self.backend.forward(cur, pos, state)
@@ -1039,35 +1363,86 @@ class TPEngine:
                     break
                 self.channel.send({"op": "step", "req": self.requests, "token": token})
                 cur = token
+                fed.append(token)
+            committed = fed[:pos]
             tail = detok.flush()
             if tail:
                 text += tail
                 emit(tail)
         finally:
-            if state is not None:
-                try:
-                    self.backend.release_state(state)
-                except Exception as exc:                                # noqa: BLE001
-                    self.log(f"tp: releasing request state failed: {type(exc).__name__}: {exc}")
-            if len(ids) > getattr(self.backend, "span", 0) and hasattr(self.backend, "trim_memory"):
-                self.backend.trim_memory()      # a chunked prompt grew the reserved pool; return it
-            try:
-                self.channel.send({"op": "end", "req": self.requests})
-            except OSError as exc:                                      # noqa: BLE001  (the request is failing anyway)
-                self.log(f"tp: sending end to rank 1 failed: {type(exc).__name__}: {exc}")
+            self._finish_request(state, end, start, False, committed, pending, use_cache, len(ids))
         t1 = time.perf_counter()
         t_first = t_first if t_first is not None else t1
-        return {"cached_tokens": 0, "new_tokens": n_new, "prompt_tokens": len(ids),
+        return {"cached_tokens": start, "new_tokens": n_new, "prompt_tokens": len(ids),
                 "time_prefill": t_first - t0, "time_generate": t1 - t_first,
                 "eos": eos, "eos_reason": reason, "spec_used": False}
+
+    def _finish_request(self, state, end: dict, start: int, spec: bool, committed: list[int] | None,
+                        pending: int | None, use_cache: bool, n_ids: int, end_pos: int | None = None) -> None:
+        """Request teardown on rank 0 (both paths): prefix record and end-of-request checkpoint,
+        state release, memory trim, then the end frame that makes rank 1 do the same."""
+        try:
+            self._prefix_end(state, end, start, spec, committed, pending, use_cache, end_pos)
+        except Exception as exc:                                        # noqa: BLE001
+            # the record no longer matches what the ranks hold: forget every checkpoint
+            self.log(f"tp: prefix cache bookkeeping failed ({type(exc).__name__}: {exc}); clearing it")
+            self._prefix_reset(end)
+        if state is not None:
+            try:
+                self.backend.release_state(state)
+            except Exception as exc:                                    # noqa: BLE001
+                self.log(f"tp: releasing request state failed: {type(exc).__name__}: {exc}")
+        if n_ids - start > getattr(self.backend, "span", 0) and hasattr(self.backend, "trim_memory"):
+            self.backend.trim_memory()          # a chunked prompt grew the reserved pool; return it
+        try:
+            self.channel.send(end)
+        except OSError as exc:                                          # noqa: BLE001  (the request is failing anyway)
+            self.log(f"tp: sending end to rank 1 failed: {type(exc).__name__}: {exc}")
+
+    async def reset_prefix_cache(self) -> None:
+        """cache_salt namespace change (the vendored server calls this between requests, with
+        nothing in flight): forget every checkpoint and the cached sequence, so no request of
+        the new namespace reuses anything of the old one. Rank 1 drops its copies at the next
+        begin ("drop_all")."""
+        if self.prefix is not None:
+            await asyncio.get_running_loop().run_in_executor(self._pool, self._prefix_clear)
+
+    def _prefix_clear(self) -> None:
+        with self._busy:
+            px = self.prefix
+            for c in px.ckpts:
+                self.backend.drop_stash(c.stash)
+            px.ckpts.clear()
+            px.kv_ids = array("i")
+            px.draft_ids = array("i")
+            self._drop_all_next = True
+
+    def _prefix_reset(self, end: dict) -> None:
+        px = self.prefix
+        for c in px.ckpts:
+            try:
+                self.backend.drop_stash(c.stash)
+            except Exception:                                           # noqa: BLE001
+                pass
+        px.ckpts.clear()
+        px.kv_ids = array("i")
+        px.draft_ids = array("i")
+        end.pop("save", None)
+        end.pop("rewind", None)
+        end.pop("drop", None)
+        end["drop_all"] = True          # rank 1 may hold keys this request reserved: drop everything
 
     # -- one spec request (the model thread; mirrors the round/accept sequence of Rank1Worker)
     def _run_spec(self, ids: list[int], max_tokens: int, stops: list[str], cancel: asyncio.Event | None,
                   emit: Callable[[str], None], spec_k: int | None, eos_id: int | None,
-                  sampler: TopPSampler | None = None) -> dict[str, Any]:
+                  sampler: TopPSampler | None = None, use_cache: bool = True) -> dict[str, Any]:
         import torch                                                    # the whole request runs under inference_mode (as the script)
-        self.channel.send({"op": "begin", "req": self.requests, "ids": [int(t) for t in ids], "spec": True})
+        begin = {"op": "begin", "req": self.requests, "ids": [int(t) for t in ids], "spec": True}
+        ck, start, pending, evicted = self._prefix_begin(ids, True, use_cache, begin)
+        self.channel.send(begin)
+        end = {"op": "end", "req": self.requests}
         state = None
+        committed = end_pos = None
         n_new = 0
         eos = False
         reason = "max_new_tokens"
@@ -1079,16 +1454,19 @@ class TPEngine:
         block = int(self.backend.dspark_block)
         try:
             with torch.inference_mode():
-                state = self.backend.new_state()
-                pparams = self.backend.prefill(ids, state, spec=True)
+                state = self._prefix_state(ck, start, evicted)
+                pparams = _prefill(self.backend, ids, state, True, start)
                 taps = (pparams or {}).get("export_states")
                 if taps:
                     # Stand-ins (and any backend that does not prime its own drafter): prime
                     # once from the returned taps, as before. The real backend validates each
                     # chunk's export and primes per chunk inside prefill().
                     self.backend.draft_prefill_kv(taps)
+                self._prefix_save(pending, state, ids)
+                pending = None
                 t_first = time.perf_counter()
                 anchor, position = int(ids[-1]), len(ids) - 1
+                seq = list(ids)          # seq[:position] is committed, seq[position] the anchor
                 # All stop decisions happen after a round has settled on both ranks (post rewind):
                 # the next frame rank 1 sees is either another round or end, never a half-round.
                 while True:
@@ -1120,6 +1498,7 @@ class TPEngine:
                     self.channel.send({"op": "accept", "req": self.requests, "accepted": int(a)})
                     self.backend.rewind(state, k - a)
                     position += a + 1
+                    seq += [int(t) for t in drafts[:a]] + [int(bonus)]
                     accepted_total += a
                     self.backend.refresh_draft_kv((vparams or {}).get("export_states"), a + 1, position)
                     # Emit the round's tokens; eos/stop/max cut inside the round are safe: both
@@ -1143,25 +1522,17 @@ class TPEngine:
                     if done:
                         break
                     anchor = bonus
+                committed = seq[:position]
+                end_pos = min(position, len(ids) + n_new)   # where the emitted reply ends
                 tail = detok.flush()
                 if tail:
                     text += tail
                     emit(tail)
         finally:
-            if state is not None:
-                try:
-                    self.backend.release_state(state)
-                except Exception as exc:                                # noqa: BLE001
-                    self.log(f"tp: releasing request state failed: {type(exc).__name__}: {exc}")
-            if len(ids) > getattr(self.backend, "span", 0) and hasattr(self.backend, "trim_memory"):
-                self.backend.trim_memory()      # a chunked prompt grew the reserved pool; return it
-            try:
-                self.channel.send({"op": "end", "req": self.requests})
-            except OSError as exc:                                      # noqa: BLE001  (the request is failing anyway)
-                self.log(f"tp: sending end to rank 1 failed: {type(exc).__name__}: {exc}")
+            self._finish_request(state, end, start, True, committed, pending, use_cache, len(ids), end_pos)
         t1 = time.perf_counter()
         t_first = t_first if t_first is not None else t1
-        return {"cached_tokens": 0, "new_tokens": n_new, "prompt_tokens": len(ids),
+        return {"cached_tokens": start, "new_tokens": n_new, "prompt_tokens": len(ids),
                 "time_prefill": t_first - t0, "time_generate": t1 - t_first,
                 "eos": eos, "eos_reason": reason, "spec_used": True,
                 "spec_rounds": rounds, "spec_k_last": k if rounds else None,
@@ -1216,10 +1587,11 @@ class TPEngine:
                     if spec:
                         done = self._run_spec(ids, max_tokens, [s for s in (stop or []) if s],
                                               cancel, lambda piece: loop.call_soon_threadsafe(q.put_nowait, piece),
-                                              spec_k, eos_id, sampler)
+                                              spec_k, eos_id, sampler, use_cache=bool(cache_prompt))
                     else:
                         done = self._run(ids, max_tokens, sampler, eos_id, [s for s in (stop or []) if s],
-                                         cancel, lambda piece: loop.call_soon_threadsafe(q.put_nowait, piece))
+                                         cancel, lambda piece: loop.call_soon_threadsafe(q.put_nowait, piece),
+                                         use_cache=bool(cache_prompt))
                 loop.call_soon_threadsafe(q.put_nowait, done)
             except BaseException as exc:                                # noqa: BLE001  (handed to the awaiting side)
                 loop.call_soon_threadsafe(q.put_nowait, exc)

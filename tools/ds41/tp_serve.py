@@ -129,7 +129,8 @@ def build_tp_engine(args: argparse.Namespace) -> Any:
     ctx = int(args.max_ctx) if args.max_ctx else DEFAULT_SAFE_CTX
     ctx = max(16, min(ctx, backend.cache_tokens - 2))
     return tp_engine.TPEngine(backend, channel, tokenizer, ctx=ctx,
-                              eos_id=tp_engine.eos_id_of(args.model, tokenizer), seed=args.seed)
+                              eos_id=tp_engine.eos_id_of(args.model, tokenizer), seed=args.seed,
+                              log=lambda line: print(line, flush=True))   # the launchers log to a file
 
 
 def main() -> None:
@@ -201,6 +202,13 @@ def main() -> None:
           + (f" (cache {be.cache_tokens}, prefill chunk {be.span} rows, block tables sized to the cache)"
              if be is not None else "")
           + ", one in-flight request", flush=True)
+    px = getattr(engine, "prefix", None)
+    if be is not None:
+        print("tp-serve: prefix cache " + (
+            f"on ({px.slots} checkpoints of the recurrent state, prompts from {px.min_tokens} tokens, "
+            f"end-of-reply checkpoints {'on' if px.save_end else 'off'}; per request \"cache_prompt\": false "
+            f"opts out)" if px is not None else "off (EXL3_TP_PREFIX_CACHE=0): every request re-prefills"),
+            flush=True)
     reqlog.log("serve_start", model=Path(args.model).name, model_id=args.model_id, pid=os.getpid(),
                ctx=getattr(engine, "ctx", None), sessions=int(getattr(engine, "sessions", 1)),
                heartbeat_s=reqlog.heartbeat_s, sse_ping_s=app["ping"].interval_s or None, loader=args.loader)

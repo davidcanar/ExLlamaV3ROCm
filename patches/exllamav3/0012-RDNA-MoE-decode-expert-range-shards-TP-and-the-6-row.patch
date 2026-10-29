@@ -1,0 +1,278 @@
+From 63776921c34d4df4c20dfd75b67442bd60263a3d Mon Sep 17 00:00:00 2001
+From: David Canar <davidcanar@gmail.com>
+Date: Wed, 28 Oct 2026 19:52:41 -0600
+Subject: [PATCH] RDNA MoE decode: expert-range shards (TP) and the 6-row
+ scratch
+
+The RDNA decode path (exl3_rocm_moe_decode: Hadamard, gate|up multirow GEMV, activation,
+weighted down GEMV with the split-K fused epilogue) was only taken when every expert is local
+(min_expert < 0). Tensor-parallel expert sharding gives each rank a contiguous expert range, so
+cross-host TP always fell back to the cooperative kernels, which measure 2.9x slower per layer
+on gfx1151 (one DS4.1 layer, half the experts plus the shared expert: 455 vs 1317 us at 1 row,
+1328 vs 4181 us at the 6-row verify).
+
+- the kernels take [min_expert, max_expert): picks outside the range contribute exact zeros.
+  gate|up and the activation skip the slot; the down GEMV still runs the fused epilogue's
+  arrival protocol for its tiles with a zero partial, so the split-K reduction and the per-row
+  completion counters see every slot as before
+- BC_BlockSparseMLP takes the RDNA path for range shards unless EXL3_ROCM_MOE_DECODE_RANGE=0
+- temp_hidden holds 2 * bszn_rows: the path stages gate and up inputs per slot (72 rows for a
+  6-row verify); at the old 64 rows verify passes declined to the cooperative kernels
+
+Checked with perf/moe_bench.py --check (ExLlamaV3ROCm repo): the two half-range shards sum to
+the full module within 1.4e-7 relative, and the RDNA range path matches the cooperative kernels
+within 1e-3 relative, at 1 and 6 rows. TP=2 decode at 62.8K context, HTTP end to end: plain
+13.8 -> 24.3 tok/s, DSpark greedy 22.4 -> 35.6 tok/s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../libtorch/blocksparse_mlp.cpp              |  9 ++-
+ .../rocm/quant/exl3_gemv_multirow_rdna.cu     | 73 +++++++++++++++----
+ .../rocm/quant/exl3_gemv_multirow_rdna.cuh    |  4 +-
+ exllamav3/modules/block_sparse_mlp.py         |  4 +-
+ 4 files changed, 71 insertions(+), 19 deletions(-)
+
+diff --git a/exllamav3/exllamav3_ext/libtorch/blocksparse_mlp.cpp b/exllamav3/exllamav3_ext/libtorch/blocksparse_mlp.cpp
+index a14888fd..ffb6d0f0 100644
+--- a/exllamav3/exllamav3_ext/libtorch/blocksparse_mlp.cpp
++++ b/exllamav3/exllamav3_ext/libtorch/blocksparse_mlp.cpp
+@@ -139,7 +139,7 @@ bool BC_BlockSparseMLP::run_bszN_rdna
+         rdna_gu_trellis, rdna_gu_suh, rdna_gu_svh,
+         down_ptrs_trellis, down_ptrs_suh, down_ptrs_svh,
+         yh2, interm_gu, interm_a2, out_d2,
+-        rdna_K_gu, rdna_cb, rdna_K_d, rdna_cb, act_limit
++        rdna_K_gu, rdna_cb, rdna_K_d, rdna_cb, act_limit, min_expert, max_expert
+     );
+ 
+     const int H = (int) out_bszn.size(-1);
+@@ -337,12 +337,15 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
+         rdna_K_gu = kcode(up_K);
+         rdna_K_d = kcode(down_K);
+         rdna_cb = up_mul1 ? 2 : up_mcg ? 1 : 0;
+-        // EXL3_ROCM_MOE_DECODE=0 keeps run_bszN on the kernels above
++        // EXL3_ROCM_MOE_DECODE=0 keeps run_bszN on the kernels above. Expert-range shards (TP
++        // expert parallel) take it too: out-of-range picks contribute exact zeros in-kernel
++        // (EXL3_ROCM_MOE_DECODE_RANGE=0 keeps those on the cooperative kernels)
+         const char* env = std::getenv("EXL3_ROCM_MOE_DECODE");
++        const char* env_r = std::getenv("EXL3_ROCM_MOE_DECODE_RANGE");
+         rdna_moe = !(env && env[0] == '0')
+             && gated && act_silu && !act_gelu && !act_silu_oai && !act_relu2
+             && !gate_bias_ptrs && !up_bias_ptrs && !down_bias_ptrs
+-            && min_expert < 0
++            && (min_expert < 0 || !(env_r && env_r[0] == '0'))
+             && rdna_K_gu && rdna_K_d
+             && interm_gu.scalar_type() == at::kHalf && interm_a2.scalar_type() == at::kHalf
+             && out_d2.scalar_type() == at::kFloat;
+diff --git a/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu
+index 370c1a9d..4307bba3 100644
+--- a/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu
++++ b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu
+@@ -990,6 +990,15 @@ __device__ __forceinline__ void exl3_moe_had_in_128_v
+     ((half4*) output_ptr)[lane] = v;
+ }
+ 
++// Expert-range shards (TP expert parallel, CPU split): the pointer tables hold the local experts
++// [min_e, max_e) only; a pick outside the range has no local matrices and contributes nothing.
++// min_e < 0: every expert is local and the picks index the tables directly
++__device__ __forceinline__ int exl3_moe_dec_local(const int64_t s, const int min_e, const int max_e)
++{
++    if (min_e < 0) return (int) s;
++    return (s >= min_e && s < max_e) ? (int) (s - min_e) : -1;
++}
++
+ static __global__
+ __launch_bounds__(256)
+ void exl3_moe_dec_had_gu
+@@ -1001,7 +1010,9 @@ void exl3_moe_dec_had_gu
+     const int size_k,
+     const int S,
+     const int top_k,
+-    const int E
++    const int E,
++    const int min_e,
++    const int max_e
+ )
+ {
+     const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+@@ -1011,7 +1022,9 @@ void exl3_moe_dec_had_gu
+     const int j = warp_id / k_segs;
+     const int seg = warp_id % k_segs;
+     const int js = j < S ? j : j - S;
+-    const int mat = (int) sel[js] + (j < S ? 0 : E);
++    const int loc = exl3_moe_dec_local(sel[js], min_e, max_e);
++    if (loc < 0) return;                   // out-of-range pick: its rows are never read
++    const int mat = loc + (j < S ? 0 : E);
+     const int token = js / top_k;
+     const half* suh = (const half*) suh_gu[mat];
+     exl3_gemv_had_in_128(y + (int64_t) token * size_k + seg * 128,
+@@ -1028,7 +1041,9 @@ void exl3_moe_dec_had_act
+     half* __restrict__ a_had,              // (S, size_k)
+     const int size_k,
+     const int S,
+-    const float act_limit
++    const float act_limit,
++    const int min_e,
++    const int max_e
+ )
+ {
+     const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+@@ -1037,6 +1052,8 @@ void exl3_moe_dec_had_act
+     if (warp_id >= S * k_segs) return;
+     const int j = warp_id / k_segs;
+     const int seg = warp_id % k_segs;
++    const int loc = exl3_moe_dec_local(sel[j], min_e, max_e);
++    if (loc < 0) return;                   // out-of-range pick: the down GEMV skips its row
+     const int64_t off = (int64_t) j * size_k + seg * 128;
+     half4 g = ((const half4*) (gu + off))[lane];
+     half4 u = ((const half4*) (gu + (int64_t) S * size_k + off))[lane];
+@@ -1060,7 +1077,7 @@ void exl3_moe_dec_had_act
+     half4 a;
+     a.x = xg[0];
+     a.y = xg[1];
+-    const half* suh = (const half*) suh_d[(int) sel[j]];
++    const half* suh = (const half*) suh_d[loc];
+     exl3_moe_had_in_128_v(a, a_had + off, suh + seg * 128, lane);
+ }
+ 
+@@ -1084,7 +1101,9 @@ void exl3_moe_dec_dot
+     const int E,
+     const int num_tokens,
+     const int core,
+-    const int tpb
++    const int tpb,
++    const int min_e,
++    const int max_e
+ )
+ {
+     const int warp_id = threadIdx.x / 32;
+@@ -1094,9 +1113,27 @@ void exl3_moe_dec_dot
+     const int n_tiles = size_n / 16;
+     const int n_segs = size_n / 128;
+     const int js = j < S ? j : j - S;
+-    const int mat = (int) sel[js] + (j < S ? 0 : E);
++    const int loc = exl3_moe_dec_local(sel[js], min_e, max_e);
+     const int64_t row_off = (int64_t) j * size_n;
+ 
++    if (loc < 0)
++    {
++        // Out-of-range pick (block-uniform: one slot per grid row). Gate|up: nothing to compute,
++        // the slot's segment counters stay at rest. Down: the token's grouped reduction counts
++        // every slot of every segment, so arrive with an exact zero row instead of the GEMV
++        // (rotating zeros stays zero; any local svh is a valid pointer for it)
++        if (!weights || warp_id != 0) return;
++        for (int t = 0; t < tpb; ++t)
++            exl3_gemv_fused_epilogue<c_fp32>
++            (
++                0.0f, C, row_off, size_n, tile_n + t, lane, (const half*) svh_list[0], 0.0f,
++                pb->seg_counters + j * n_segs + (tile_n + t) / 8, pb->red_counters + (tile_n + t) / 8,
++                S, num_tokens
++            );
++        return;
++    }
++    const int mat = loc + (j < S ? 0 : E);
++
+     if (weights)
+     {
+         const float w_scale = 0.088388347648f * __half2float(weights[j]);
+@@ -1123,7 +1160,8 @@ static void exl3_moe_dec_launch_dot
+ (
+     Exl3GemvMrParams* pb, const uintptr_t* B_list, const uintptr_t* svh_list, const int64_t* sel,
+     const half* weights, const half* A_had, void* C, int size_k, int size_n, int S, int E,
+-    int num_tokens, int slots, int top_k, int K, int cb, bool c_fp32, int device, cudaStream_t stream
++    int num_tokens, int slots, int top_k, int K, int cb, bool c_fp32, int device, cudaStream_t stream,
++    int min_e, int max_e
+ )
+ {
+     const int n_tiles = size_n / 16;
+@@ -1137,9 +1175,9 @@ static void exl3_moe_dec_launch_dot
+ 
+     #define MOE_DEC_L3(bits_val, codebook, warps_val) \
+         if (c_fp32) hipLaunchKernelGGL((exl3_moe_dec_dot<bits_val, true, codebook, warps_val>), grid, block, smem, stream, \
+-            pb, B_list, svh_list, sel, weights, A_had, C, size_k, size_n, S, E, num_tokens, core, tpb); \
++            pb, B_list, svh_list, sel, weights, A_had, C, size_k, size_n, S, E, num_tokens, core, tpb, min_e, max_e); \
+         else hipLaunchKernelGGL((exl3_moe_dec_dot<bits_val, false, codebook, warps_val>), grid, block, smem, stream, \
+-            pb, B_list, svh_list, sel, weights, A_had, C, size_k, size_n, S, E, num_tokens, core, tpb);
++            pb, B_list, svh_list, sel, weights, A_had, C, size_k, size_n, S, E, num_tokens, core, tpb, min_e, max_e);
+     #define MOE_DEC_L2(bits_val, codebook) \
+         switch (warps) { \
+             case 4:  MOE_DEC_L3(bits_val, codebook, 4)  break; \
+@@ -1205,7 +1243,9 @@ void exl3_rocm_moe_decode
+     int64_t cb_gu,
+     int64_t K_d,
+     int64_t cb_d,
+-    double act_limit
++    double act_limit,
++    int64_t min_expert,
++    int64_t max_expert
+ )
+ {
+     const at::cuda::OptionalCUDAGuard device_guard(y.device());
+@@ -1243,28 +1283,33 @@ void exl3_rocm_moe_decode
+     TORCH_CHECK(pb, "moe_decode: parameter block allocation failed");
+ 
+     const int64_t* sel_p = (const int64_t*) sel.data_ptr();
++    // Expert-range shard: picks index the local tables after subtracting min_expert, picks
++    // outside [min_expert, max_expert) contribute exact zeros (TP expert parallel)
++    const int min_e = (int) min_expert;
++    const int max_e = (int) max_expert;
++    TORCH_CHECK(min_e < 0 || (max_e - min_e == E), "moe_decode: expert range must span the local tables");
+ 
+     // 1. gate|up input rotation
+     {
+         int blocks = CEIL_DIVIDE(2 * S * (Hi / 128) * 32, 256);
+         hipLaunchKernelGGL(exl3_moe_dec_had_gu, dim3(blocks), dim3(256), 0, stream,
+             (const half*) y.data_ptr(), sel_p, (const uintptr_t*) gu_suh.data_ptr(),
+-            (half*) yh.data_ptr(), Hi, S, top_k, E);
++            (half*) yh.data_ptr(), Hi, S, top_k, E, min_e, max_e);
+     }
+     // 2. gate|up GEMV, 2S slots
+     exl3_moe_dec_launch_dot(pb, (const uintptr_t*) gu_trellis.data_ptr(), (const uintptr_t*) gu_svh.data_ptr(),
+         sel_p, nullptr, (const half*) yh.data_ptr(), gu.data_ptr(), Hi, I, S, E, 1, 2 * S, top_k,
+-        (int) K_gu, (int) cb_gu, false, device, stream);
++        (int) K_gu, (int) cb_gu, false, device, stream, min_e, max_e);
+     // 3. activation + down input rotation
+     {
+         int blocks = CEIL_DIVIDE(S * (I / 128) * 32, 256);
+         hipLaunchKernelGGL(exl3_moe_dec_had_act, dim3(blocks), dim3(256), 0, stream,
+             (const half*) gu.data_ptr(), sel_p, (const uintptr_t*) d_suh.data_ptr(),
+-            (half*) a_had.data_ptr(), I, S, (float) act_limit);
++            (half*) a_had.data_ptr(), I, S, (float) act_limit, min_e, max_e);
+     }
+     // 4. down GEMV, weighted, grouped per token
+     exl3_moe_dec_launch_dot(pb, (const uintptr_t*) d_trellis.data_ptr(), (const uintptr_t*) d_svh.data_ptr(),
+         sel_p, (const half*) weights.data_ptr(), (const half*) a_had.data_ptr(), out.data_ptr(), I, Ho, S, 0, bsz,
+-        S, top_k, (int) K_d, (int) cb_d, true, device, stream);
++        S, top_k, (int) K_d, (int) cb_d, true, device, stream, min_e, max_e);
+     cuda_check(cudaPeekAtLastError());
+ }
+diff --git a/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cuh b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cuh
+index f4b3b614..40f748ca 100644
+--- a/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cuh
++++ b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cuh
+@@ -106,5 +106,7 @@ void exl3_rocm_moe_decode
+     int64_t cb_gu,
+     int64_t K_d,
+     int64_t cb_d,
+-    double act_limit
++    double act_limit,
++    int64_t min_expert = -1,   // expert-range shard [min_expert, max_expert); -1: all experts local
++    int64_t max_expert = -1
+ );
+diff --git a/exllamav3/modules/block_sparse_mlp.py b/exllamav3/modules/block_sparse_mlp.py
+index 1c3b142a..972e9370 100644
+--- a/exllamav3/modules/block_sparse_mlp.py
++++ b/exllamav3/modules/block_sparse_mlp.py
+@@ -598,7 +598,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
+         # second entry under the same name would silently double memory forever)
+         bszn_rows = MAX_BSZN * numex
+ 
+-        temp_hidden = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH * 2, bszn_rows), Hi), torch.half, "moe1_temp_hidden")
++        # 2 * bszn_rows: the RDNA decode path stages gate and up inputs for every slot (2S rows; a
++        # 6-row verify step is 72) and declines to the cooperative kernels when this is short
++        temp_hidden = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH * 2, 2 * bszn_rows), Hi), torch.half, "moe1_temp_hidden")
+         temp_interm = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH * 2, 2 * bszn_rows), I), self.interm_dtype, "moe1_temp_interm")
+         temp_activa = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH, bszn_rows), I), torch.half, "moe1_temp_activa")
+         temp_output = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH, bszn_rows), Ho), torch.float, "moe1_temp_output")
+-- 
+2.54.0
+
