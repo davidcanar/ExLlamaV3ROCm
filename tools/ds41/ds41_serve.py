@@ -2,9 +2,11 @@
 # Source path in the Kyojin tree: tools/ds41/serve.py. MIT License, Copyright (c) 2025 Turboderp -- see LICENSE.kyojin.
 # Near-verbatim copy for the two-node EXL3 TP server; entry points here are
 # tp_serve.py (rank 0, HTTP) and tp_rank1.py (rank 1, mirror worker).
-# LOCAL modification (marked 'LOCAL (exl3-tp)', applied by vendor_kyojin.py): the
+# LOCAL modifications (marked 'LOCAL (exl3-tp)', applied by vendor_kyojin.py): the
 # per-request `speculative` / `spec_k` fields are validated and forwarded to
-# engine.generate for the DSpark engine. Everything else is byte-identical upstream.
+# engine.generate for the DSpark engine, and the optional `session` field pins a
+# multi-session slot (tp_sessions; the engine validates the id). Everything else
+# is byte-identical upstream.
 #!/usr/bin/env python3
 """OpenAI-compatible server for DeepSeek-V4.1-Flash-1017 (text in, text and tool calls out).
 
@@ -341,6 +343,7 @@ def create_app(engine: Any, model_id: str, defaults: Defaults | None = None) -> 
                             **({"images": body["_images"]} if body.get("_images") else {}),
                             **({"speculative": body["speculative"]} if body.get("speculative") is not None else {}),   # LOCAL (exl3-tp)
                             **({"spec_k": body["spec_k"]} if body.get("spec_k") is not None else {}),                 # LOCAL (exl3-tp)
+                            **({"session": body["session"]} if body.get("session") is not None else {}),              # LOCAL (exl3-tp): explicit session slot
                             **({"ignore_eos": True} if body.get("_ignore_eos") else {}),
                             **({"cache_prompt": False} if body.get("cache_prompt") is False else {}),
                             **({"stats": request_stats} if sessions > 1 else {})):

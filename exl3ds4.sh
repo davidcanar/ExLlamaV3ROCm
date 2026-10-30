@@ -41,9 +41,13 @@
 #   EXL3_TP_BUDGETS (default 95,104 with DSpark)  EXL3_TP_SPAN (prefill chunk, 2048)
 #   EXL3_TP_MEM_FLOOR (GiB kept free per rank at startup, default 2; 0 disables)
 #   EXL3_TP_VISION (default 1 = rank 0 loads the vision tower; a load or floor failure
-#     degrades to text-only unless EXL3_TP_VISION_STRICT=1)  EXL3_TP_MAX_IMAGES (8)
-#   EXL3_TP_DSPARK_CONF  EXL3_DS41_CONF  EXL3_TP_MODEL_DIR
-#   EXL3_LOAD_TIMEOUT (2700 s)  EXL3_STOP_TIMEOUT (120 s)
+#     degrades to text-only unless EXL3_TP_VISION_STRICT=1)  EXL3_TP_MAX_IMAGES (16)
+#   EXL3_TP_SESSIONS (4 cached conversations; 1 = single-session rollback)
+#   EXL3_TP_PREFIX_CACHE (1; S=1 engine; S>=2 caches per conversation)
+#   EXL3_TP_DISK_CACHE (1)  EXL3_TP_DISK_CACHE_DIR
+#     ($ROOT/diskcache)  EXL3_TP_DISK_CACHE_GIB (32)  EXL3_TP_DISK_TIMEOUT (300 s)
+#   KYOJIN_SSE_PING_S (30 s SSE keep-alive)  EXL3_TP_DSPARK_CONF  EXL3_DS41_CONF
+#   EXL3_TP_MODEL_DIR  EXL3_LOAD_TIMEOUT (2700 s)  EXL3_STOP_TIMEOUT (120 s)
 #
 # Logs: rank 0 -> ~/exl3ds4/logs/exl3ds4-rank0.log (Box1)
 #       rank 1 -> ~/exl3ds4/logs/exl3ds4-rank1.log (Box2; 'exl3ds4.sh logs rank1')
@@ -66,6 +70,16 @@ CONTROL_PORT="${EXL3_TP_CONTROL_PORT:-29651}"  # rank0<->rank1 control channel
 
 EXL3_TP_SAFE_CTX="${EXL3_TP_SAFE_CTX:-524288}"
 EXL3_TP_CACHE_TOKENS="${EXL3_TP_CACHE_TOKENS:-524288}"
+EXL3_TP_MAX_IMAGES="${EXL3_TP_MAX_IMAGES:-16}"   # per-request image cap (both ranks)
+KYOJIN_SSE_PING_S="${KYOJIN_SSE_PING_S:-30}"   # SSE keep-alive during long prefills
+
+# Multi-session prompt retention and per-rank NVMe overflow (S=1 rolls back to proto 4)
+EXL3_TP_SESSIONS="${EXL3_TP_SESSIONS:-4}"
+EXL3_TP_PREFIX_CACHE="${EXL3_TP_PREFIX_CACHE:-1}"
+EXL3_TP_DISK_CACHE="${EXL3_TP_DISK_CACHE:-1}"
+EXL3_TP_DISK_CACHE_DIR="${EXL3_TP_DISK_CACHE_DIR:-$ROOT/diskcache}"
+EXL3_TP_DISK_CACHE_GIB="${EXL3_TP_DISK_CACHE_GIB:-32}"
+EXL3_TP_DISK_TIMEOUT="${EXL3_TP_DISK_TIMEOUT:-300}"
 
 LOAD_TIMEOUT="${EXL3_LOAD_TIMEOUT:-2700}"  # max seconds to wait for /health 200
 STOP_TIMEOUT="${EXL3_STOP_TIMEOUT:-120}"   # max seconds for graceful unload per rank
@@ -91,7 +105,7 @@ lan_ip() { ip -4 route get 8.8.8.8 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{
 
 # ---- knob validation and defaults ------------------------------------------
 # Validate the RESOLVED values (the EXL3_* envs themselves may be unset).
-for v in HTTP_PORT MASTER_PORT CONTROL_PORT \
+for v in HTTP_PORT MASTER_PORT CONTROL_PORT EXL3_TP_SESSIONS EXL3_TP_DISK_TIMEOUT EXL3_TP_DISK_CACHE_GIB \
          EXL3_TP_SAFE_CTX EXL3_TP_CACHE_TOKENS LOAD_TIMEOUT STOP_TIMEOUT; do
     [[ "${!v}" =~ ^[0-9]+$ ]] || die "$v must be a positive integer (got '${!v}'; check the EXL3_* env of the same meaning)"
 done
@@ -101,7 +115,7 @@ case "${EXL3_TP_DSPARK:-1}" in          # DSpark ON by default
     0|false|no|off) EXL3_TP_DSPARK=0 ;;
     *) die "EXL3_TP_DSPARK must be 0/1/true/false/yes/no/on/off (got '${EXL3_TP_DSPARK}')" ;;
 esac
-export EXL3_TP_SAFE_CTX EXL3_TP_CACHE_TOKENS EXL3_TP_DSPARK EXL3_TP_MODEL_DIR
+export EXL3_TP_SAFE_CTX EXL3_TP_CACHE_TOKENS EXL3_TP_DSPARK EXL3_TP_MODEL_DIR KYOJIN_SSE_PING_S EXL3_TP_SESSIONS EXL3_TP_PREFIX_CACHE EXL3_TP_DISK_CACHE EXL3_TP_DISK_CACHE_DIR EXL3_TP_DISK_CACHE_GIB EXL3_TP_DISK_TIMEOUT
 
 dspark_label() { [[ "$EXL3_TP_DSPARK" == 1 ]] && echo "ON (MTP speculative decoding)" || echo "OFF"; }
 
@@ -113,6 +127,9 @@ dspark_label() { [[ "$EXL3_TP_DSPARK" == 1 ]] && echo "ON (MTP speculative decod
 PASS_ENV=()
 for v in EXL3_TP_DSPARK EXL3_TP_BUDGETS EXL3_TP_DSPARK_CONF EXL3_DS41_CONF \
          EXL3_TP_SAFE_CTX EXL3_TP_CACHE_TOKENS EXL3_TP_MODEL_DIR \
+         EXL3_TP_SESSIONS EXL3_TP_SESSION_MIN_MATCH EXL3_TP_PREFIX_SLOTS EXL3_TP_PREFIX_MIN \
+         EXL3_TP_PREFIX_END EXL3_TP_PREFIX_CACHE EXL3_TP_PREFIX_LOG \
+         EXL3_TP_DISK_CACHE EXL3_TP_DISK_CACHE_DIR EXL3_TP_DISK_CACHE_GIB EXL3_TP_DISK_TIMEOUT \
          EXL3_TP_SPAN EXL3_TP_USE_PER_DEVICE EXL3_TP_MEM_FLOOR \
          EXL3_TP_VISION EXL3_TP_VISION_STRICT EXL3_TP_MAX_IMAGES \
          EXL3_TP_ODL_AR2 EXL3_TP_ODL_AR2_PEER EXL3_TP_ODL_AR2_PORT EXL3_TP_ODL_AR2_MAX \

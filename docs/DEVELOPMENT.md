@@ -6,7 +6,10 @@
   prompts, samples tokens and drives the request. **Rank 1 (Box2)** runs
   `tools/ds41/tp_rank1.py` and mirrors every model call, driven by framed JSON
   over a TCP control channel on the Thunderbolt IP link (protocol 4: JSON
-  frames, prefix-cache fields and the vision `imgmeta` + binary blob frames).
+  frames, prefix-cache fields and the vision `imgmeta` + binary blob frames;
+  protocol 5 at `EXL3_TP_SESSIONS >= 2` adds session page maps and spill/load
+  frames). `tp_sessions.py` owns the four shared-pool conversation slots and
+  prefix auto-matching; `tp_disk.py` owns each rank's local NVMe images.
 - Model collectives use RCCL over OdinLink (`NCCL_NET=ODL_TB5`). Decode-sized
   all-reduces bypass RCCL through `odl_ar2` (stream-ordered, no host sync).
 - The vision tower + aligner runs on rank 0 only (`tools/ds41/tp_vision.py` is
@@ -24,17 +27,23 @@
 cd ~/exl3ds4/tools/ds41
 DS41_REF_DIR=~/exl3ds4/model ../../.venv/bin/python -m pytest -q \
     test_ds41_chat.py test_ds41_parse.py test_ds41_serve.py test_tp_control.py \
-    test_tp_chunked_prefill.py test_tp_prefix_cache.py test_serve_compat.py
+    test_tp_chunked_prefill.py test_tp_prefix_cache.py test_serve_compat.py \
+    test_tp_sessions.py test_tp_disk.py test_vendor_kyojin.py
 PYTHONPATH=~/exl3ds4/src/exllamav3-dsv41f \
     ../../.venv/bin/python -m pytest -q test_tp_vision.py   # engine-level vision tests
+# stage 1 + stage 2 in one process: the disk tier must not leak state across suites
+../../.venv/bin/python -m pytest -q test_tp_sessions.py test_tp_disk.py
 ```
 
-Last run: 526 passed, 6 skipped (the skips need the real tokenizer; set
-`DS41_REF_DIR`); the vision suite passed 33/33. The TP tests run the real
-`Rank1Worker` over a loopback socket against stand-in backends, and assert both
-ranks make identical model calls; the vision tests additionally run the real
-`TPEngine` pairs with a tower stand-in and (with the exllamav3 tree on
-`PYTHONPATH`) against the real `MMEmbedding`/geometry code — no GPU needed.
+Last run: **606 passed, 6 skipped** (the skips need the real tokenizer; set
+`DS41_REF_DIR`), plus **44 passed** in the dedicated combined sessions+disk run.
+The TP tests run the real `Rank1Worker` over a loopback socket against stand-in
+backends, and assert both ranks make identical model calls; the session tests
+cover page routing, auto-matching, eviction and proto-5 guards; the disk tests
+cover checksums, streaming, caps, spill/reload and every fallback; the vision
+tests additionally run the real `TPEngine` pairs with a tower stand-in and (with
+the exllamav3 tree on `PYTHONPATH`) against the real `MMEmbedding`/geometry code
+— no GPU needed.
 
 ## GPU smoke tests (server stopped)
 
@@ -62,12 +71,22 @@ shared `EXLLAMA_MASTER_ADDR/PORT`) and compares against a single-device load;
   Thunderbolt host is plugged into a box.
 - Full-group gathers use RCCL `all_gather`, chunked at 64 MiB
   (`EXL3_TP_GATHER_CHUNK_BYTES`).
+- `EXL3_TP_SESSIONS=4` (deployment default) keeps four cached conversations over
+  one shared pool; `1` rolls back to the single-session engine and protocol 4.
+  `EXL3_TP_SESSION_MIN_MATCH` tunes the auto-routing floor.
+- `EXL3_TP_DISK_CACHE=1` spills whole LRU conversations to each rank's local
+  `EXL3_TP_DISK_CACHE_DIR` (default `<checkout>/diskcache`), capped by
+  `EXL3_TP_DISK_CACHE_GIB` (32) with a 300 s `EXL3_TP_DISK_TIMEOUT`. Images are
+  one-shot; `0` keeps the pool eviction-only.
 - Diagnostics: `EXL3_TP_TRACE_COLLECTIVES=1` (ordered collective log),
   `EXL3_TP_STREAM_HASH=N` (residual-stream hashes), `EXL3_TP_PREFIX_LOG=1`
-  (one line per request with the reused tokens).
+  (one line per request with the reused tokens). `/tp/status` reports the pool,
+  hot/cold conversations, counters and the local disk tier snapshot.
 
-Settings that change the TP plan or the collective sequence must match on both
-ranks; `exl3ds4.sh` forwards them to Box2 (ssh forwards no environment).
+Settings that change the TP plan, the session geometry or the collective
+sequence must match on both ranks; `exl3ds4.sh` forwards them to Box2 (ssh
+forwards no environment). The proto-5 handshake refuses a rank 1 with a
+different session count or pool page count.
 
 ## Rebuilding
 

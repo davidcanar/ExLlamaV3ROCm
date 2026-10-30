@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """One-shot vendoring: copy the MIT-licensed Kyojin HTTP/chat/parser/test layer into
-<exl3ds4>/tools/ds41 with attribution headers. Idempotent (overwrites).
+this tools/ds41 folder with attribution headers. Idempotent (overwrites).
 
 Run on the rank-0 box:  <exl3ds4>/.venv/bin/python vendor_kyojin.py
-Source:                <exl3ds4>/src/kyojin  (Yamz-Labs/kyojin @ e2f3756, release 1.8.2;
-                       cloned by setup.sh; override with EXL3_KYOJIN_SRC)
+Source:                  <exl3ds4>/src/kyojin  (Yamz-Labs/kyojin @ e2f3756, release 1.8.2;
+                         cloned by setup.sh; override with EXL3_KYOJIN_SRC)
 Root defaults to two directories above this file; override with EXL3DS4_ROOT.
 
-ds41_serve.py (from Kyojin serve.py) additionally carries two small, clearly marked
-LOCAL blocks that forward the per-request `speculative` / `spec_k` fields of the two-node
-DSpark engine to generate(); everything else stays byte-identical to upstream.
+ds41_serve.py (from Kyojin serve.py) additionally carries three small, clearly marked
+LOCAL blocks that forward per-request fields of the two-node engines to generate():
+`speculative` / `spec_k` (DSpark) and `session` (multi-session slot pinning, tp_sessions);
+everything else stays byte-identical to upstream.
 """
 import os
 import shutil
@@ -19,7 +20,7 @@ _ROOT = os.environ.get(
     "EXL3DS4_ROOT", os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
 SRC = Path(os.environ.get("EXL3_KYOJIN_SRC", os.path.join(_ROOT, "src/kyojin")))
-DST = Path(os.environ.get("EXL3_DS41_DIR", os.path.join(_ROOT, "tools/ds41")))
+DST = Path(os.environ.get("EXL3_DS41_DIR", os.path.dirname(os.path.abspath(__file__))))
 KY = "Kyojin <https://github.com/Yamz-Labs/kyojin> commit e2f37564bbae01a6ea8ad4176dfd97db09c253aa (release 1.8.2)"
 
 # source path in the Kyojin tree -> file name here
@@ -57,11 +58,14 @@ def header(rel: str, note: str = "") -> str:
 
 
 def patch_serve(text: str) -> str:
-    """The two LOCAL blocks of ds41_serve.py: per-request speculative decoding fields.
+    """The three LOCAL blocks of ds41_serve.py: per-request engine fields.
 
     1. validation in completions(): `speculative` (bool) and `spec_k` (positive int), plus a 400
        when speculative is explicitly asked for but the engine has no DSpark;
-    2. the worker's generate() call forwards both when the request sent them.
+    2. the worker's generate() call forwards `speculative` / `spec_k` when the request sent
+       them, and `session` (1..EXL3_TP_SESSIONS, multi-session slot pinning; the engine
+       validates and refuses it on single-session servers -- unknown by other engines
+       through **_).
     Everything else stays byte-identical to upstream serve.py (asserted by the anchors)."""
     anchor_a = (
         '            stops = body.get("stop") or []\n'
@@ -84,10 +88,15 @@ def patch_serve(text: str) -> str:
     insert_b = anchor_b + (
         '                            **({"speculative": body["speculative"]} if body.get("speculative") is not None else {}),   # LOCAL (exl3-tp)\n'
         '                            **({"spec_k": body["spec_k"]} if body.get("spec_k") is not None else {}),                 # LOCAL (exl3-tp)\n'
+        '                            **({"session": body["session"]} if body.get("session") is not None else {}),              # LOCAL (exl3-tp): explicit session slot\n'
     )
     assert anchor_a in text, "serve.py validation anchor not found (upstream changed?)"
     assert anchor_b in text, "serve.py worker-call anchor not found (upstream changed?)"
-    return text.replace(anchor_a, insert_a, 1).replace(anchor_b, insert_b, 1)
+    out = text.replace(anchor_a, insert_a, 1).replace(anchor_b, insert_b, 1)
+    # the session block must survive re-vendoring: exactly one forwarded field line,
+    # after spec_k, or the multi-session override silently disappears from the HTTP API
+    assert out.count('"session": body["session"]') == 1, "session LOCAL block not applied exactly once"
+    return out
 
 
 def main() -> None:
@@ -98,13 +107,15 @@ def main() -> None:
             note = (
                 "# Near-verbatim copy for the two-node EXL3 TP server; entry points here are\n"
                 "# tp_serve.py (rank 0, HTTP) and tp_rank1.py (rank 1, mirror worker).\n"
-                "# LOCAL modification (marked 'LOCAL (exl3-tp)', applied by vendor_kyojin.py): the\n"
+                "# LOCAL modifications (marked 'LOCAL (exl3-tp)', applied by vendor_kyojin.py): the\n"
                 "# per-request `speculative` / `spec_k` fields are validated and forwarded to\n"
-                "# engine.generate for the DSpark engine. Everything else is byte-identical upstream.\n"
+                "# engine.generate for the DSpark engine, and the optional `session` field pins a\n"
+                "# multi-session slot (tp_sessions; the engine validates the id). Everything else\n"
+                "# is byte-identical upstream.\n"
             )
             text = patch_serve(text)
             (DST / name).write_text(header(src_rel, note) + text, encoding="utf-8")
-            print(f"vendored {name}  <-  {src_rel}  (+ LOCAL speculative/spec_k patch)")
+            print(f"vendored {name}  <-  {src_rel}  (+ LOCAL speculative/spec_k/session patch)")
             continue
         (DST / name).write_text(header(src_rel) + text, encoding="utf-8")
         print(f"vendored {name}  <-  {src_rel}")

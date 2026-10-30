@@ -14,7 +14,9 @@
 # The EXL3_TP_DSPARK / EXL3_TP_BUDGETS / EXL3_TP_DSPARK_CONF / EXL3_DS41_CONF / EXL3_TP_SAFE_CTX
 # / EXL3_TP_CACHE_TOKENS / EXL3_TP_SPAN / EXL3_TP_USE_PER_DEVICE / EXL3_TP_MEM_FLOOR variables
 # are forwarded to Box2 (ssh forwards nothing by default; SPAN and the cache MUST match on both
-# ranks or the prefill chunk sequences diverge and the collectives wedge).
+# ranks or the prefill chunk sequences diverge and the collectives wedge). The session and
+# disk knobs (EXL3_TP_SESSIONS, EXL3_TP_PREFIX_*, EXL3_TP_DISK_*) travel the same way: rank 1
+# validates the session count and pool geometry at the handshake.
 #
 # While the model loads, GET http://<box1>:<http-port>/health answers 503 with the stage
 # ("model", "rank 1", "warm-up"); it turns 200 when serving. Logs:
@@ -36,6 +38,10 @@ RANK0_LOG="$ROOT/logs/tpserve-rank0.log"
 PASS_ENV=()
 for v in EXL3_TP_DSPARK EXL3_TP_BUDGETS EXL3_TP_DSPARK_CONF EXL3_DS41_CONF EXL3_TP_SAFE_CTX \
          EXL3_TP_CACHE_TOKENS EXL3_TP_SPAN EXL3_TP_USE_PER_DEVICE EXL3_TP_MEM_FLOOR \
+         EXL3_TP_SESSIONS EXL3_TP_SESSION_MIN_MATCH EXL3_TP_PREFIX_SLOTS EXL3_TP_PREFIX_MIN \
+         EXL3_TP_PREFIX_END EXL3_TP_PREFIX_CACHE EXL3_TP_PREFIX_LOG \
+         EXL3_TP_DISK_CACHE EXL3_TP_DISK_CACHE_DIR EXL3_TP_DISK_CACHE_GIB EXL3_TP_DISK_TIMEOUT \
+         EXL3_TP_MAX_IMAGES \
          EXL3_TP_ODL_AR2 EXL3_TP_ODL_AR2_PEER EXL3_TP_ODL_AR2_PORT EXL3_TP_ODL_AR2_MAX \
          EXL3_TP_SHARED_EXPERT_DEVICE EXL3_DSV4_CAND_ROWS EXL3_TP_NCCL_SYNC EXL3_TP_NCCL_FP32 \
          EXL3_ROCM_MOE_DECODE_RANGE; do

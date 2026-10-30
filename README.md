@@ -5,8 +5,9 @@ quant) on **two AMD Strix Halo machines** joined by one Thunderbolt/USB4 cable.
 [ExLlamaV3](https://github.com/turboderp/ExLlamaV3) splits the model across both
 boxes (tensor parallelism), [OdinLink](https://github.com/Geramy/OdinLink-Five)
 carries the traffic over the cable, and an OpenAI-compatible server exposes it
-with MTP speculative decoding ("DSpark"), a prompt cache, image input (vision)
-and a 512K-token context.
+with MTP speculative decoding ("DSpark"), four cached conversations sharing one
+512K-token pool, per-rank NVMe spill/reload, image input (vision) and a
+512K-token context.
 
 This repository is the working deployment, packaged for reinstallation: an
 installer, a controller script, the server, and the patches it needs on top of
@@ -27,12 +28,23 @@ Prompt processing runs at ~300 tok/s. Follow-up turns reuse the cached prompt:
 the next turn of a 19.8K-token conversation starts answering after **0.47 s**
 instead of 65 s. Details, history and memory budget: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
+The multi-session build was validated live with DSpark on and a 512K cache:
+four interleaved conversations each resumed with `cached_tokens=1195`; a fifth
+conversation spilled the LRU one to two ~71.5 MB per-rank NVMe images, and that
+conversation's return reloaded them (`cold_loads=1`) with `cached_tokens=1206`
+instead of re-prefilling; the restored reply matched a fresh prefill exactly.
+A 4,820-token prompt resumed from its checkpoint, the vision card still read
+**BLUE HERON 42**, a DSpark streaming run measured **45.74 tok/s**, and the
+restore counters recorded no fallbacks. CPU validation: **606 passed, 6 skipped**,
+plus **44 passed** in the dedicated combined sessions+disk run.
+
 ## What you need
 
 - Two Strix Halo (`gfx1151`) machines with 128 GB each, one Thunderbolt/USB4
   cable between them, Fedora (validated on Fedora 44, kernel 7.1), the same
   user and paths on both.
-- About 400 GiB of disk per box (196 GiB quant + 189 GiB Engram tables).
+- About 400 GiB of disk per box (196 GiB quant + 189 GiB Engram tables), plus
+  up to 32 GiB per box for the optional NVMe conversation-spill tier.
 - Root once per box, for the kernel command line and the OdinLink module.
 
 The validated rig, whose addresses are the defaults:
@@ -112,25 +124,45 @@ Per-request options beyond the OpenAI ones:
 |---|---|
 | `"speculative": false` | plain decoding for this request (DSpark is on by default, sampled requests included) |
 | `"spec_k": 1..5` | cap the draft length |
+| `"session": 1..4` | pin a hot conversation slot; normally omit it and let prefix matching route |
 | `"cache_prompt": false` | do not reuse or save the cached prompt |
-| `"cache_salt": "..."` | prompt-cache namespace; a new salt drops the cache |
+| `"cache_salt": "..."` | prompt-cache namespace; a new salt drops every cached conversation |
 | `"reasoning_effort"`, `"chat_template_kwargs": {"thinking": false}` | thinking budget / off |
 
-The prompt cache follows one conversation: a request that starts differently
-(a client's title or summary request, say) overwrites it, and the next turn of
-the main conversation prefills from where they diverge. One request runs at a
-time; others queue.
+The server keeps four conversation slots by default (`EXL3_TP_SESSIONS=4`) over
+one shared 512K-token pool. It recognizes a returning conversation from the
+prompt prefix itself, so clients need no session id: a turn that still contains
+the previous prompt (modulo the template's one-token generation header) returns
+to its slot. A different conversation, such as a client's title or summary
+request, gets another slot instead of overwriting the first. When all slots are
+hot, the least-recently-used conversation is spilled to one local NVMe image per
+rank and reloaded on its next turn instead of re-prefilling; images last for the
+server's lifetime only. `"session": N` can pin a hot slot, but auto-matching is
+the normal path. One request runs at a time; others queue, so GPU work stays
+serialized.
 
 ## Configuration
 
 `exl3ds4.sh` sets the validated defaults: 512K-token context
 (`EXL3_TP_SAFE_CTX` / `EXL3_TP_CACHE_TOKENS`), DSpark on (`EXL3_TP_DSPARK=1`),
-prompt cache on (`EXL3_TP_PREFIX_CACHE=1`, two 32 MiB checkpoints per box), and
-the vision tower on (`EXL3_TP_VISION=1`: a failed tower load degrades to
-text-only instead of failing startup; `EXL3_TP_VISION_STRICT=1` makes it fatal).
+four cached conversations (`EXL3_TP_SESSIONS=4`) with per-session prompt reuse
+(two 32 MiB checkpoints per conversation; `EXL3_TP_PREFIX_CACHE` controls the
+single-session engine and multi-session keeps one namespace per conversation),
+the NVMe
+overflow tier on (`EXL3_TP_DISK_CACHE=1`: 32 GiB per rank under
+`EXL3_TP_DISK_CACHE_DIR`, default `$EXL3DS4_ROOT/diskcache`, 300 s frame
+timeout), the vision tower on (`EXL3_TP_VISION=1`, up to 16 images per request;
+a failed tower load degrades to text-only instead of failing startup;
+`EXL3_TP_VISION_STRICT=1` makes it fatal), and a 30 s SSE keep-alive
+(`KYOJIN_SSE_PING_S=30`). `EXL3_TP_SESSIONS=1` rolls back to the single-session
+engine, protocol 4 and the old one-conversation cache exactly.
+
 Every optimization can be switched off on its own if you suspect it:
 `EXL3_ROCM_MOE_DECODE_RANGE=0`, `EXL3_TP_ODL_AR2=0`, `EXL3_TP_SPEC_SAMPLED=0`,
-`EXL3_TP_PREFIX_CACHE=0`, `EXL3_TP_VISION=0`. The full list is in
+`EXL3_TP_DISK_CACHE=0`, `EXL3_TP_VISION=0`, or `EXL3_TP_SESSIONS=1` for the old
+single-session engine. In multi-session mode use `"cache_prompt": false` to skip
+prompt reuse for a request; `EXL3_TP_PREFIX_CACHE=0` disables it in the
+single-session engine. The full list is in
 [tools/ds41/README.md](tools/ds41/README.md#knobs-and-defaults).
 
 On other machines, override the rig's addresses and paths:
@@ -146,6 +178,14 @@ On other machines, override the rig's addresses and paths:
 ## Known limitations
 
 - If either rank dies mid-request, restart both (`exl3ds4.sh restart`).
+- One request runs at a time; four cached conversations share the pool but their
+  GPU work is serialized. Pages are grow-only within a conversation's life;
+  freedom comes from whole-session spill or eviction.
+- Spilled images are one-shot: a server restart starts with an empty disk tier
+  and every conversation re-prefills.
+- A conversation that repeats another conversation's entire last prompt within
+  the one-token generation-header tolerance can match that slot. This is the
+  same matching rule as the single-session cache and never changes the output.
 - Memory is tight: GPU memory is system RAM, and the model leaves ~3.6 GiB on
   Box1 and ~2 GiB on Box2 for the OS. Keep other heavy jobs off the boxes while
   serving.
@@ -156,12 +196,27 @@ On other machines, override the rig's addresses and paths:
   pixel hashing, not built in this first version; text prompts keep the cache).
   Prefill speed at the full 512K context is unmeasured.
 
+## Security notes
+
+The HTTP API has no authentication and binds `0.0.0.0:1234` by default: keep it
+on a trusted LAN or bind `127.0.0.1`. Image URL fetches are operator-trust and
+are not SSRF-filtered (`EXL3_TP_IMAGE_HTTP=0` turns them off; the data:/base64
+path stays available). The NVMe tier is local to each rank and trusted: image
+metadata is checksummed, but the stash region is a pickle, so never point
+`EXL3_TP_DISK_CACHE_DIR` at storage an untrusted party can write to. It is
+created 0o700 and stale files are swept at startup. `EXL3_TP_DISK_CACHE_GIB`
+caps each rank's images, and the image fetch limits
+(`EXL3_TP_IMAGE_MAX_BYTES`, `_MAX_PIXELS`, `_FETCH_TIMEOUT`) bound the other
+untrusted input path.
+
 ## Repository layout
 
 ```
 setup.sh, env.sh       installer; shared ROCm/HIP environment
 exl3ds4.sh             controller: start | stop | restart | status | logs
 tools/ds41/            the OpenAI server and the two-rank engine (+ CPU tests)
+  tp_sessions.py       shared-pool conversation slots and prefix auto-matching
+  tp_disk.py           per-rank NVMe image store for spilled conversations
 patches/exllamav3/     12 ExLlamaV3 commits (git am) on PR #449
 patches/odinlink/      3 OdinLink-Five diffs (git apply): multi-frame, device allow-list, RX/teardown fixes
 odl_ar2/               OdinLink all-reduce used for decode

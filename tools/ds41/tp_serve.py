@@ -79,14 +79,21 @@ async def _tp_status(request: web.Request) -> web.Response:
     rank1 = "unknown"
     if ping is not None:
         rank1 = await asyncio.get_running_loop().run_in_executor(None, ping)
-    return web.json_response({
+    sessions = int(getattr(engine, "sessions", 1))
+    out = {
         "status": "ok" if rank1 in ("ok", "busy", "unknown") else "degraded",
         "source": "exl3-tp-serve", "rank1": rank1, "proto": tp_engine.PROTO,
         "dspark": bool(getattr(engine, "dspark", False)),
         "vision": bool(getattr(engine, "supports_vision", False)),
         "requests": getattr(engine, "requests", None),
-        "ctx": getattr(engine, "ctx", None), "sessions": 1,
-    })
+        "ctx": getattr(engine, "ctx", None), "sessions": sessions,
+    }
+    if sessions > 1:
+        out["proto"] = tp_engine.PROTO_SESSIONS
+        status = getattr(engine, "session_status", None)
+        if callable(status):
+            out["pool"] = status()          # slots, pages used/free, per-session detail, counters
+    return web.json_response(out)
 
 
 def build_tp_engine(args: argparse.Namespace) -> Any:
@@ -103,16 +110,33 @@ def build_tp_engine(args: argparse.Namespace) -> Any:
         args.control_host, args.control_port,
         accept_timeout=tp_engine.env_float("EXL3_TP_ACCEPT_TIMEOUT", 1800.0), log=print)
     vision = getattr(backend, "vision", None) is not None
-    channel.send({"op": "hello", "proto": tp_engine.PROTO, "vocab_size": backend.vocab_size,
-                  "dspark": bool(backend.dspark), "vision": vision})
+    # Multi-session (EXL3_TP_SESSIONS >= 2, opt-in) bumps the control protocol to 5 and
+    # validates the session/pool geometry in the handshake: a stale or differently
+    # configured rank 1 refuses loudly instead of desyncing page ownership mid-request
+    sessions = max(1, int(getattr(args, "sessions", 0) or 0) or
+                   tp_engine.env_int("EXL3_TP_SESSIONS", 1))
+    env_sessions = tp_engine.env_int("EXL3_TP_SESSIONS", 1)
+    if args.sessions is not None and env_sessions != sessions:
+        # --sessions wins, but the launcher forwards the ENV var to the rank-1 box: warn so
+        # the handshake mismatch below does not surprise anyone
+        print(f"tp-serve: --sessions {sessions} overrides EXL3_TP_SESSIONS={env_sessions}; the "
+              f"launcher can only forward the env var -- export it on both boxes too", flush=True)
+    proto = tp_engine.PROTO if sessions < 2 else tp_engine.PROTO_SESSIONS
+    page_size = int(getattr(backend, "page_size", 256) or 256)
+    pool_pages = int(backend.cache_tokens) // page_size
+    hello = {"op": "hello", "proto": proto, "vocab_size": backend.vocab_size,
+             "dspark": bool(backend.dspark), "vision": vision}
+    if proto >= tp_engine.PROTO_SESSIONS:
+        hello.update({"sessions": sessions, "pool_pages": pool_pages, "page_size": page_size})
+    channel.send(hello)
     reply = channel.recv()
-    if reply.get("op") != "hello_ok" or int(reply.get("proto", -1)) != tp_engine.PROTO \
+    if reply.get("op") != "hello_ok" or int(reply.get("proto", -1)) != proto \
             or int(reply.get("rank", -1)) != 1:
         startup_health.abort(f"rank 1 handshake failed: {reply}")
         raise SystemExit(f"tp-serve: rank 1 handshake failed: {reply}")
     if not bool(reply.get("vision_capable", False)):
         startup_health.abort("rank 1 does not speak this control protocol's vision frames "
-                             f"(proto {tp_engine.PROTO}); sync tools/ds41 on both boxes and restart")
+                             f"(proto {proto}); sync tools/ds41 on both boxes and restart")
         raise SystemExit("tp-serve: rank 1 lacks vision support (old tp_engine.py on Box2?) -- "
                          "restart both ranks with the same tools/ds41")
     if int(reply.get("vocab_size", -1)) != backend.vocab_size:
@@ -124,8 +148,26 @@ def build_tp_engine(args: argparse.Namespace) -> Any:
         startup_health.abort("rank 1 DSpark state mismatch")
         raise SystemExit(f"tp-serve: DSpark mismatch with rank 1 (rank 0 {bool(backend.dspark)}, "
                          f"rank 1 {bool(reply.get('dspark'))}); {which}")
+    if proto >= tp_engine.PROTO_SESSIONS:
+        if int(reply.get("sessions", -1)) != sessions:
+            startup_health.abort("rank 1 session count mismatch")
+            raise SystemExit(
+                f"tp-serve: rank 1 serves {reply.get('sessions')} sessions, this rank "
+                f"{sessions}. The rank-1 box must run with the same count: export "
+                f"EXL3_TP_SESSIONS={sessions} there (tp_serve_odl.sh or exl3ds4.sh "
+                f"forward it) and restart both ranks. Note --sessions only configures rank 0; "
+                f"the env var is what reaches rank 1.")
+        if int(reply.get("pool_pages", -1)) != pool_pages:
+            startup_health.abort("rank 1 pool geometry mismatch")
+            raise SystemExit(
+                f"tp-serve: rank 1's pool holds {reply.get('pool_pages')} pages, this rank's "
+                f"{pool_pages}; EXL3_TP_CACHE_TOKENS must match on both ranks")
     print(f"tp-serve: rank 1 connected and verified (vocab {backend.vocab_size}, "
-          f"dspark {'on' if backend.dspark else 'off'})", flush=True)
+          f"dspark {'on' if backend.dspark else 'off'}, proto {proto})", flush=True)
+    if sessions > 1:
+        print(f"tp-serve: multi-session serving ON ({sessions} slots over the shared "
+              f"{pool_pages}-page pool, dynamic noncontiguous pages; per-request \"session\" "
+              f"ids 1..{sessions}; /tp/status reports the pool)", flush=True)
     if vision:
         print("tp-serve: vision on (rank 0 tower + aligner loaded; image requests ship their rows "
               "to rank 1 per request; image prompts bypass the prefix cache)", flush=True)
@@ -143,7 +185,26 @@ def build_tp_engine(args: argparse.Namespace) -> Any:
     ctx = max(16, min(ctx, backend.cache_tokens - 2))
     return tp_engine.TPEngine(backend, channel, tokenizer, ctx=ctx,
                               eos_id=tp_engine.eos_id_of(args.model, tokenizer), seed=args.seed,
+                              sessions=sessions,
                               log=lambda line: print(line, flush=True))   # the launchers log to a file
+
+
+def _prefix_cache_line(engine) -> str:
+    """The startup log's prefix-cache sentence. Single-session engines report the one
+    PrefixCache; multi-session engines (mgr) hold one PrefixCache NAMESPACE PER SESSION,
+    so 'engine.prefix is None' there does NOT mean caching is off -- it means per-session
+    caching is on (governed by EXL3_TP_PREFIX_SLOTS/_MIN, not EXL3_TP_PREFIX_CACHE alone)."""
+    px = getattr(engine, "prefix", None)
+    mgr = getattr(engine, "mgr", None)
+    if mgr is not None:
+        return ("on, per session (" + f"{mgr.prefix_slots} checkpoints of the recurrent state per slot, "
+                f"prompts from {mgr.min_tokens} tokens, end-of-reply checkpoints "
+                f"{'on' if mgr.save_end else 'off'}; per request \"cache_prompt\": false opts out)")
+    if px is not None:
+        return (f"on ({px.slots} checkpoints of the recurrent state, prompts from {px.min_tokens} tokens, "
+                f"end-of-reply checkpoints {'on' if px.save_end else 'off'}; per request "
+                f"\"cache_prompt\": false opts out)")
+    return "off (EXL3_TP_PREFIX_CACHE=0): every request re-prefills"
 
 
 def main() -> None:
@@ -163,6 +224,9 @@ def main() -> None:
     parser.add_argument("--control-port", type=int, default=DEFAULT_CONTROL_PORT,
                         help="rank-0 control channel port (default $EXL3_TP_CONTROL_PORT or 29651)")
     parser.add_argument("--seed", type=int, default=None, help="sampling generator seed (temperature > 0 requests)")
+    parser.add_argument("--sessions", type=int, default=None,
+                        help="cached conversation slots (default $EXL3_TP_SESSIONS or 1; >= 2 enables the "
+                             "multi-session engine: dynamic shared-pool pages, proto 5)")
     parser.add_argument("--engine-opt", action="append", default=[], metavar="KEY=VALUE",
                         help="extra keyword argument for a module:function loader (JSON value or plain string); repeatable")
     parser.add_argument("--default-temperature", type=float, default=None,
@@ -214,14 +278,11 @@ def main() -> None:
     print(f"tp-serve: ctx {getattr(engine, 'ctx', '?')} tokens"
           + (f" (cache {be.cache_tokens}, prefill chunk {be.span} rows, block tables sized to the cache)"
              if be is not None else "")
-          + ", one in-flight request", flush=True)
-    px = getattr(engine, "prefix", None)
+          + f", {int(getattr(engine, 'sessions', 1))} session slot(s), one in-flight request"
+          + (" (multi-session: GPU work serialized, queueing in the server)" if int(getattr(engine, "sessions", 1)) > 1 else ""),
+          flush=True)
     if be is not None:
-        print("tp-serve: prefix cache " + (
-            f"on ({px.slots} checkpoints of the recurrent state, prompts from {px.min_tokens} tokens, "
-            f"end-of-reply checkpoints {'on' if px.save_end else 'off'}; per request \"cache_prompt\": false "
-            f"opts out)" if px is not None else "off (EXL3_TP_PREFIX_CACHE=0): every request re-prefills"),
-            flush=True)
+        print("tp-serve: prefix cache " + _prefix_cache_line(engine), flush=True)
     reqlog.log("serve_start", model=Path(args.model).name, model_id=args.model_id, pid=os.getpid(),
                ctx=getattr(engine, "ctx", None), sessions=int(getattr(engine, "sessions", 1)),
                heartbeat_s=reqlog.heartbeat_s, sse_ping_s=app["ping"].interval_s or None, loader=args.loader)

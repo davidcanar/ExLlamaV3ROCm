@@ -3,6 +3,7 @@
 logs/
 run/
 model/
+diskcache/
 engram-src*/
 src/
 build/

@@ -15,7 +15,8 @@ Decode, tok/s:
 | 62,822 | 35.6 | 35.0 / 33.2 | 24.3 |
 
 Prefill runs at ~300 tok/s. With the prefix cache, the next turn of a 19.8K-token
-conversation starts generating after 0.47 s instead of 65 s.
+conversation starts generating after 0.47 s instead of 65 s. A DSpark streaming
+run on the multi-session build measured **45.74 tok/s**.
 
 Where a DSpark round goes at 60K context (synchronized profile, which stretches
 the 97 ms round to 131 ms): ~45 ms MoE (six rows), ~21 ms other linears, ~16 ms
@@ -63,7 +64,10 @@ The paged DSA pools are position-indexed and keep a finished request's tokens,
 so both ranks only checkpoint the recurrent state (SWA ring, compressor windows,
 Engram ids; 32 MiB of host RAM per rank) after each prefill and at the end of
 each reply. A follow-up turn restores the longest valid checkpoint and prefills
-only the new tokens. Design and protocol: `tools/ds41/README.md`.
+only the new tokens. With `EXL3_TP_SESSIONS=4` each conversation keeps its own
+checkpoint namespace and page mapping; auto-matching chooses the slot from the
+prompt prefix, so concurrent client conversations no longer overwrite one
+another. Design and protocol: `tools/ds41/README.md`.
 
 - `perf/prefix_check.py` (HTTP, 19.8K-token conversation): turn 2 reused 19,786
   of 19,811 prompt tokens and began generating after 0.47 s (65 s fresh).
@@ -76,9 +80,33 @@ only the new tokens. Design and protocol: `tools/ds41/README.md`.
   cache-free run where two tokens are nearly tied.
 - Costs: stash 1–12 ms, restore 2–6 ms.
 
+## Multi-session and NVMe spill (2026-10-30)
+
+Four cached conversations share the one 512K-token pool, but GPU work stays
+serialized, so the per-request decode numbers above are unchanged. Routing is by
+prompt prefix (no client id): every turn that still contains its previous prompt
+returns to its own checkpoint namespace.
+
+Validated live with DSpark on and the 512K pool:
+
+- Four interleaved conversations each resumed with `cached_tokens=1195`; a
+  divergent side conversation did not overwrite them.
+- A fifth conversation spilled the LRU one to one image per rank, ~71.5 MB each,
+  instead of evicting it.
+- Returning to the spilled conversation reloaded both images (`cold_loads=1`)
+  and resumed with `cached_tokens=1206`; the reply was identical to a fresh
+  `cache_prompt: false` prefill of the same messages.
+- A 4,820-token prompt resumed from its checkpoint instead of re-prefilling.
+- The restore counters recorded no fallbacks (`spill_restore_fallbacks=0`), and
+  the vision card still read **BLUE HERON 42**.
+
+The spill writes one page at a time (~0.8 MiB at 512K) plus the pickled stashes,
+so peak host RAM stays bounded; the 71.5 MB image is the per-rank bytes on disk,
+not a RAM copy. Images are one-shot and are not reused after a restart.
+
 ## Vision
 
-Image input (protocol 4, 2026-10-29) loads the tower + aligner on rank 0 only:
+Image input (protocol 4/5, 2026-10-29) loads the tower + aligner on rank 0 only:
 ~0.7 GiB (12.7 → 12.0 GiB free of the 124 GiB GTT with DSpark and the 512K
 cache resident) and 4.2 s at startup. Rank 1 loads nothing; each image request
 ships the tower's output rows over the control channel (~0.3 MiB per image at
@@ -98,7 +126,7 @@ unaffected: a text follow-up sent after image traffic still restored 1644 of
 its prompt tokens.
 
 Validated live on 2026-10-29 against the running server: `/health` and
-`/tp/status` report `vision: true` (proto 4); a test card reading **BLUE HERON
+`/tp/status` report `vision: true` (proto 4/5); a test card reading **BLUE HERON
 42** was transcribed verbatim with plain decoding, with DSpark, and over SSE;
 `data:image/png;base64,AAAA` answered 400 (`cannot decode image`) without
 reaching either rank's model; a text request before, between and after the
@@ -116,8 +144,12 @@ GPU allocation competes with the OS.
 | DSA KV pools at 512K tokens (fp16) | 1.6 GiB | 1.6 GiB |
 | DSpark drafter main-kv (ring of 10 pages) | 7.5 MiB | — |
 | vision tower + aligner (rank 0) | ~0.7 GiB | — |
-| prefix checkpoints (2 × 32 MiB) | 64 MiB | 64 MiB |
+| prefix checkpoints (4 conversations × 2 × 32 MiB) | 256 MiB | 256 MiB |
 | RAM left for the OS | ~2.9 GiB (with the vision tower) | ~2 GiB |
+
+The NVMe tier adds no resident GPU memory: a spilled conversation's pages and
+stashes move to its rank's local images (up to `EXL3_TP_DISK_CACHE_GIB`, 32 GiB,
+per rank) and come back only when that conversation returns.
 
 The KV cache is small: V4.1-Flash keeps four pool-owning layers (2, 8, 14, 20;
 the other layers read their owner's pool), three at compression rate 2 and one
