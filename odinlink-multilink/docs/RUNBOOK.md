@@ -277,3 +277,30 @@ Suspects: listener-tag (lidx) collisions across the two peers' handle exchanges
 (lidx is a per-process counter; two boxes can present the same lidx to a third),
 or a channel-count mismatch in connect/accept pairing that the model runtime's
 fixed channel pattern never triggers.
+
+### Update 2026-11-02 afternoon: three separate causes
+
+1. **Stale cable map (fixed).** After the 10:42 synchronized `odl_tb5` reload, Box2's devices came
+   back swapped (dev0 = Box3, dev1 = Box1) while `tp3_worker.sh` still mapped
+   `10.0.2.1=0,10.0.2.3=1`. With a stale `ODL_RCCL_PEERS` the plugin opens a connection on the
+   cable to the *other* peer; its hello lands on that box's control stream (id 20 on every device)
+   and is accepted there, because listener tags are per-process counters that collide across
+   boxes. That produces exactly the asymmetric per-pair channel counts above, and the world-3
+   warmup hangs. `tools/ds41/odl_peer_probe.py` now derives the map on all three boxes at once and
+   `tools/tp3_start.sh` hands each rank its own `ODL_RCCL_PEERS` on every start
+   (`tp3_start.sh probe` prints it). With correct maps the world-3 warmup passes.
+2. **Still open: intermittent stall at the first large collective.** With correct maps, 3 of 6
+   starts stalled in the first prefill-sized all-reduce (the warm-up's 31-row chunk): every rank
+   inside the same collective, the RCCL proxy thread spinning, nearly every plugin comm worker idle
+   (no transfer queued), no driver message. It looks like a connection RCCL builds lazily for its
+   first Simple-protocol op that never completes. Next capture: `ODL_DEBUG=1` on all ranks. (The
+   failing starts all had odl_ar3 initialised; the one RCCL-only start passed — small sample.)
+3. **Frame loss on the raw DMA path.** Under concurrent load all three boxes logged
+   `RX CRC error ... frame dropped` followed by `stream N fragment gap ... dropping message`, often
+   two boxes in the same second. The driver drops the whole message and nothing retransmits it,
+   so an RCCL collective that loses a frame hangs. The odl_ar3 decode all-reduce recovers its own
+   messages (NACK + resend); RCCL traffic does not yet.
+
+Never attach `py-spy` (or any ptrace tool) to a rank without `--nonblocking`: the stop interrupts
+the plugin's blocking `STREAM_RECV`, the driver returns `-EINTR`, the plugin fails the transfer and
+NCCL raises `ncclSystemError`.
