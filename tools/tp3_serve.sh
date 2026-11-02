@@ -5,7 +5,7 @@
 # orchestrates all three).
 set -euo pipefail
 
-HTTP_PORT=${1:-8080}
+HTTP_PORT=${1:-1234}
 MASTER_PORT=${2:-29650}
 CONTROL_PORT=${3:-29651}
 ROOT=/home/davidcanar/exl3ds4
@@ -32,9 +32,15 @@ export EXL3_TP_ODL_AR2=0
 export EXL3_TP_SESSIONS=${EXL3_TP_SESSIONS:-1}
 export EXL3_TP_VISION=${EXL3_TP_VISION:-0}
 export EXL3_TP_DISK_CACHE=${EXL3_TP_DISK_CACHE:-0}
-export EXL3_TP_BUDGETS=${EXL3_TP_BUDGETS:-95,100,100}
-export EXL3_TP_SAFE_CTX=${EXL3_TP_SAFE_CTX:-2048}          # first light: 2K context
-export EXL3_TP_CACHE_TOKENS=${EXL3_TP_CACHE_TOKENS:-4096}
+export EXL3_TP_BUDGETS=${EXL3_TP_BUDGETS:-100,100,100}
+# Model selection: default is the 2.9bpw quant; export EXL3_TP_MODEL_DIR to
+# serve another checkpoint (e.g. model-3.5bpw). Paths must mirror on every box.
+export EXL3_TP_MODEL_DIR=${EXL3_TP_MODEL_DIR:-$ROOT/model}
+export EXL3_TP_SAFE_CTX=${EXL3_TP_SAFE_CTX:-524288}
+export EXL3_TP_CACHE_TOKENS=${EXL3_TP_CACHE_TOKENS:-524288}
+# DSpark (MTP speculative decoding) across all three ranks; opt out with
+# EXL3_TP_DSPARK=0. Validated after the pow2 split landed.
+export EXL3_TP_DSPARK=${EXL3_TP_DSPARK:-1}
 export LD_LIBRARY_PATH="$ODL_BUILD/rccl:$ODL_BUILD/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export LD_PRELOAD="$ROOT/.venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/libhsa-runtime64.so.1${LD_PRELOAD:+:$LD_PRELOAD}"
 export PYTHONPATH="$ROOT/src/exllamav3-dsv41f${PYTHONPATH:+:$PYTHONPATH}"

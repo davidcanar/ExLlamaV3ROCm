@@ -8,7 +8,7 @@ ROOT=/home/davidcanar/exl3ds4
 LOG=$ROOT/logs
 B2=${EXL3_BOX2:-192.168.0.103}
 B3=${EXL3_BOX3:-192.168.0.105}
-HTTP_PORT=${EXL3_HTTP_PORT:-8080}
+HTTP_PORT=${EXL3_HTTP_PORT:-1234}
 MASTER=29650
 CONTROL=29651
 
@@ -24,11 +24,18 @@ wait_loaded() {   # <host> <rank> <timeout_s>
     echo "  !! rank$r did not finish loading in ${t}s"; return 1
 }
 
+# Env overrides forwarded to the workers over ssh (ssh forwards nothing).
+FORWARD_ENV=""
+for v in EXL3_TP_MODEL_DIR EXL3_TP_SAFE_CTX EXL3_TP_CACHE_TOKENS EXL3_TP_DSPARK \
+         EXL3_TP_BUDGETS ODL_RCCL_LOCAL_IP ODL_RCCL_PEERS; do
+    [ -n "${!v:-}" ] && FORWARD_ENV+="$v=${!v} "
+done
+
 start_worker() {   # <host> <rank>
     ssh -o BatchMode=yes -o ConnectTimeout=10 "$1" \
         "cd $ROOT/src/exllamav3-dsv41f 2>/dev/null; \
          mkdir -p $LOG; \
-         nohup $ROOT/tools/ds41/tp3_worker.sh $2 $MASTER $CONTROL >> $LOG/tp3-rank$2.log 2>&1 \
+         nohup env $FORWARD_ENV $ROOT/tools/ds41/tp3_worker.sh $2 $MASTER $CONTROL >> $LOG/tp3-rank$2.log 2>&1 \
            < /dev/null & echo \$! > $LOG/tp3-rank$2.pid; \
          sleep 1; kill -0 \$(cat $LOG/tp3-rank$2.pid) 2>/dev/null && echo started || tail -3 $LOG/tp3-rank$2.log"
 }
