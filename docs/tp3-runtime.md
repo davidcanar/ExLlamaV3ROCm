@@ -1,0 +1,62 @@
+# TP=3 runtime (tp3_*) — state and the current blocker
+
+The 3-node control plane is built and verified; the model kernels are not yet
+world-size-3 capable. This note records both, so the next step is unambiguous.
+
+## What exists (tools/ds41/, the 2-node stack untouched)
+
+| File | Role |
+|---|---|
+| `tp3_channel.py` | `MultiControlChannel`: same surface as `ControlChannel` (`send`/`recv`/`request`/`request_with_blobs`/`set_recv_timeout`/`close`) fanned out over N-1 workers. **Send-to-all then recv-from-all** — a worker reply only arrives after its model call finished, and that call contains RCCL collectives, so sending to worker 2 after worker 1 replied would deadlock both. Replies are compared modulo the `rank` field; divergence raises `WorkerDiverged`. |
+| `tp3_serve.py` | `tp_serve.py` with the single rank-1 channel replaced by the multi-channel plus per-worker handshake verification. HTTP layer, args and `TPEngine` are reused verbatim. |
+| `tp3_worker.py` | `tp_rank1.py` accepting any rank >= 1 (Box2 = rank 1, Box3 = rank 2). `tp_engine.Rank1Worker` is already rank-agnostic. |
+| `tp3_worker.sh` | Per-rank worker env: world 3, LAN bootstrap/control (the 10.0.2.x mesh is point-to-point so one master address is not reachable from every box), both OdinLink cables visible with `ODL_RCCL_PEERS` per-peer routing, `EXL3_TP_ODL_AR2=0` (the odl_ar2 decode path is 2-party). |
+| `tp3_serve.sh` | Rank-0 env: HTTP head node, 2K context/first light. |
+| `tp3_start.sh` | Orchestrator (start/stop/status/logs) with a **load gate**: rank 0 must not start until every worker logged its model load, because rank 0's load performs the world-3 NCCL warmup that the workers block in. |
+
+## Verified working (fabric + control plane)
+
+- world-3 NCCL communicator + warmup across all three boxes over OdinLink
+  (`NCCL init: world_size 3` / `Finished NCCL warmup`).
+- Both workers connect, handshake and are verified by rank 0
+  (`tp3-serve: 2 worker(s) connected and verified`).
+- Symmetric 3-way load: budgets `[95, 100, 100]` GiB, each rank ~50 GiB free
+  after loading, engram overrides applied on every rank.
+
+## Blocker: kernels assume power-of-two per-rank shards
+
+First op after the handshake dies inside Triton on the worker:
+
+```
+offs_h = hgrp * HP + tl.arange(0, HP)
+arange's range must be a power of 2
+```
+
+At world_size 3 the per-rank head partition `HP` is not a power of two (2 ranks
+split evenly and stay power-of-two), and `tl.arange` requires a power-of-2
+range. The kernels that index sharded dims with `tl.arange(0, HP)` need to pad
+to `next_pow2(HP)` and mask the tail (or use a masked/`tl.arange(0, BLOCK)`
+form with `mask = offs < HP`).
+
+Options, in increasing cost:
+
+1. **TP=4 instead of 3** (4 boxes, or 3 boxes + ... not possible) — keeps every
+   per-rank dim a power of two. A 4th box makes this a config change.
+2. **Fix the sharded kernels** to accept non-power-of-2 tail blocks (pad +
+   mask): the honest fix, but it touches the attention/indexer/mHC kernels and
+   needs numerics checks against the 2-node baseline.
+3. **TP=2 for the model on Box1+Box2** and use Box3 for something else
+   (prefix/disk tier, second model, Engram host) — no kernel work, but no
+   TP=3 either.
+
+Until one of these lands, `tp3_*` is correct but cannot serve: the fabric is
+proven at 3 ranks, the model math is not.
+
+## Publishing / operational notes
+
+- The 2-node stack (`tp_serve.py`, `tp_rank1.py`, `exl3ds4.sh`) is untouched
+  and remains the supported path.
+- Per-boot OdinLink device mapping must be re-derived after any `odl_tb5`
+  reload (`odinlink-multilink/docs/RUNBOOK.md`).
+- 3.5bpw checkpoint (~237 GiB) is downloading on Box2; Box1 was freed by moving
+  the 178 GiB GLM checkpoint to Box2 (verified) and deleting the Box1 copy.
