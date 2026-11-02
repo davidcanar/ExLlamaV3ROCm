@@ -439,6 +439,15 @@ class ControlChannel:
         self.log = log or (lambda message: None)
         self.lock = threading.RLock()
         self._closed = False
+        # Control frames are small and latency-critical (a decode step or spec round cannot start
+        # on the workers before its frame lands), and the workers never send data back between
+        # frames: with Nagle on, a frame sent while the previous one is still unacknowledged
+        # waits for the peer's delayed ACK (>= 40 ms on Linux) -- e.g. the round frame that
+        # follows an accept frame by one ~13 ms draft. Not a TCP socket (tests): ignored.
+        try:
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except (OSError, AttributeError):
+            pass
         try:
             self.peer = f"{conn.getpeername()[0]}:{conn.getpeername()[1]}"
         except OSError:
@@ -749,15 +758,22 @@ class TPModelBackend:
         log(f"tp: rank {rank} cache {cache_tokens} tokens ({cache_tokens // PAGE_SIZE} pages of "
             f"{PAGE_SIZE}); prefill chunks at {span} rows; block tables sized to the cache")
         started = time.time()
+        # EXL3_TP_MOE_TENSOR_SPLIT=1 (every rank): split each routed expert's intermediate width
+        # across the ranks instead of giving each rank a range of whole experts. Every rank then
+        # runs all of a token's experts at 1/N width, so decode no longer waits on whichever rank
+        # the router happened to pick most experts from (expert parallelism: max-of-N imbalance)
+        tp_options = {"moe_tensor_split": True} if env_truthy("EXL3_TP_MOE_TENSOR_SPLIT", False) else None
         model.load(
             tensor_p=True,
             tp_backend="nccl",
             use_per_device=use,
             max_chunk_size=span,
             progressbar=progress,
+            tp_options=tp_options,
         )
         log(f"tp: rank {rank} cached TP load completed in {time.time() - started:.1f} s "
-            f"(budgets {use} GiB, dspark {'on' if dspark else 'off'})")
+            f"(budgets {use} GiB, dspark {'on' if dspark else 'off'}"
+            f"{', MoE tensor split' if tp_options else ''})")
         check_memory_floor("after the TP load", rank=rank, floor_gib=floor_gib, log=log)
 
         # ---- rank 0 only: the DSpark drafter, loaded beside the TP trunk (as the script) ----
