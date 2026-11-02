@@ -253,3 +253,27 @@ Verified: 2-rank and 3-rank all-reduce `exact=True` (repeat runs), zero
 transfers failed, fabric healthy afterwards. `ODL_RCCL_DEVICES` pinning is no
 longer needed (and should stay unset so all cables are visible).
 
+
+## OPEN: rccl3_allreduce microbenchmark hangs at 3 ranks (regression)
+
+`support/rccl3_run.sh` passed 3×/3 at 3 ranks on 2026-11-01 (23:37–23:47, 4 MiB,
+`exact=True`, all rc=0) and has hung on every attempt on 2026-11-02, at 10 KiB,
+64 KiB and 4 MiB, with and without `odl_trace_rx`, `NCCL_MAX_NCHANNELS=1`,
+and after an `odl_tb5` reload on Box3. The same boxes, plugin and driver pass:
+
+- `support/../r2` 2-rank allreduce (11.7 us @ 4 MiB) — every time
+- the **TP=3 model server** end to end: 2.9bpw and 3.5bpw, 2K→512K ctx,
+  DSpark 27.3 tok/s, needle-correct at 38K tokens
+
+so the fabric and the negotiated plugin are healthy for the real workload; the
+failure is specific to torch.distributed's 3-rank communicator shape.
+
+Signature (per-box plugin traces, `ODL_DEBUG=1`, saved in
+`odl-multi/debug-3rank-1110/`): asymmetric per-pair channel counts
+(box1: 2 connects →Box2, 4 →Box3; box3: 4 →Box1, 4 →Box2), hellos/grants all
+complete with zero drops, then data completes on a subset of channels
+(xfer DONE 4/12/16 per box) and NCCL's watchdog aborts. No kernel-level drops.
+Suspects: listener-tag (lidx) collisions across the two peers' handle exchanges
+(lidx is a per-process counter; two boxes can present the same lidx to a third),
+or a channel-count mismatch in connect/accept pairing that the model runtime's
+fixed channel pattern never triggers.

@@ -45,7 +45,7 @@ def main() -> int:
               file=sys.stderr, flush=True)
 
     # 2. throughput/latency probe at a collective-relevant size
-    nbytes = 4 * 1024 * 1024
+    nbytes = int(os.environ.get("RCCL3_BYTES", 4 * 1024 * 1024))
     buf = torch.ones(nbytes // 4, dtype=torch.float32, device=dev)
     for _ in range(3):                      # warm up the plugin/link
         dist.all_reduce(buf, op=dist.ReduceOp.SUM)
@@ -60,8 +60,8 @@ def main() -> int:
     if rank == 0:
         # all-reduce moves ~2*(world-1)/world of the buffer per rank
         eff_gbs = (nbytes * 2.0 * (world - 1) / world) / per / 1e9
-        print(f"WORLD={world} exact={exact} "
-              f"4MiB_allreduce={per*1e3:.2f} ms  eff={eff_gbs:.2f} GB/s "
+        print(f"WORLD={world} exact={exact} bytes={nbytes} "
+              f"allreduce={per*1e6:.1f} us  eff={eff_gbs:.2f} GB/s "
               f"stats_present={stats_present()}", flush=True)
 
     dist.destroy_process_group()
