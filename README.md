@@ -217,9 +217,10 @@ exl3ds4.sh             controller: start | stop | restart | status | logs
 tools/ds41/            the OpenAI server and the two-rank engine (+ CPU tests)
   tp_sessions.py       shared-pool conversation slots and prefix auto-matching
   tp_disk.py           per-rank NVMe image store for spilled conversations
-patches/exllamav3/     12 ExLlamaV3 commits (git am) on PR #449
+patches/exllamav3/     14 ExLlamaV3 commits (git am) on PR #449
 patches/odinlink/      3 OdinLink-Five diffs (git apply): multi-frame, device allow-list, RX/teardown fixes
 odl_ar2/               OdinLink all-reduce used for decode
+odl_ar3/               OdinLink mesh all-reduce used for TP=3 decode
 perf/                  benchmarks, profiler, correctness checks
 scripts/               build, launchers, smoke tests, model sync
 docs/                  PERFORMANCE.md, DEVELOPMENT.md

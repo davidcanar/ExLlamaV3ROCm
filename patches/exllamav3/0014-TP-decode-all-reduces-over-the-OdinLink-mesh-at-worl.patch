@@ -1,0 +1,233 @@
+From 25cd9a2d9769f17fa7cd21088d72cf345da9d6cb Mon Sep 17 00:00:00 2001
+From: David Canar <davidcanar@gmail.com>
+Date: Mon, 2 Nov 2026 13:07:02 -0700
+Subject: [PATCH] TP: decode all-reduces over the OdinLink mesh at world size
+ >= 3 (odl_ar3)
+
+At world size 3 every decode all-reduce went through 3-rank RCCL over the
+ODL_TB5 net plugin: a ring of 2(N-1) = 4 network steps followed by a host
+stream sync, ~170 us per 10 KB op and 80 ops per token. With
+EXL3_TP_ODL_AR3=1 the backend routes the all-reduces whose bf16 wire payload
+fits the driver's 64 KiB latency path through libodl_ar3.so
+(model_tp_odl.OdlAllReduceMesh): every rank sends its whole contribution to
+every peer over the direct cable to that peer (the 3-box mesh is a triangle)
+and sums all N contributions in canonical rank order, so the reduced tensors
+stay bit-identical on every rank. One network hop, stream-ordered
+([stage + doorbell] -> [wait + sum]), no host sync: ~40 us per 10 KB op,
+~90 us per 60 KB op (6-row verify).
+
+Cables are matched to peers by a ping at start-up, so no per-boot device map
+is needed. Setup is collective and all-or-nothing: every world >= 3 rank
+joins the agreement step, also with the flag off, so a rank whose
+environment differs makes all ranks fall back to RCCL instead of leaving the
+others waiting. Lost messages (RX CRC drops on the raw DMA path) are
+recovered: each message carries its round number, a receiver NACKs a round
+on a gap or after ODL3_NACK_US, and the sender resends it from its slot
+(3 slots: a slot is provably not reused before every peer has its round).
+
+DeepSeek-V4.1-Flash 3.5bpw, TP=3, 2K context, greedy: plain decode 57.6 ->
+46.8 ms/token (17.2 -> 21.4 tok/s), DSpark 23.0 -> 30.2 tok/s. Greedy plain
+output is byte-identical to the RCCL path. Prefill-sized collectives stay on
+RCCL; EXL3_TP_ODL_AR3_BIG=1 enables an experimental mesh reduce-scatter +
+all-gather that is correct but slower than RCCL today.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ exllamav3/model/model_tp_backend.py |   8 ++
+ exllamav3/model/model_tp_odl.py     | 157 ++++++++++++++++++++++++++++
+ 2 files changed, 165 insertions(+)
+
+diff --git a/exllamav3/model/model_tp_backend.py b/exllamav3/model/model_tp_backend.py
+index 2e3e8011..c56e1fac 100644
+--- a/exllamav3/model/model_tp_backend.py
++++ b/exllamav3/model/model_tp_backend.py
+@@ -37,6 +37,9 @@ _gather_chunk_bytes = int(os.environ.get("EXL3_TP_GATHER_CHUNK_BYTES", str(64 *
+ # Cross-host decode all-reduces over OdinLink streams instead of RCCL (model_tp_odl.py): stream-
+ # ordered, so those ops need no host sync; larger collectives stay on RCCL
+ _odl_ar2 = os.environ.get("EXL3_TP_ODL_AR2", "0") != "0"
++# World size >= 3: decode all-reduces over the OdinLink mesh (one hop to every peer over its own cable,
++# model_tp_odl.OdlAllReduceMesh); stream-ordered like odl_ar2, falls back to RCCL collectively
++_odl_ar3 = os.environ.get("EXL3_TP_ODL_AR3", "0") != "0"
+ # 17 slots (16 devices + accumulator) x 2MB: 8 ring stages of the 256KB reduce chunk size
+ SHBUF_SIZE_R = 17 * 8 * 256 * 1024
+ SHBUF_SIZE_S = 16 * 1024
+@@ -151,6 +154,11 @@ class TPBackendNCCL:
+             self.odl = OdlAllReduce(self.rank, fp32_wire = _nccl_fp32)
+             print(f" -- odl_ar2: rank {self.rank} decode all-reduces over OdinLink streams "
+                   f"(<= {self.odl.max_wire} wire bytes)", flush = True)
++        elif cross_host and self.world_size >= 3:
++            # Collective on every rank (also with EXL3_TP_ODL_AR3=0): all ranks enable it or none
++            from .model_tp_odl import OdlAllReduceMesh
++            self.odl = OdlAllReduceMesh.create(self.rank, self.world_size, device, fp32_wire = _nccl_fp32,
++                                               enabled = _odl_ar3)
+         if not cross_host:
+             self.fallback = TPBackendNative(
+                 device,
+diff --git a/exllamav3/model/model_tp_odl.py b/exllamav3/model/model_tp_odl.py
+index e9d9facd..b7b2ad8a 100644
+--- a/exllamav3/model/model_tp_odl.py
++++ b/exllamav3/model/model_tp_odl.py
+@@ -80,3 +80,160 @@ class OdlAllReduce:
+         if self.lib is not None:
+             self.lib.odl2_shutdown()
+             self.lib = None
++
++_DEFAULT_LIB3 = os.path.expanduser("~/exl3ds4/odl_ar3/libodl_ar3.so")
++
++
++class OdlAllReduceMesh:
++    """
++    OdinLink decode all-reduce for cross-host TP at world size >= 3 (libodl_ar3.so,
++    ~/exl3ds4/odl_ar3): the 3-box mesh is a triangle of point-to-point cables, so every rank
++    sends its whole contribution to every peer over the cable to that peer and sums all N
++    contributions in rank order -- one network hop instead of RCCL's 2(N-1) ring steps, fully
++    stream-ordered (no host sync), bit-identical on every rank.
++
++    The cable -> peer map is discovered at start-up by a ping on every cable (no per-boot device
++    map). Setup is collective and all-or-nothing: if any rank fails to open its cables or to
++    find every peer, every rank closes its side and returns None, and the backend keeps using
++    RCCL for everything.
++
++    env: EXL3_TP_ODL_AR3=1 enables it (every rank), EXL3_TP_ODL_AR3_MAX (largest wire payload in
++    bytes routed here, default 64 KiB: the driver's latency path), EXL3_TP_ODL_AR3_LIB (library),
++    ODL3_SID (stream id used on every cable, default 243), ODL3_HOT_US (progress-thread hot-spin
++    window, default 50000), ODL3_DEVS (restrict to these /dev/odl_tb5_N, default all).
++    """
++
++    def __init__(self, lib, rank: int, world: int, fp32_wire: bool, big: bool = False):
++        self.lib = lib
++        self.rank = rank
++        self.world = world
++        self.fp32_wire = fp32_wire
++        self.max_wire = min(int(lib.odl3_max_bytes()), int(os.environ.get("EXL3_TP_ODL_AR3_MAX", str(64 * 1024))))
++        # big path (EXL3_TP_ODL_AR3_BIG=1): prefill-sized fp32 all-reduces as a mesh reduce-scatter +
++        # all-gather over every cable at once, stream-ordered; fp32 tensors only (bf16 wire)
++        self.big = bool(big) and not fp32_wire
++        self.big_max = int(lib.odl3_big_max_elems()) if self.big else 0
++        self.ops = 0
++        self.big_ops = 0
++
++    @classmethod
++    def create(cls, rank: int, world: int, device: int, fp32_wire: bool = False, enabled: bool = True):
++        """Collective: EVERY cross-host rank of a world >= 3 group calls this at backend init, also
++        with enabled = False (EXL3_TP_ODL_AR3=0 on that box), so a rank whose environment differs
++        makes all ranks fall back to RCCL together instead of leaving the others waiting in the
++        setup barrier"""
++        import torch.distributed as dist
++
++        def agree(ok: bool) -> bool:
++            t = torch.tensor([1 if ok else 0], dtype = torch.int32, device = device)
++            dist.all_reduce(t, op = dist.ReduceOp.MIN)
++            return bool(int(t.item()))
++
++        if not enabled:
++            if not agree(False):
++                return None
++            raise RuntimeError("odl_ar3: agreement logic error")
++        lib = None
++        ok = True
++        want_big = os.environ.get("EXL3_TP_ODL_AR3_BIG", "0") != "0"
++        if want_big:
++            os.environ["ODL3_BIG"] = "1"          # read by odl3_open: opens the big-path streams too
++        try:
++            lib = ctypes.CDLL(os.environ.get("EXL3_TP_ODL_AR3_LIB", _DEFAULT_LIB3))
++            lib.odl3_open.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
++            lib.odl3_open.restype = ctypes.c_int
++            lib.odl3_handshake.argtypes = [ctypes.c_int]
++            lib.odl3_handshake.restype = ctypes.c_int
++            lib.odl3_start.restype = ctypes.c_int
++            lib.odl3_enqueue.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int]
++            lib.odl3_enqueue.restype = ctypes.c_int
++            lib.odl3_last_error.restype = ctypes.c_int
++            lib.odl3_max_bytes.restype = ctypes.c_uint32
++            lib.odl3_num_devs.restype = ctypes.c_int
++            lib.odl3_peer_rank_of_dev.argtypes = [ctypes.c_int]
++            lib.odl3_peer_rank_of_dev.restype = ctypes.c_int
++            lib.odl3_dev_index.argtypes = [ctypes.c_int]
++            lib.odl3_dev_index.restype = ctypes.c_int
++            lib.odl3_shutdown.restype = None
++            lib.odl3_enqueue_big.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int]
++            lib.odl3_enqueue_big.restype = ctypes.c_int
++            lib.odl3_big_ready.restype = ctypes.c_int
++            lib.odl3_big_max_elems.restype = ctypes.c_uint64
++            ok = lib.odl3_open(int(rank), int(world), 15000) >= world - 1
++        except OSError as e:
++            print(f" -- odl_ar3: rank {rank} cannot load the library ({e})", flush = True)
++            ok = False
++        # Barrier 1: every rank has its cable streams open before anyone pings (the driver drops
++        # messages for streams that are not open yet)
++        if not agree(ok):
++            if lib is not None:
++                lib.odl3_shutdown()
++            print(f" -- odl_ar3: rank {rank}: setup failed or EXL3_TP_ODL_AR3 is off on some rank; "
++                  f"decode all-reduces stay on RCCL", flush = True)
++            return None
++        ok = lib.odl3_handshake(10000) == 0
++        # Barrier 2: every ping has been consumed, so message k on each cable is round k
++        if not agree(ok):
++            lib.odl3_shutdown()
++            print(f" -- odl_ar3: rank {rank} peer handshake failed on some rank; decode all-reduces stay on RCCL", flush = True)
++            return None
++        ok = lib.odl3_start() == 0
++        if not agree(ok):
++            lib.odl3_shutdown()
++            return None
++        # every rank must route the same tensors the same way: big path only if all ranks have it
++        big = agree(want_big and bool(lib.odl3_big_ready()))
++        peers = ", ".join(f"rank {lib.odl3_peer_rank_of_dev(i)} on /dev/odl_tb5_{lib.odl3_dev_index(i)}"
++                          for i in range(lib.odl3_num_devs()) if lib.odl3_peer_rank_of_dev(i) >= 0)
++        self = cls(lib, rank, world, fp32_wire, big = big)
++        print(f" -- odl_ar3: rank {rank} decode all-reduces over the OdinLink mesh ({peers}; "
++              f"<= {self.max_wire} wire bytes)"
++              + (f"; prefill all-reduces as mesh reduce-scatter + all-gather (<= {self.big_max} fp32 elements)"
++                 if self.big else ""), flush = True)
++        return self
++
++    def _dtype(self, t: torch.Tensor):
++        if t.dtype == torch.float32:
++            return (_DT_FP32, 4) if self.fp32_wire else (_DT_FP32_BF16WIRE, 2)
++        if t.dtype == torch.bfloat16:
++            return _DT_BF16, 2
++        if t.dtype == torch.float16:
++            return _DT_FP16, 2
++        return None, 0
++
++    def try_all_reduce_(self, t: torch.Tensor) -> bool:
++        """In-place SUM all-reduce of t when it fits the latency path; False = caller uses RCCL.
++        Every rank sees the same shapes in the same order, so they always take the same route."""
++        if not (t.is_cuda and t.is_contiguous()):
++            return False
++        code, wire_elt = self._dtype(t)
++        if code is None:
++            return False
++        if t.numel() * wire_elt > self.max_wire:
++            if not (self.big and code == _DT_FP32_BF16WIRE and t.numel() <= self.big_max):
++                return False
++            if self.lib.odl3_last_error():
++                raise RuntimeError("odl_ar3: transport error latched by a previous all-reduce "
++                                   "(peer gone or link down); restart all ranks")
++            stream = torch.cuda.current_stream(t.device).cuda_stream
++            rc = self.lib.odl3_enqueue_big(ctypes.c_void_p(stream), ctypes.c_void_p(t.data_ptr()),
++                                           ctypes.c_void_p(t.data_ptr()), t.numel() * t.element_size(), code)
++            if rc != 0:
++                raise RuntimeError(f"odl_ar3: big enqueue failed ({rc})")
++            self.big_ops += 1
++            return True
++        if self.lib.odl3_last_error():
++            raise RuntimeError("odl_ar3: transport error latched by a previous all-reduce "
++                               "(peer gone or link down); restart all ranks")
++        stream = torch.cuda.current_stream(t.device).cuda_stream
++        rc = self.lib.odl3_enqueue(ctypes.c_void_p(stream), ctypes.c_void_p(t.data_ptr()),
++                                   ctypes.c_void_p(t.data_ptr()), t.numel() * t.element_size(), code)
++        if rc != 0:
++            raise RuntimeError(f"odl_ar3: enqueue failed ({rc})")
++        self.ops += 1
++        return True
++
++    def close(self):
++        if self.lib is not None:
++            self.lib.odl3_shutdown()
++            self.lib = None
+-- 
+2.54.0
+

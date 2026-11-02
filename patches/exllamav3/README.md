@@ -1,13 +1,15 @@
 # patches/exllamav3 — the `multi-node-rocm` branch of ExLlamaV3
 
-Twelve commits on top of the PR #449 (`dsv41f`) base of ExLlamaV3 that add the
+Fourteen commits on top of the PR #449 (`dsv41f`) base of ExLlamaV3 that add the
 cross-host tensor-parallel runtime this deployment runs on and its decode
 performance work. Generated with:
 
     git format-patch d45e8961..multi-node-rocm
 
 (`0008`–`0011` were exported with `git format-patch --start-number 8
-0e259659..multi-node-rocm`, `0012` with `git format-patch -1 63776921`.)
+0e259659..multi-node-rocm`, `0012` with `git format-patch -1 63776921`, `0014` with `git format-patch -1
+25cd9a2d --start-number 14`; `0013` is the diff of publish commit `faa86f1` with its
+mail header, so `git am` takes the whole series.)
 
 Upstream / base:
 
@@ -38,6 +40,10 @@ Commits (in order):
 12. `0012` RDNA MoE decode: expert-range shards (TP) and the 6-row scratch
     (TP ranks take the RDNA decode kernels instead of the cooperative ones;
     `EXL3_ROCM_MOE_DECODE_RANGE=0` reverts; rebuild the extension)
+13. `0013` TP3: power-of-two attention group split (`pow2_units`; heads
+    32/16/16 at world 3, unchanged at world 2)
+14. `0014` TP: decode all-reduces over the OdinLink mesh at world size >= 3
+    (odl_ar3; needs `odl_ar3/libodl_ar3.so`, enabled by `EXL3_TP_ODL_AR3=1`)
 
 Apply with `git am` to preserve authorship and commit identity:
 

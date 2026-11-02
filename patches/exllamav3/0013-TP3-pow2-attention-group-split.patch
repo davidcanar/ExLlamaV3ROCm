@@ -1,3 +1,18 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: David Canar <davidcanar@gmail.com>
+Date: Mon, 2 Nov 2026 08:29:23 -0700
+Subject: [PATCH] TP3: power-of-two attention group split (2b-uneven)
+
+TPAllocation gains pow2_units; the allocator snaps such components to the
+most-even power-of-two per-rank channel split (_pow2_split), largest share to
+the rank with most remaining memory. DSV4 attention sets the flag: at world 3
+its 8 o-groups split 4/2/2 = heads 32/16/16 instead of the ratio split's
+16/24/24 (24 is not a power of two and the Triton kernels reject it). World 2
+is unaffected (4/4, identical to the ratio split), no heads are padded, no
+kernel changes.
+
+Signed-off-by: David Canar <davidcanar@gmail.com>
+---
 diff --git a/exllamav3/model/model_tp_alloc.py b/exllamav3/model/model_tp_alloc.py
 index f58b2ccd..68dd7cef 100644
 --- a/exllamav3/model/model_tp_alloc.py

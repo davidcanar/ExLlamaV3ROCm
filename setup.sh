@@ -19,7 +19,8 @@
 #      configures cmake and builds the userspace library + RCCL v7 plugin
 #      (the kernel module needs root and is NOT built here — instructions
 #      are printed at the end), then builds odl_ar2/libodl_ar2.so, the
-#      OdinLink decode all-reduce the TP backend uses (EXL3_TP_ODL_AR2)
+#      OdinLink decode all-reduce the TP backend uses (EXL3_TP_ODL_AR2), and
+#      odl_ar3/libodl_ar3.so, its TP=3 mesh version (EXL3_TP_ODL_AR3)
 #   6. builds the native ExLlamaV3 extension for gfx1151 and runs the GPU
 #      smoke test (scripts/build_exllamav3.sh)
 #   7. with --model (default): downloads the EXL3 quant to model/ and the
@@ -209,6 +210,12 @@ if (( DO_ODL )); then
     else
         log "building odl_ar2 (decode all-reduce over the OdinLink stream API; hipcc from the venv)"
         EXL3_ODL_SRC="$EXL3_ODL_SRC" EXL3_ODL_BUILD="$EXL3_ODL_BUILD" bash "$ROOT/odl_ar2/build.sh"
+    fi
+    if [[ -f "$ROOT/odl_ar3/libodl_ar3.so" ]]; then
+        log "odl_ar3 already built ($ROOT/odl_ar3/libodl_ar3.so)"
+    else
+        log "building odl_ar3 (TP=3 mesh decode all-reduce over the OdinLink stream API; hipcc from the venv)"
+        EXL3_ODL_SRC="$EXL3_ODL_SRC" EXL3_ODL_BUILD="$EXL3_ODL_BUILD" bash "$ROOT/odl_ar3/build.sh"
     fi
     cat <<EOF
 
