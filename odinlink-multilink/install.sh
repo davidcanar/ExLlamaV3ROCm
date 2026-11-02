@@ -36,7 +36,7 @@ echo "== patched thunderbolt core → /lib/modules/$KVER/updates =="
 install -d -m 0755 "/lib/modules/$KVER/updates/thunderbolt"
 install -m 0644 "$OUT/thunderbolt.ko" "/lib/modules/$KVER/updates/thunderbolt/thunderbolt.ko"
 depmod -a "$KVER"
-resolved=$(modinfo -F filename thunderbolt 2>/dev/null || true)
+resolved=$(modinfo -k "$KVER" -F filename thunderbolt 2>/dev/null || true)
 echo "   modprobe thunderbolt → ${resolved:-<unresolved>}"
 case "$resolved" in
   /lib/modules/$KVER/updates/thunderbolt/thunderbolt.ko) ;;
