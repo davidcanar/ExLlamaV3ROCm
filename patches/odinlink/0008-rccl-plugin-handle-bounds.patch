@@ -1,0 +1,26 @@
+diff --git a/rccl/src/odl_tb5_plugin.c b/rccl/src/odl_tb5_plugin.c
+index 5df9ee2..8eacc5d 100644
+--- a/rccl/src/odl_tb5_plugin.c
++++ b/rccl/src/odl_tb5_plugin.c
+@@ -277,7 +277,8 @@ static inline int odl_dev_of(int dev)
+  * (RCCL's device index is used), so 2-node deployments need no changes.
+  */
+ #define ODL_HANDLE_ID_MARK 0xA5   /* marks a handle carrying a peer IPv4 */
+-#define ODL_HANDLE_IP_OFF  12     /* after stream_id(1) + "odl_tb5_N\0" */
++#define ODL_HANDLE_HWID_MAX 10    /* bytes 1..10: "odl_tb5_N", NUL padded */
++#define ODL_HANDLE_IP_OFF  12     /* after hw_id and the marker byte */
+ 
+ static uint32_t odl_local_ip(void)
+ {
+@@ -518,7 +519,10 @@ static rcclResult_t odl_tb5_listen(int dev, void *handle, void **listenComm)
+ 
+ 		memset(handle, 0, 64);
+ 		((uint8_t *)handle)[0] = lh->stream_id;
+-		memcpy((uint8_t *)handle + 1, lh->hw_id, sizeof(lh->hw_id));
++		/* Bounded copy: handle is exactly 64 bytes and the id starts at
++		 * offset 1, so copying sizeof(hw_id) (64) writes one byte past
++		 * the end -- over whatever NCCL keeps after the handle. */
++		memcpy((uint8_t *)handle + 1, lh->hw_id, ODL_HANDLE_HWID_MAX);
+ 		/* Identity of the link this listener sits on, so a peer with
+ 		 * several cables can pick the one that reaches us. Written in
+ 		 * the space after hw_id; old peers ignore it. */
