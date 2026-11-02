@@ -1,0 +1,174 @@
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+index 7204586..b30cf7d 100644
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -388,2 +388,36 @@ void tb_unregister_protocol_handler(struct tb_protocol_handler *handler);
+ 
++/**
++ * struct tb_protocol_handler_xd - Source-XDomain aware protocol handler
++ * @base: Stock handler fields. Only @uuid, @data and @list are used; the
++ *	  legacy @callback field is ignored (callback_xd replaces it).
++ * @callback_xd: Like the legacy callback, but also receives the source
++ *		 XDomain resolved from the packet route in the receiving
++ *		 controller's own domain. Protocols that can have more than
++ *		 one peer must dispatch this way: two point-to-point links
++ *		 put the peers at the SAME route string in their respective
++ *		 domains, so a route-blind handler cannot tell which
++ *		 controller a packet arrived on.
++ * @owner: Optional module owning the callback. If set, the XDomain core
++ *	   pins it while dispatching so an unload cannot race a callback.
++ *
++ * This is a SEPARATE registration API rather than extra fields in
++ * struct tb_protocol_handler on purpose: tb_protocol_handler is embedded in
++ * other drivers' private structures (thunderbolt_net embeds it in struct
++ * tbnet), so changing its layout silently corrupts every handler compiled
++ * against the stock header -- the prebuilt in-tree thunderbolt_net most of
++ * all. Keeping the stock layout and the stock dispatch path intact means
++ * those drivers keep working unmodified.
++ */
++#define TB_PROTOCOL_HANDLER_HAS_XDOMAIN 1
++struct module;
++struct tb_protocol_handler_xd {
++	struct tb_protocol_handler base;
++	int (*callback_xd)(struct tb_xdomain *xd, const void *buf, size_t size,
++			   void *data);
++	struct module *owner;
++};
++
++int tb_register_protocol_handler_xd(struct tb_protocol_handler_xd *handler);
++void tb_unregister_protocol_handler_xd(struct tb_protocol_handler_xd *handler);
++
+ /**
+diff --git a/thunderbolt/xdomain.c b/thunderbolt/xdomain.c
+index 55f91ea..3a3f27e 100644
+--- a/thunderbolt/xdomain.c
++++ b/thunderbolt/xdomain.c
+@@ -79,2 +79,12 @@ static LIST_HEAD(protocol_handlers);
+ 
++/* Source-XDomain aware handlers (separate list so struct tb_protocol_handler
++ * keeps its stock layout for prebuilt consumers such as thunderbolt_net). */
++static LIST_HEAD(protocol_handlers_xd);
++
++/* In-flight protocol dispatches, drained on unregister: the dispatcher drops
++ * xdomain_lock around each callback, so without this an unregister can return
++ * while a dispatch that selected the handler is still running. */
++static atomic_t protocol_dispatch_active = ATOMIC_INIT(0);
++static DECLARE_WAIT_QUEUE_HEAD(protocol_dispatch_wait);
++
+ /* UUID for XDomain discovery protocol: b638d70e-42ff-40bb-97c2-90e2c0b2ff07 */
+@@ -649,2 +659,5 @@ void tb_unregister_protocol_handler(struct tb_protocol_handler *handler)
+ 	mutex_unlock(&xdomain_lock);
++
++	wait_event(protocol_dispatch_wait,
++		   !atomic_read(&protocol_dispatch_active));
+ }
+@@ -652,2 +665,46 @@ EXPORT_SYMBOL_GPL(tb_unregister_protocol_handler);
+ 
++/**
++ * tb_register_protocol_handler_xd() - Register a source-XDomain handler
++ * @handler: Handler to register
++ *
++ * Same as tb_register_protocol_handler(), but the callback also receives the
++ * source XDomain of the packet. This is what makes more than one
++ * point-to-point peer distinguishable: both peers report the same route
++ * string in their own domain, so the route alone is ambiguous.
++ *
++ * Return: %0 on success, negative errno otherwise.
++ */
++int tb_register_protocol_handler_xd(struct tb_protocol_handler_xd *handler)
++{
++	if (!handler->base.uuid || !handler->callback_xd)
++		return -EINVAL;
++	if (uuid_equal(handler->base.uuid, &tb_xdp_uuid))
++		return -EINVAL;
++
++	mutex_lock(&xdomain_lock);
++	list_add_tail(&handler->base.list, &protocol_handlers_xd);
++	mutex_unlock(&xdomain_lock);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(tb_register_protocol_handler_xd);
++
++/**
++ * tb_unregister_protocol_handler_xd() - Unregister a source-XDomain handler
++ * @handler: Handler to unregister
++ *
++ * Does not return until dispatches that may still run @handler have finished,
++ * so the caller can free handler-owned data immediately afterwards.
++ */
++void tb_unregister_protocol_handler_xd(struct tb_protocol_handler_xd *handler)
++{
++	mutex_lock(&xdomain_lock);
++	list_del_init(&handler->base.list);
++	mutex_unlock(&xdomain_lock);
++
++	wait_event(protocol_dispatch_wait,
++		   !atomic_read(&protocol_dispatch_active));
++}
++EXPORT_SYMBOL_GPL(tb_unregister_protocol_handler_xd);
++
+ static void update_property_block(struct tb_xdomain *xd)
+@@ -2457,4 +2514,7 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
+ 	const struct tb_protocol_handler *handler, *tmp;
++	const struct tb_protocol_handler_xd *hxd;
+ 	const struct tb_xdp_header *hdr = buf;
++	struct tb_xdomain *source_xd = NULL;
+ 	unsigned int length;
++	u64 route;
+ 	int ret = 0;
+@@ -2479,5 +2539,18 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
+ 
++	route = ((u64)hdr->xd_hdr.route_hi << 32 | hdr->xd_hdr.route_lo) &
++		~BIT_ULL(63);
++	/* Resolve the peer XDomain in the receiving controller's own domain:
++	 * point-to-point peers on separate controllers report the same route
++	 * string, and scoping the lookup to this tb tells them apart. */
++	source_xd = tb_xdomain_find_by_route_locked(tb, route);
++	atomic_inc(&protocol_dispatch_active);
++
++	/* Source-XDomain handlers first; stock handlers keep their exact
++	 * previous semantics and struct layout. */
+ 	mutex_lock(&xdomain_lock);
+-	list_for_each_entry_safe(handler, tmp, &protocol_handlers, list) {
+-		if (!uuid_equal(&hdr->uuid, handler->uuid))
++	list_for_each_entry(hxd, &protocol_handlers_xd, base.list) {
++		if (!uuid_equal(&hdr->uuid, hxd->base.uuid))
++			continue;
++
++		if (hxd->owner && !try_module_get(hxd->owner))
+ 			continue;
+@@ -2485,5 +2558,8 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
+ 		mutex_unlock(&xdomain_lock);
+-		ret = handler->callback(buf, size, handler->data);
++		ret = hxd->callback_xd(source_xd, buf, size, hxd->base.data);
+ 		mutex_lock(&xdomain_lock);
+ 
++		if (hxd->owner)
++			module_put(hxd->owner);
++
+ 		if (ret)
+@@ -2493,2 +2569,23 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
+ 
++	if (!ret) {
++		mutex_lock(&xdomain_lock);
++		list_for_each_entry_safe(handler, tmp, &protocol_handlers, list) {
++			if (!uuid_equal(&hdr->uuid, handler->uuid))
++				continue;
++
++			mutex_unlock(&xdomain_lock);
++			ret = handler->callback(buf, size, handler->data);
++			mutex_lock(&xdomain_lock);
++
++			if (ret)
++				break;
++		}
++		mutex_unlock(&xdomain_lock);
++	}
++
++	if (atomic_dec_and_test(&protocol_dispatch_active))
++		wake_up_all(&protocol_dispatch_wait);
++
++	tb_xdomain_put(source_xd);
++
+ 	return ret > 0;

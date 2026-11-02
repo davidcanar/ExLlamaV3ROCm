@@ -78,5 +78,37 @@ License notes (from the upstream project):
   `librccl_net_odl_tb5.so`), `nccl/`, `cli/`, `daemon/`, `tray/`, `verbs/`:
   **MIT**. The plugin half of this patch applies to MIT code.
 
+
+`0004-odl-tb5-demux-by-source-xdomain.patch` and
+`0005-odl-tb5-bound-connect-retries.patch` add multi-link support on top of
+`0001`-`0003` (both apply cleanly at `4534f58` after the earlier three):
+
+- `0004` demuxes XDomain LOGIN/LOGOUT by **source XDomain** instead of by
+  route. Two point-to-point links put every peer at the same route string
+  (`X-2`), so a route-blind handler dispatches the second peer's login to the
+  wrong device and that link never completes. Uses
+  `tb_register_protocol_handler_xd()` when the core provides it and falls back
+  to the route handler otherwise, so a single-cable build against a stock
+  kernel still works. Upstream: Geramy/OdinLink-Five issue #35, PR #37.
+- `0005` bounds the connect-retry loop. A failed DMA path setup after a
+  successful login used to re-handshake once per second forever (the retry
+  counter only tracked failed *logins*); on Strix Halo that `tb_cfg_*` storm
+  takes the USB4 controller — and the GPU, sharing the power/firmware domain —
+  down. It also gives the `bind_any`/Mac-sink path a legal input HopID instead
+  of the hardcoded `1`, which is below `TB_PATH_MIN_HOPID` (8) and produced
+  `failed to allocate input HopID: -22`.
+
+Both require the kernel-side change in
+`patches/linux/0001-thunderbolt-source-xdomain-protocol-handlers.patch`.
+That patch adds a **separate** `struct tb_protocol_handler_xd` and registration
+API and deliberately leaves `struct tb_protocol_handler` byte-identical to
+mainline: the in-tree `thunderbolt_net` embeds that struct in its private data,
+so adding fields mid-struct corrupts `net->napi.state` and plugging a cable
+hangs the machine (`napi_enable` BUG under `rtnl_lock`).
+`odinlink-multilink/check-tb-handler-abi.sh` enforces the layout at build time.
+
+Bring-up, addressing scheme and verification:
+[`odinlink-multilink/docs/RUNBOOK.md`](../../odinlink-multilink/docs/RUNBOOK.md).
+
 Only this diff is redistributed here; the OdinLink-Five source itself is
 fetched from upstream by `setup.sh`. See the repository NOTICE.
