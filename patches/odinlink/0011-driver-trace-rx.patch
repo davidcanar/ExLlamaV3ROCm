@@ -1,0 +1,46 @@
+diff --git a/driver/odl_tb5_core.h b/driver/odl_tb5_core.h
+index 358c2d2..27e8e3c 100644
+--- a/driver/odl_tb5_core.h
++++ b/driver/odl_tb5_core.h
+@@ -609,6 +609,7 @@ extern unsigned int odl_busy_poll_us;
+ extern unsigned int odl_rx_asm_max;
+ extern unsigned int odl_rx_asm_pool;
+ extern int odl_max_devices;
++extern int odl_trace_rx;
+ extern bool odl_bind_any;
+ extern bool odl_skip_login;
+ 
+diff --git a/driver/odl_tb5_proto.c b/driver/odl_tb5_proto.c
+index 6746f63..aa57393 100644
+--- a/driver/odl_tb5_proto.c
++++ b/driver/odl_tb5_proto.c
+@@ -26,6 +26,11 @@
+ 
+ /* Stop retrying the XDomain login after this many failures (0 = forever).
+  * See HAZARD note in odl_tb5_login_work_fn(). */
++int odl_trace_rx = 0;
++module_param_named(trace_rx, odl_trace_rx, int, 0644);
++MODULE_PARM_DESC(trace_rx,
++	"Log every received stream frame's demux decision. Very verbose; bring-up only.");
++
+ int odl_login_max_retries = 20;
+ module_param_named(login_max_retries, odl_login_max_retries, int, 0644);
+ MODULE_PARM_DESC(login_max_retries,
+diff --git a/driver/odl_tb5_ring_dma.c b/driver/odl_tb5_ring_dma.c
+index e831cb5..cfac953 100644
+--- a/driver/odl_tb5_ring_dma.c
++++ b/driver/odl_tb5_ring_dma.c
+@@ -415,6 +415,13 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
+ 					u16 payload_len = le16_to_cpu(shdr->payload_len);
+ 
+ 					stream = odl_tb5_stream_lookup(dev, dst_id);
++					if (odl_trace_rx)
++						pr_info("odl_tb5: RX dev%d dst=%u src=%u len=%u stream=%ps\n",
++							dev->index, dst_id, shdr->src_id,
++							payload_len, stream ? stream : NULL);
++					if (!stream)
++						pr_warn_ratelimited("odl_tb5: RX dev%d dst=%u NO STREAM - dropped\n",
++								dev->index, dst_id);
+ 					if (stream && payload_len > 0) {
+ 						const void *payload =
+ 							data + ODL_TB5_STREAM_HDR_SIZE;

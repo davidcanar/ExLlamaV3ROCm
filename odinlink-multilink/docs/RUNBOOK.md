@@ -226,3 +226,44 @@ Bootstrap must ride the LAN, not the 10.0.2.x mesh: that mesh is
 point-to-point, so one master address is not reachable from every box.
 `NCCL_SOCKET_IFNAME` is per box and is not uniform either (a USB NIC comes up
 as `enp198s0f0u2u4`), so the launcher detects each box's LAN interface.
+
+## Status of the virtual-single-device plugin (0009/0010) — WIP, do not deploy
+
+The design investigation is complete; the current 0010 does NOT pass and is
+parked as WIP. Findings, so the next session starts from knowledge and not
+from scratch:
+
+1. **0007/0008 are correct and necessary** (unique device identity for NCCL
+   topo; NCCL handle overflow). Keep them.
+2. **The g_lock self-deadlock in listen()** (odl_listen_setup under the lock
+   calling get_shared_handle which takes it again) stalled NCCL before
+   listen(); fixed via `_locked` helper variants — that part of 0010 is right.
+3. **`odl_tb5_stream_wait_rx()` returns 0 on success** (data ready), negative
+   on timeout/error. `<= 0` in accept() threw the success case away and
+   busy-spun ~3M/s on an already-delivered hello. Fixed (`< 0`).
+4. **The remaining blocker is structural**: a shared per-cable stream cannot
+   multiplex multiple connections, because the driver's RX reassembly is
+   PER-STREAM single-buffer state (`rx_asm_len`/`rx_asm_next_frag`/one
+   `rx_asm_buf`). Interleaved multi-frame messages from several senders trip
+   the frag-gap check and are dropped. One sender at a time per stream works
+   (odl_stream_pingpong proves it); twelve NCCL channels on one stream cannot.
+
+**Design for the next iteration** (per-connection streams, the shape the
+driver actually supports):
+
+- Keep the per-cable shared stream as a CONTROL channel only — it carries
+  single-frame hello/grant messages (single-frame needs no reassembly, so
+  multiplexing it is safe).
+- connect(): open a dedicated send stream S, send `hello{S}` (single frame)
+  on the control stream, return success with dst unknown.
+- accept(): pop the pending hello, open a dedicated recv stream R, register
+  by_src[S] -> R, send `grant{S -> R}` (single frame) on the control stream.
+- The dispatcher routes grants to the connector's comm: sets `dst_id = R`;
+  the send worker queues requests until dst_id is set.
+- Data then flows per-connection (one sender per stream), which the driver
+  guarantees correct.
+- Teardown: close the per-connection streams; control stream stays.
+
+Debug tooling that made this tractable (keep): `0011-driver-trace-rx.patch`
+(`echo 1 > /sys/module/odl_tb5/parameters/trace_rx`) logs every frame's
+demux decision; `ODL_DEBUG=1` plugin trace lands in `/tmp/odl_plugin.<pid>.log`.
