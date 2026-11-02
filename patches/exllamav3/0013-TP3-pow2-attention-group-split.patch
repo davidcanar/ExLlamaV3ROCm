@@ -1,0 +1,91 @@
+diff --git a/exllamav3/model/model_tp_alloc.py b/exllamav3/model/model_tp_alloc.py
+index f58b2ccd..68dd7cef 100644
+--- a/exllamav3/model/model_tp_alloc.py
++++ b/exllamav3/model/model_tp_alloc.py
+@@ -27,8 +27,10 @@ class TPAllocation:
+         limit_key: str = None,
+         max_devices: int = None,
+         affinity_key: str = None,
++        pow2_units: bool = False,
+     ):
+         self.key = key
++        self.pow2_units = pow2_units
+         self.channel_width = channel_width
+         self.channel_unit = channel_unit
+         self.limit_key = limit_key
+@@ -63,6 +65,45 @@ class TPAllocation:
+         )
+ 
+ 
++def _pow2_split(channels: int, weights, active):
++    """Split `channels` over the active devices so every device gets a power-of-two
++    count (0 allowed), larger counts to larger weights.
++
++    Some sharded kernels index their per-rank slice with tl.arange(0, N), which
++    requires N to be a power of two (e.g. DSV4 attention: 8 o-groups over 3
++    ranks would otherwise give a 2/3/3 group split = 16/24/24 heads, and 24 is
++    not a power of two). ratio_split() has no such notion, so components whose
++    downstream kernels need it ask for this split instead.
++
++    Most-even distribution: each device takes the largest power of two not
++    exceeding both the running cap (next_pow2(ceil(remaining/devices))) and
++    what remains, so 8 groups over 3 ranks become 4/2/2 (heads 32/16/16), and
++    over 2 ranks 4/4 (heads 32/32, identical to the ratio split).
++    """
++    devs = [i for i, a in enumerate(active) if a]
++    n = len(devs)
++    split = [0] * len(weights)
++    if n == 0 or channels <= 0:
++        return split
++    order = sorted(devs, key=lambda i: -weights[i])
++    remaining = channels
++    for pos, dev in enumerate(order):
++        k = n - pos
++        if remaining <= 0:
++            break
++        cap = 1
++        while cap < (remaining + k - 1) // k:
++            cap *= 2
++        chunk = min(cap, remaining)
++        while chunk > 1 and chunk & (chunk - 1):
++            chunk -= 1           # min(cap, remaining) is already <= a pow2 cap, but be safe
++        split[dev] = chunk
++        remaining -= chunk
++    assert remaining == 0 and sum(split) == channels, \
++        f"_pow2_split({channels}) -> {split} (infeasible)"
++    return split
++
++
+ class TPAllocator:
+ 
+     def __init__(
+@@ -138,7 +179,10 @@ class TPAllocator:
+ 
+             # Perform split
+             channels = c.channels_to_split
+-            split = ratio_split(channels, rem_mem_s, chunk_size = 1)
++            if c.pow2_units:
++                split = _pow2_split(channels, rem_mem_s, [m > 0 for m in rem_mem_s])
++            else:
++                split = ratio_split(channels, rem_mem_s, chunk_size = 1)
+             c.current_split = split
+             if c.affinity_key is not None and c.affinity_key not in affinity_dev:
+                 owners = [i for i, s in enumerate(split) if s]
+diff --git a/exllamav3/modules/dsv4.py b/exllamav3/modules/dsv4.py
+index e8676770..0e5f8d14 100644
+--- a/exllamav3/modules/dsv4.py
++++ b/exllamav3/modules/dsv4.py
+@@ -781,6 +781,13 @@ class DSV4Attention(Module):
+             recons_temp = recons,
+             channels_to_split = self.o_groups,
+             limit_key = "attn",
++            # The sharded attention kernels index their per-rank head slice with
++            # tl.arange(0, HP), which requires a power-of-two head count; a plain
++            # ratio split of the 8 o-groups over 3 ranks gives 2/3/3 groups =
++            # 16/24/24 heads and 24 is not a power of two. Ask the allocator for
++            # a power-of-two group split (4/2/2 = heads 32/16/16 at world 3;
++            # identical to the ratio split at world 2, so TP=2 is unaffected).
++            pow2_units = True,
+         )
+         return [tpa]
+ 

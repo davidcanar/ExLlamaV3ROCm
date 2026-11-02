@@ -23,34 +23,35 @@ world-size-3 capable. This note records both, so the next step is unambiguous.
 - Symmetric 3-way load: budgets `[95, 100, 100]` GiB, each rank ~50 GiB free
   after loading, engram overrides applied on every rank.
 
-## Blocker: kernels assume power-of-two per-rank shards
+## RESOLVED: power-of-two per-rank shards (option 2b-uneven)
 
-First op after the handshake dies inside Triton on the worker:
+The blocker was Triton's power-of-2 requirement on per-rank head partitions
+(`tl.arange(0, HP)`); at world 3 a memory-ratio split of the 8 attention
+o-groups gives 2/3/3 groups = 16/24/24 heads and 24 is not a power of two.
 
-```
-offs_h = hgrp * HP + tl.arange(0, HP)
-arange's range must be a power of 2
-```
+Fix (option **2b-uneven**): `patches/exllamav3/0013-TP3-pow2-attention-group-split.patch`
+adds `pow2_units` to `TPAllocation`; the allocator then snaps the attention
+group split to the most-even power-of-two distribution — **4/2/2 groups =
+heads 32/16/16** (which rank gets 32 follows remaining memory; experts
+rebalance automatically in the same allocation pass). Zero padded heads, zero
+wasted attention FLOPs, and a **no-op at world 2** (8 groups over 2 ranks snap
+to 4/4, exactly the ratio split).
 
-At world_size 3 the per-rank head partition `HP` is not a power of two (2 ranks
-split evenly and stay power-of-two), and `tl.arange` requires a power-of-2
-range. The kernels that index sharded dims with `tl.arange(0, HP)` need to pad
-to `next_pow2(HP)` and mask the tail (or use a masked/`tl.arange(0, BLOCK)`
-form with `mask = offs < HP`).
+Verified on the 3-box mesh, 2.9bpw, 2K ctx, DSpark off:
 
-Options, in increasing cost:
+- 3-rank load + NCCL world-3 warmup + both-worker handshake: clean
+- first generation through the HTTP API: coherent; decode ~19 tok/s
+- **greedy agreement with the 2-node baseline**: 413/450 chars identical on a
+  two-sentence probe (divergence is final-phrase phrasing — float reduction
+  order, not a math bug); identical stop point (115 tokens) on the primes
+  probe
+- decode speed vs TP=2: 19.3 vs 23.3 tok/s at trivial context — the gap is
+  the missing `odl_ar2` fast path (2-party only; TP=3 routes decode all-reduces
+  through 3-way RCCL) and should narrow with context length as expert sharding
+  pays off (128 vs 192 experts per rank)
 
-1. **TP=4 instead of 3** (4 boxes, or 3 boxes + ... not possible) — keeps every
-   per-rank dim a power of two. A 4th box makes this a config change.
-2. **Fix the sharded kernels** to accept non-power-of-2 tail blocks (pad +
-   mask): the honest fix, but it touches the attention/indexer/mHC kernels and
-   needs numerics checks against the 2-node baseline.
-3. **TP=2 for the model on Box1+Box2** and use Box3 for something else
-   (prefix/disk tier, second model, Engram host) — no kernel work, but no
-   TP=3 either.
-
-Until one of these lands, `tp3_*` is correct but cannot serve: the fabric is
-proven at 3 ranks, the model math is not.
+Remaining TP=3 gaps: no DSpark (spec decoding) validation, no multi-session /
+disk tier / vision, 2K ctx only, and `odl_ar2` has no 3-rank story yet.
 
 ## Publishing / operational notes
 
