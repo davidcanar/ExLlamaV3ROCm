@@ -20,8 +20,8 @@ set -euo pipefail
 NODE_RANK=${1:?usage: tp3_worker.sh <node-rank 1|2> [master-port] [control-port]}
 MASTER_PORT=${2:-29650}
 CONTROL_PORT=${3:-29651}
-ROOT=/home/davidcanar/exl3ds4
-ODL_BUILD=/home/davidcanar/.cache/odinlink/build
+ROOT="${EXL3DS4_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+ODL_BUILD="${EXL3_ODL_BUILD:-$HOME/.cache/odinlink/build}"
 
 case "$NODE_RANK" in
 1)  # Box2: dev0=Box3, dev1=Box1 (measured 2026-11-02 after the 10:42 reload; the old

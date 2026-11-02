@@ -31,6 +31,14 @@
 #   ./exl3ds4.sh restart             # stop, then start
 #   ./exl3ds4.sh status              # link/ranks/health; exit 0 ready, 3 loading, 1 down
 #   ./exl3ds4.sh logs [rank0|rank1|all]   # follow logs (default rank0)
+#   ./exl3ds4.sh probe               # print this boot's OdinLink cable map (servers stopped)
+#
+# Every start first probes the OdinLink cable map on both boxes at once
+# (tools/ds41/odl_peer_probe.py) and hands each rank its own ODL_RCCL_PEERS: the
+# /dev/odl_tb5_N that reaches the peer changes across boots and odl_tb5 reloads (and a
+# box on a three-box mesh has two cables), and a stale map hangs the NCCL warmup.
+# EXL3_TP2_NO_PROBE=1 skips it (the launchers' default maps then apply).
+# Three boxes (TP=3) use tools/ds41/tp3_start.sh instead; only one stack runs at a time.
 #
 # Locations (all overridable, defaults = the validated rig): EXL3DS4_ROOT (this
 #   checkout), EXL3DS4_REMOTE (Box2 ssh target), EXL3_MASTER_ADDR (rank-0 Thunderbolt
@@ -48,6 +56,8 @@
 #     ($ROOT/diskcache)  EXL3_TP_DISK_CACHE_GIB (32)  EXL3_TP_DISK_TIMEOUT (300 s)
 #   KYOJIN_SSE_PING_S (30 s SSE keep-alive)  EXL3_TP_DSPARK_CONF  EXL3_DS41_CONF
 #   EXL3_TP_MODEL_DIR  EXL3_LOAD_TIMEOUT (2700 s)  EXL3_STOP_TIMEOUT (120 s)
+#   EXL3_ODL_IP0 / EXL3_ODL_IP1 (10.0.2.1 / 10.0.2.2: the ranks' OdinLink identities,
+#     ODL_RCCL_LOCAL_IP)  EXL3_TP2_NO_PROBE
 #
 # Logs: rank 0 -> ~/exl3ds4/logs/exl3ds4-rank0.log (Box1)
 #       rank 1 -> ~/exl3ds4/logs/exl3ds4-rank1.log (Box2; 'exl3ds4.sh logs rank1')
@@ -100,6 +110,29 @@ die()  { warn "$*"; exit 1; }
 remote() { timeout "${2:-30}" ssh -o BatchMode=yes "$REMOTE" "$1"; }
 
 odl_up() { [[ -e "$ODL_DEV" ]] && grep -q odl_tb5 /proc/modules; }
+
+# OdinLink cable map for THIS boot (see the header). P0/P1 = ODL_RCCL_PEERS of rank 0/1.
+ODL_IP0="${EXL3_ODL_IP0:-10.0.2.1}"
+ODL_IP1="${EXL3_ODL_IP1:-10.0.2.2}"
+PROBE_PY="$ROOT/tools/ds41/odl_peer_probe.py"
+P0=""; P1=""
+probe_cables() {
+    local d a b
+    d=$(mktemp -d)
+    python3 "$PROBE_PY" --name box1 --ip "$ODL_IP0" > "$d/0" 2>&1 & a=$!
+    remote "python3 '$PROBE_PY' --name box2 --ip '$ODL_IP1'" 90 > "$d/1" 2>&1 & b=$!
+    wait "$a" "$b"
+    P0=$(sed -n 's/^ODL_RCCL_PEERS=//p' "$d/0")
+    P1=$(sed -n 's/^ODL_RCCL_PEERS=//p' "$d/1")
+    # TP=2 needs the Box1<->Box2 cable seen from both ends; other cables may stay silent
+    if [[ ",$P0" != *",$ODL_IP1="* || ",$P1" != *",$ODL_IP0="* ]]; then
+        warn "OdinLink cable probe incomplete (link down, or a server still holds the devices?):"
+        sed 's/^/    /' "$d/0" "$d/1" >&2
+        rm -rf "$d"; return 1
+    fi
+    rm -rf "$d"
+    log "OdinLink cable map: rank 0 ODL_RCCL_PEERS=$P0 | rank 1 ODL_RCCL_PEERS=$P1"
+}
 
 lan_ip() { ip -4 route get 8.8.8.8 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}'; }
 
@@ -233,11 +266,18 @@ do_start() {
         die "if that is the ds4-vllm stack use '~/vllm-strix-halo.sh ds4 stop' — this script never touches foreign servers."
     fi
 
+    # ---- OdinLink cable map (per boot) --------------------------------------
+    if [[ -z "${EXL3_TP2_NO_PROBE:-}" ]]; then
+        probe_cables || die "cannot derive the OdinLink cable map — check '/usr/local/bin/odl-state' on both boxes (odinlink-multilink/docs/RUNBOOK.md), or set EXL3_TP2_NO_PROBE=1"
+    fi
+    local r1_peers
+    r1_peers="$(printf '%q ' "ODL_RCCL_LOCAL_IP=$ODL_IP1" ${P1:+"ODL_RCCL_PEERS=$P1"})"
+
     # ---- rank 1 on Box2 (nohup; pid + log live on Box2) --------------------
     log "Starting rank 1 on $REMOTE (log on Box2: $R1_LOG)..."
     remote "{ echo; echo \"===== $(date '+%F %T') exl3ds4 rank 1 (master=$MASTER_PORT control=$CONTROL_PORT dspark=$EXL3_TP_DSPARK safe_ctx=$EXL3_TP_SAFE_CTX cache=$EXL3_TP_CACHE_TOKENS) =====\"; } >> '$R1_LOG'" 15 >/dev/null 2>&1 || true
     if ! remote "mkdir -p '$RUN_DIR'
-                 nohup env $REMOTE_ENV '$TP_RANK1_SH' $MASTER_PORT $CONTROL_PORT >> '$R1_LOG' 2>&1 < /dev/null &
+                 nohup env $REMOTE_ENV $r1_peers'$TP_RANK1_SH' $MASTER_PORT $CONTROL_PORT >> '$R1_LOG' 2>&1 < /dev/null &
                  echo \$! > '$R1_PID'; sleep 1
                  p=\$(cat '$R1_PID')
                  kill -0 \"\$p\" 2>/dev/null && grep -aq tp_rank1 /proc/\"\$p\"/cmdline" 90 >/dev/null 2>&1; then
@@ -248,7 +288,7 @@ do_start() {
     # ---- rank 0 on Box1 (nohup; pid file + log here) -----------------------
     log "Starting rank 0 on Box1 (HTTP 0.0.0.0:$HTTP_PORT; log: $LOG0)..."
     { echo; echo "===== $(date '+%F %T') exl3ds4 rank 0 (http=0.0.0.0:$HTTP_PORT master=$MASTER_PORT control=$CONTROL_PORT dspark=$EXL3_TP_DSPARK safe_ctx=$EXL3_TP_SAFE_CTX cache=$EXL3_TP_CACHE_TOKENS) ====="; } >> "$LOG0"
-    nohup "$TP_RANK0_SH" "$HTTP_PORT" "$MASTER_PORT" "$CONTROL_PORT" >> "$LOG0" 2>&1 < /dev/null &
+    nohup env "ODL_RCCL_LOCAL_IP=$ODL_IP0" ${P0:+"ODL_RCCL_PEERS=$P0"} "$TP_RANK0_SH" "$HTTP_PORT" "$MASTER_PORT" "$CONTROL_PORT" >> "$LOG0" 2>&1 < /dev/null &
     echo $! > "$PID0"
     sleep 1
     if ! rank0_state >/dev/null; then
@@ -458,8 +498,8 @@ do_logs() {
 # =============================================================================
 ACTION="${1:-start}"; shift || true
 case "$ACTION" in
-    start|stop|restart|status|logs|help|-h|--help) ;;
-    *) die "unknown action '$ACTION' — usage: $0 [start|stop|restart|status|logs [rank0|rank1|all]]" ;;
+    start|stop|restart|status|logs|probe|help|-h|--help) ;;
+    *) die "unknown action '$ACTION' — usage: $0 [start|stop|restart|status|logs [rank0|rank1|all]|probe]" ;;
 esac
 LOG_WHICH="rank0"
 if [[ "$ACTION" == logs && "${1:-}" != "" ]]; then
@@ -472,5 +512,8 @@ case "$ACTION" in
     restart) do_stop; do_start ;;
     status)  do_status ;;
     logs)    do_logs "$LOG_WHICH" ;;
-    help|-h|--help) sed -n '2,43p' "$0" ;;
+    probe)   ss -ltn 2>/dev/null | grep -qE ":$HTTP_PORT\b" \
+                 && die "a server (TP=2 or TP=3) is listening on :$HTTP_PORT — stop it first; the probe needs the OdinLink devices"
+             probe_cables ;;
+    help|-h|--help) sed -n '2,/^set -uo pipefail$/p' "$0" | sed '$d' ;;
 esac

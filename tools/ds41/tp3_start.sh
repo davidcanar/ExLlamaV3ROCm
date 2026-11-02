@@ -11,7 +11,7 @@
 # hangs the world-3 NCCL warmup or the first large collective. EXL3_TP3_NO_PROBE=1 skips the probe
 # (each script's built-in default map is used, or ODL_RCCL_PEERS_{0,1,2} if exported).
 set -uo pipefail
-ROOT=/home/davidcanar/exl3ds4
+ROOT="${EXL3DS4_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 LOG=$ROOT/logs
 B2=${EXL3_BOX2:-192.168.0.103}
 B3=${EXL3_BOX3:-192.168.0.105}
@@ -33,9 +33,10 @@ wait_loaded() {   # <host> <rank> <timeout_s>
 }
 
 # Env overrides forwarded to the workers over ssh (ssh forwards nothing). The per-box OdinLink
-# settings (ODL_RCCL_LOCAL_IP / ODL_RCCL_PEERS) are NOT forwarded: they differ on every box.
+# settings (ODL_RCCL_LOCAL_IP / ODL_RCCL_PEERS) and the LAN interface (EXL3_IFACE) are NOT
+# forwarded: they differ on every box. EXLLAMA_MASTER_ADDR (Box1's LAN IP) is the same for all.
 FORWARD_ENV=""
-for v in EXL3_TP_MODEL_DIR EXL3_TP_SAFE_CTX EXL3_TP_CACHE_TOKENS EXL3_TP_DSPARK \
+for v in EXLLAMA_MASTER_ADDR EXL3_TP_MODEL_DIR EXL3_TP_SAFE_CTX EXL3_TP_CACHE_TOKENS EXL3_TP_DSPARK \
          EXL3_TP_BUDGETS EXL3_TP_ODL_AR3 EXL3_TP_NCCL_SYNC EXL3_TP_SPAN EXL3_TP_SPIN_RECV \
          NCCL_MAX_NCHANNELS; do
     [ -n "${!v:-}" ] && FORWARD_ENV+="$v=${!v} "

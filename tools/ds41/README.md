@@ -19,6 +19,12 @@ default, one dynamically shared page pool) and `tp_disk.py` on both ranks (per-r
 images when a whole conversation is spilled). `EXL3_TP_SESSIONS=1` keeps the original
 single-conversation engine and protocol 4 byte-compatible.
 
+Three boxes (TP=3) run the same engine through `tp3_serve.py` (rank 0, with
+`tp3_channel.py`'s fan-out channel instead of the single rank-1 channel) and
+`tp3_worker.py` (ranks 1-2), started by `tp3_start.sh`; see
+[docs/tp3-runtime.md](../../docs/tp3-runtime.md). Both controllers derive the OdinLink
+cable map with `odl_peer_probe.py` on every start.
+
 ## Attribution
 
 The HTTP/chat/parser/test layer is vendored, unmodified, from **Kyojin**

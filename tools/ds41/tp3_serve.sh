@@ -8,8 +8,8 @@ set -euo pipefail
 HTTP_PORT=${1:-1234}
 MASTER_PORT=${2:-29650}
 CONTROL_PORT=${3:-29651}
-ROOT=/home/davidcanar/exl3ds4
-ODL_BUILD=/home/davidcanar/.cache/odinlink/build
+ROOT="${EXL3DS4_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+ODL_BUILD="${EXL3_ODL_BUILD:-$HOME/.cache/odinlink/build}"
 
 ulimit -n 65536
 export EXL3_TP_NODE_RANK=0
