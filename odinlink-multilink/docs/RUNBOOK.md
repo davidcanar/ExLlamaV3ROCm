@@ -79,6 +79,45 @@ It unloads `odl_tb5`, `thunderbolt_net`, `typec_*`, `typec_ucsi`, `typec`, unbin
 the NHI controllers, swaps the core, rebinds, and loads the driver with
 `bind_any=0`. If `typec_ucsi` is pinned by hardware (it usually is), reboot.
 
+## Kernel updates
+
+`thunderbolt.ko` and `odl_tb5.ko` are built for one kernel, and a kernel update
+installs a new default kernel without them. Stage both before rebooting, on every
+box:
+
+```bash
+sudo dnf upgrade --refresh                       # new kernel + kernel-devel <new-kver>
+odinlink-multilink/build.sh <new-kver>           # e.g. 7.2.14-200.fc44.x86_64
+sudo odinlink-multilink/install.sh <new-kver>    # core -> /lib/modules/<new-kver>/updates
+```
+
+Before the reboot check that `sudo grubby --default-kernel` is the new kernel, that
+`sudo grubby --info=/boot/vmlinuz-<new-kver>` still carries the kernel command line,
+and that `sudo lsinitrd /boot/initramfs-<new-kver>.img | grep /thunderbolt.ko`
+prints nothing (`omit_drivers`). Stop the model server first: `install.sh` rewrites
+`libodl_tb5.so` in place.
+
+`/usr/local/lib/odinlink/odl_tb5.ko` is one path for every kernel, so once a new
+kernel is staged the old one has no matching driver. To boot back into it, run
+`sudo odinlink-multilink/install.sh <old-kver>` (its build stays in
+`~/.cache/odl-multi/<old-kver>`).
+
+After the reboot:
+
+- `odl-state` on every box. A box that booted after its peers had given up
+  (`giving up after 20 login attempts` in dmesg) leaves those links idle; run
+  `sudo systemctl restart odinlink` on all boxes at about the same time.
+- `tools/ds41/tp3_start.sh probe` (or `exl3ds4.sh probe` for two boxes) must see
+  every cable from both ends.
+- `perf/tp3/rccl_stall.sh 12` before putting the server back.
+- Userspace (`rebuild-plugin.sh`, `odl_ar3/build.sh`) does not depend on the kernel;
+  rebuild it only to pick up a new compiler, on every box.
+
+Moving the 3-box rig from 7.1.8/7.2.13 to 7.2.14 on 2026-11-02: the 7.2.14
+`drivers/thunderbolt` is identical to 7.2.13's, and `patches/linux/0001` applies with
+`--fuzz=0`. 7.2 on both ends of a cable exposed the `rx_repost` race fixed by
+`patches/odinlink/0013` (next section).
+
 ## Loader defaults
 
 `odl-swap.sh` loads with **`bind_any=0`** and `ring=1024`, `e2e=1`.
@@ -156,6 +195,8 @@ sent on the wrong cable has no matching stream on the peer.
 | Second link's login times out ×20, `/dev/odl_tb5_1` missing on the peer | Route-based demux (driver built without `0004`, or core without `patches/linux/0001`). Check `dmesg` for `source-XDomain protocol demux`. |
 | `modprobe thunderbolt` resolves to `kernel/...`, not `updates/...` | `updates/` not populated, or an initramfs copy is winning. Re-install and regenerate the initramfs with `omit_drivers`. |
 | `rmmod thunderbolt` says "in use by: typec" | Unload `typec_ucsi` → `typec` first (`support/reload-node.sh`), or reboot. |
+| All devices READY, but the cable probe (`tp3_start.sh probe`) sees each cable in one direction only, and dmesg shows `can_send=0 ... free=<256 ... rx_posted=~4000` | `odl_tb5` without `patches/odinlink/0013`: concurrent RX reposts drained the frame pool. Rebuild and install the driver, then `systemctl restart odinlink` on every box. |
+| A box logs `giving up after 20 login attempts ... staying idle` after a reboot | Its peer booted later. `sudo systemctl restart odinlink` on all boxes together. |
 | `Unknown symbol tb_register_protocol_handler_xd` | Driver built for the xd API, running core is stock. Install the patched core (or rebuild the driver against stock headers for single-cable use). |
 
 ## Multi-link and TP>2
@@ -287,7 +328,7 @@ fixed channel pattern never triggers.
    and is accepted there, because listener tags are per-process counters that collide across
    boxes. That produces exactly the asymmetric per-pair channel counts above, and the world-3
    warmup hangs. `tools/ds41/odl_peer_probe.py` now derives the map on all three boxes at once and
-   `tools/tp3_start.sh` hands each rank its own `ODL_RCCL_PEERS` on every start
+   `tools/ds41/tp3_start.sh` hands each rank its own `ODL_RCCL_PEERS` on every start
    (`tp3_start.sh probe` prints it). With correct maps the world-3 warmup passes.
 2. **Fixed (patches/odinlink/0012): intermittent stall at the first large collective.** With
    correct maps, about 1 start in 6 stalled in the first collective that connects new channels

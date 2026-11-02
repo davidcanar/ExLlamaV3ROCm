@@ -2,7 +2,7 @@ NOTICE — third-party components used by ExLlamaV3ROCm
 =======================================================
 
 This repository contains the deployment glue, controller, launchers, server
-engine integration and patches written for the two-node Strix Halo rig
+engine integration and patches written for the two- and three-node Strix Halo rigs
 (MIT, see LICENSE). It redistributes or references the following third-party
 work; each component keeps its own license and attribution:
 
@@ -23,12 +23,19 @@ Kyojin (MIT, Copyright (c) 2025 Turboderp)
 OdinLink-Five (kernel driver GPL-2.0; userspace library, RCCL/NCCL plugins,
   CLI, daemon and all other components MIT; Copyright (c) Geramy)
   <https://github.com/Geramy/OdinLink-Five>, upstream commit 4534f58 plus the
-  local 5-file diff in `patches/odinlink/` (driver: odl_tb5_core.h,
-  odl_tb5_params.c, odl_tb5_proto.c, odl_tb5_ring_dma.c; RCCL v7 plugin:
-  rccl/src/odl_tb5_plugin.c). Only the patch is redistributed — the patched
-  files of `driver/` are GPL-2.0 derivative work and must stay GPL-2.0; the
-  RCCL plugin patch applies to MIT userspace code. Source is fetched by
-  `setup.sh`.
+  local patch series in `patches/odinlink/` (driver, userspace library and
+  RCCL v7 plugin; see its README). Only the patches are redistributed — the
+  patched files of `driver/` are GPL-2.0 derivative work and must stay
+  GPL-2.0; the library and RCCL plugin patches apply to MIT userspace code.
+  Source is fetched by `setup.sh` and `odinlink-multilink/build.sh`.
+
+Linux kernel, drivers/thunderbolt (GPL-2.0)
+  `patches/linux/0001-thunderbolt-source-xdomain-protocol-handlers.patch`
+  modifies `drivers/thunderbolt/` and `include/linux/thunderbolt.h`.
+  `odinlink-multilink/build.sh` fetches the source of the distribution kernel
+  it builds for (Fedora SRPM, kernel.org as a fallback), applies the patch and
+  builds the module locally. Only the patch is redistributed; it and the
+  module built from it are GPL-2.0.
 
 DeepSeek-V4.1-Flash reference encoding (MIT, DeepSeek-AI)
   `tools/ds41/testdata/reference/` carries the official reference
@@ -37,7 +44,9 @@ DeepSeek-V4.1-Flash reference encoding (MIT, DeepSeek-AI)
 
 Model weights and Engram tables (NOT redistributed in this repository)
   Quantized checkpoint: `LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw`
-  (EXL3 2.9 bpw quantization of DeepSeek-V4.1-Flash-1017).
+  (EXL3 2.9 bpw quantization of DeepSeek-V4.1-Flash-1017); for TP=3 also
+  `LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw` (downloaded by hand,
+  see README).
   Engram source tables: `deepseek-ai/DeepSeek-V4.1-Flash-1017`
   (shards model-00047/00048-of-00048.safetensors). Both are downloaded by
   `setup.sh` under their upstream licenses/terms; model data never enters
