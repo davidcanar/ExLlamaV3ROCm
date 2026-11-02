@@ -42,10 +42,16 @@ export EXL3_TP_ODL_AR3=${EXL3_TP_ODL_AR3:-1}
 # knobs must match on every rank (tp3_start.sh forwards overrides; the handshake refuses a
 # mismatch). EXL3_TP_SESSIONS=1 is the single-conversation engine.
 export EXL3_TP_SESSIONS=${EXL3_TP_SESSIONS:-4}
-export EXL3_TP_VISION=${EXL3_TP_VISION:-0}
+# Image input: rank 0 loads the vision tower + aligner (~0.7 GiB) beside its shard and ships
+# each image's rows to the workers per request (they never load it). Same defaults as TP=2.
+export EXL3_TP_VISION=${EXL3_TP_VISION:-1}
+export EXL3_TP_MAX_IMAGES=${EXL3_TP_MAX_IMAGES:-16}
 export EXL3_TP_DISK_CACHE=${EXL3_TP_DISK_CACHE:-1}
 export EXL3_TP_DISK_CACHE_DIR=${EXL3_TP_DISK_CACHE_DIR:-$ROOT/diskcache}
-export EXL3_TP_DISK_CACHE_GIB=${EXL3_TP_DISK_CACHE_GIB:-32}
+# 100 GiB per box: these boxes serve nothing else, and a spilled conversation costs ~68 MB +
+# ~3.3 KB per token (a full 1M-token conversation ~3.3 GB), so ~25 full-context conversations
+# or a few hundred 100K ones survive on NVMe. Images last until the server restarts.
+export EXL3_TP_DISK_CACHE_GIB=${EXL3_TP_DISK_CACHE_GIB:-100}
 export EXL3_TP_DISK_TIMEOUT=${EXL3_TP_DISK_TIMEOUT:-300}
 # SSE keep-alive: a long prefill (100K tokens is minutes) sends no data, and clients with a read
 # timeout drop the stream (which cancels the job). Rank 0 only: it is the HTTP layer.
@@ -54,8 +60,10 @@ export EXL3_TP_BUDGETS=${EXL3_TP_BUDGETS:-100,100,100}
 # Model selection: default is the 2.9bpw quant; export EXL3_TP_MODEL_DIR to
 # serve another checkpoint (e.g. model-3.5bpw). Paths must mirror on every box.
 export EXL3_TP_MODEL_DIR=${EXL3_TP_MODEL_DIR:-$ROOT/model}
-export EXL3_TP_SAFE_CTX=${EXL3_TP_SAFE_CTX:-524288}
-export EXL3_TP_CACHE_TOKENS=${EXL3_TP_CACHE_TOKENS:-524288}
+# 1M context (the model's own limit: max_position_embeddings 1048576, YaRN x16). The DSA KV
+# pools cost ~1.6 GiB per rank per 512K tokens; must match on every rank (pool geometry).
+export EXL3_TP_SAFE_CTX=${EXL3_TP_SAFE_CTX:-1048576}
+export EXL3_TP_CACHE_TOKENS=${EXL3_TP_CACHE_TOKENS:-1048576}
 # DSpark (MTP speculative decoding) across all three ranks; opt out with
 # EXL3_TP_DSPARK=0. Validated after the pow2 split landed.
 export EXL3_TP_DSPARK=${EXL3_TP_DSPARK:-1}

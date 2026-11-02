@@ -94,7 +94,13 @@ two seconds per attempt) and is the quickest check after any driver or plugin ch
   byte-identical to the RCCL-only path. Until 2026-11-02 TP=3 ran the single-conversation
   engine, where any other conversation (a client's title request, a test) overwrote the
   cached one and its next turn re-prefilled from scratch.
-- Off and not validated at TP=3: vision (`EXL3_TP_VISION=0`).
+- Vision (rank 0 loads the tower, the workers get each image's rows): on since
+  2026-11-02; `perf/tp3/vision_check.py` reads the BLUE HERON 42 card exactly with DSpark
+  and plain decoding, and a broken image is a clean 400.
+- Context: 1M tokens since 2026-11-02 (4096-page pool, +1.6 GiB per rank over 512K; Box1
+  keeps ~15 GiB free with vision). The morning's 1M attempt hung in the first prefill
+  all-reduce, which was the plugin's connector registry (`patches/odinlink/0012`); no prompt
+  longer than 512K has been run since.
 - RCCL has no retransmit over OdinLink: a frame dropped by a cable (RX CRC error, rare)
   during a prefill all-reduce hangs the server until it is restarted.
 - Not measured yet: decode beyond 32K context, prefill at full context.
@@ -108,3 +114,4 @@ two seconds per attempt) and is the quickest check after any driver or plugin ch
 | `perf/tp3/rccl_stall.sh` | start-up collective repro (`ODL_DEBUG=1` keeps plugin traces of failing attempts) |
 | `perf/tp3/http_check.py` | one DSpark and one plain request against the running server |
 | `perf/tp3/session_check.py` | conversation cache: interleaved conversations, thinking on, NVMe spill and reload |
+| `perf/tp3/vision_check.py` | image input: a known card with DSpark and plain, a broken image, a text request |

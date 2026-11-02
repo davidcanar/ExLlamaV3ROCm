@@ -4,7 +4,8 @@ Serve **DeepSeek-V4.1-Flash** on **two or three AMD Strix Halo machines** joined
 Thunderbolt/USB4 cables. [ExLlamaV3](https://github.com/turboderp/ExLlamaV3) splits the
 model across the boxes (tensor parallelism), [OdinLink](https://github.com/Geramy/OdinLink-Five)
 carries the traffic over the cables, and an OpenAI-compatible server exposes it with MTP
-speculative decoding ("DSpark") and a 512K-token context.
+speculative decoding ("DSpark"), image input, cached conversations and a 512K-token (TP=2)
+or 1M-token (TP=3) context.
 
 | | TP=2 | TP=3 |
 |---|---|---|
@@ -12,7 +13,8 @@ speculative decoding ("DSpark") and a 512K-token context.
 | controller (run on Box1) | `exl3ds4.sh` | `tools/ds41/tp3_start.sh` |
 | quant | [2.9 bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw) (196 GiB) | [3.5 bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw) (240 GiB), or the 2.9 bpw |
 | decode all-reduce | `odl_ar2` (two parties, one cable) | `odl_ar3` (one hop to each peer, over its own cable) |
-| server | DSpark, four cached conversations in one shared pool, per-rank NVMe spill, image input | DSpark, four cached conversations in one shared pool, per-rank NVMe spill |
+| context | 512K tokens | 1M tokens (the model's maximum) |
+| server | DSpark, four cached conversations in one shared pool, per-rank NVMe spill, image input | the same |
 
 This repository is the working deployment, packaged for reinstallation: an installer,
 the two controllers, the server, and the patches it needs on top of ExLlamaV3, OdinLink
@@ -200,7 +202,7 @@ Endpoints: `POST /v1/chat/completions` (streaming or not), `POST /v1/completions
 health). Thinking is on by default: replies carry `reasoning_content` and
 `content`, and tool calls use the DeepSeek DSML format.
 
-Image input is on by default at TP=2 (`/health` reports `"vision": true`): send
+Image input is on by default (`/health` reports `"vision": true`): send
 `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}`
 parts in a message and the model reads them. Each image costs one vision-tower
 pass on Box1 plus its expanded token span in the prompt; DSpark and SSE
@@ -271,14 +273,19 @@ On other machines, override the rig's addresses and paths:
 
 `tp3_start.sh` forwards these to every rank, and they must match on all of them:
 `EXL3_TP_MODEL_DIR` (default `$EXL3DS4_ROOT/model`), `EXL3_TP_SAFE_CTX` /
-`EXL3_TP_CACHE_TOKENS` (524288), `EXL3_TP_DSPARK` (1), `EXL3_TP_BUDGETS` (GiB per rank,
+`EXL3_TP_CACHE_TOKENS` (1048576), `EXL3_TP_DSPARK` (1), `EXL3_TP_BUDGETS` (GiB per rank,
 `100,100,100`), `EXL3_TP_ODL_AR3` (1; `0` puts decode back on RCCL), `EXL3_TP_NCCL_SYNC`
-(`stream`), `EXL3_TP_SPAN`, `NCCL_MAX_NCHANNELS` (4), and the conversation cache knobs
-with the TP=2 defaults: `EXL3_TP_SESSIONS` (4), `EXL3_TP_PREFIX_*`, `EXL3_TP_DISK_CACHE`
-(1), `EXL3_TP_DISK_CACHE_DIR` (`$EXL3DS4_ROOT/diskcache`), `EXL3_TP_DISK_CACHE_GIB` (32),
-`EXL3_TP_DISK_TIMEOUT` (300). Rank 0 sends an SSE keep-alive comment after 30 s
-without output (`KYOJIN_SSE_PING_S`), so clients do not time out during a long prefill.
-Vision is off at TP=3 (`EXL3_TP_VISION=0`; validated at TP=2 only).
+(`stream`), `EXL3_TP_SPAN`, `NCCL_MAX_NCHANNELS` (4), the conversation cache knobs
+(`EXL3_TP_SESSIONS` 4, `EXL3_TP_PREFIX_*`, `EXL3_TP_DISK_CACHE` 1, `EXL3_TP_DISK_CACHE_DIR`
+`$EXL3DS4_ROOT/diskcache`, `EXL3_TP_DISK_CACHE_GIB` 100, `EXL3_TP_DISK_TIMEOUT` 300) and
+the vision knobs (`EXL3_TP_VISION` 1, `EXL3_TP_VISION_STRICT`, `EXL3_TP_MAX_IMAGES` 16).
+The 1M pool costs 1.6 GiB per rank more than 512K, and the vision tower ~0.7 GiB on rank 0
+only; with both, Box1 keeps ~15 GiB free. Spilled conversations take ~68 MB plus ~3.3 KB
+per token on each box (a full 1M-token one ~3.3 GB), so the 100 GiB tier holds a few hundred
+long conversations; they live until the server restarts. `EXL3_TP_DISK_TIMEOUT` is not a
+lifetime: it is how long rank 0 waits for a worker's disk write or read before treating it
+as late. Rank 0 sends an SSE keep-alive comment after 30 s without output
+(`KYOJIN_SSE_PING_S`), so clients do not time out during a long prefill.
 
 | variable | default | meaning |
 |---|---|---|
@@ -319,7 +326,10 @@ rank started by hand).
   detects and resends lost decode messages, but RCCL has no retransmit over
   OdinLink, so a loss during a large transfer such as a prefill all-reduce hangs the
   server until it is restarted.
-- TP=3 decode at long context and prefill at full context are not measured yet.
+- TP=3 serves a 1M-token context, but no prompt longer than 512K tokens has been run on it
+  yet, and decode beyond 32K and prefill beyond 100K are unmeasured. Prefill slows as the
+  context grows: a full 1M-token prompt takes on the order of an hour the first time
+  (cached afterwards).
 
 ## Security notes
 
