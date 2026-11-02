@@ -146,9 +146,40 @@ Box3 `dev0`=Box2/`dev1`=Box1.
 
 ## Multi-link and TP>2
 
-The fabric is ready for TP=3: each box has one ready device per peer, so every
-rank pair has a direct cable. What TP=3 additionally needs is in the **RCCL
-plugin**, not here: `rccl/src/odl_tb5_plugin.c` currently keeps a single global
-`g_handle`, so all peers share one cable. It needs per-device handles plus a
-peer→device mapping (the `ODL_RCCL_DEVICES` allow-list is per-node, not
-per-peer). Track that separately from this kit.
+The fabric is ready for TP=3 and `patches/odinlink/0006` makes the RCCL plugin
+ready as well. Two changes:
+
+1. **One handle per device.** The plugin used to keep a single global
+   `g_handle`, opened with whichever device RCCL mentioned first and then
+   reused for every peer — on a 3-node mesh all collectives went down one
+   cable. Handles are now per `/dev/odl_tb5_N` with per-device refcounts.
+2. **Peer-aware device selection.** `listen()` advertises this rank's link
+   address in the NCCL handle (in the free bytes after `hw_id`, marked with
+   `0xA5`; old peers simply ignore it), and `connect()` uses it to pick the
+   local cable that reaches that peer:
+
+   ```bash
+   # on every rank; the address must be the one on the links it serves
+   export ODL_RCCL_LOCAL_IP=10.0.2.1
+   # peer address -> local /dev/odl_tb5_N, comma separated
+   export ODL_RCCL_PEERS="10.0.2.2=0,10.0.2.3=1"
+   ```
+
+   With neither variable set, behaviour is unchanged (RCCL's device index is
+   used), so a 2-node deployment needs no changes at all.
+
+Reference values for the 3-box mesh in this runbook:
+
+| Rank | Box | `ODL_RCCL_LOCAL_IP` | `ODL_RCCL_PEERS` |
+|---|---|---|---|
+| 0 | Box1 | 10.0.2.1 | `10.0.2.2=0,10.0.2.3=1` |
+| 1 | Box2 | 10.0.2.2 | `10.0.2.1=0,10.0.2.6=1` |
+| 2 | Box3 | 10.0.2.3 | `10.0.2.4=0,10.0.2.5=1` |
+
+(The device numbers come from the device↔peer map above: Box1 `dev0`=Box2,
+`dev1`=Box3; Box2 `dev0`=Box1, `dev1`=Box3; Box3 `dev0`=Box2, `dev1`=Box1 —
+note Box3's numbering is the reverse of its address order, which is exactly
+why this map is explicit rather than inferred.)
+
+`ODL_RCCL_DEVICES` still filters which devices are exposed at all; leave it
+unset on a multi-link host so both cables are visible.

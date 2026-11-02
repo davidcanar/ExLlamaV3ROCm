@@ -1,0 +1,314 @@
+diff --git a/rccl/src/odl_tb5_plugin.c b/rccl/src/odl_tb5_plugin.c
+index db4a48f..1a1e417 100644
+--- a/rccl/src/odl_tb5_plugin.c
++++ b/rccl/src/odl_tb5_plugin.c
+@@ -30,6 +30,7 @@
+ #include <sys/mman.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
++#include <arpa/inet.h>
+ 
+ #include "net_v7.h"
+ #include <odl_tb5/odl_tb5.h>
+@@ -128,10 +129,15 @@ static int num_devices;
+ static struct odl_rccl_stats *stats_map;
+ static int stats_fd = -1;
+ 
+-/* ── Shared device handle (one TB link, many streams) ──────────────── */
++/* ── Shared device handles (one TB link each, many streams) ─────────── */
++/* A handle is bound to exactly ONE /dev/odl_tb5_N, i.e. one point-to-point
++ * cable and therefore one peer. A multi-cable host must keep one handle per
++ * device: sharing a single handle across peers (the previous behaviour) sent
++ * every collective down whichever cable happened to open first, which silently
++ * breaks TP>2 meshes. */
+ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+-static odl_tb5_t       g_handle;            /* opened lazily */
+-static int             g_handle_refs;
++static odl_tb5_t       g_handles[ODL_TB5_MAX_RCCL_DEVICES];   /* by odl dev */
++static int             g_handle_refs[ODL_TB5_MAX_RCCL_DEVICES];
+ static uint8_t         g_next_cid = 1;      /* connection/stream id alloc */
+ 
+ struct odl_tb5_request;
+@@ -141,7 +147,8 @@ struct odl_tb5_request;
+  * posted them (RCCL matches sends/recvs in order per connection) and never
+  * concurrently. */
+ struct odl_tb5_comm {
+-	odl_tb5_t handle;    /* shared g_handle */
++	odl_tb5_t handle;    /* shared handle of this comm's odl device */
++	int       odl_dev;    /* /dev/odl_tb5_N behind ->handle */
+ 	uint8_t   stream_id; /* local stream to send-from / recv-on */
+ 	uint8_t   dst_id;    /* remote stream to deliver to (send side) */
+ 	int       is_send;
+@@ -170,6 +177,7 @@ struct odl_tb5_request {
+  * advertised to the connecting peer so it can target it as dst. */
+ struct odl_tb5_listen_handle {
+ 	int       dev_id;
++	int       odl_dev;    /* /dev/odl_tb5_N this listener is bound to */
+ 	odl_tb5_t handle;     /* shared handle ref held until accept/closeListen */
+ 	uint8_t   stream_id;  /* auto-assigned recv stream */
+ 	int       accepted;   /* ref transferred to recvComm */
+@@ -250,49 +258,116 @@ static inline void stats_record_rx(int size)
+ 	__atomic_store_n(&stats_map->last_update_ns, clock_mono_ns(), __ATOMIC_RELAXED);
+ }
+ 
+-/* Open (or reuse) the shared device handle and wait for the peer link. */
+-static rcclResult_t get_shared_handle(int dev, odl_tb5_t *out)
++/* RCCL device index -> /dev/odl_tb5_N. */
++static inline int odl_dev_of(int dev)
++{
++	return (dev >= 0 && dev < num_devices) ? dev_map[dev] : dev;
++}
++
++/* ── Peer selection for multi-cable hosts ────────────────────────────
++ *
++ * listen() advertises this rank's identity on the link it listens on, so
++ * connect() can pick the local cable that actually reaches that peer instead
++ * of trusting the device index RCCL guessed. Configure with:
++ *
++ *   ODL_RCCL_LOCAL_IP=10.0.2.1                this rank's link address
++ *   ODL_RCCL_PEERS="10.0.2.2=0,10.0.2.3=1"    peer address -> local odl dev
++ *
++ * Both are optional: with neither set the plugin behaves exactly as before
++ * (RCCL's device index is used), so 2-node deployments need no changes.
++ */
++#define ODL_HANDLE_ID_MARK 0xA5   /* marks a handle carrying a peer IPv4 */
++#define ODL_HANDLE_IP_OFF  12     /* after stream_id(1) + "odl_tb5_N\0" */
++
++static uint32_t odl_local_ip(void)
++{
++	const char *s = getenv("ODL_RCCL_LOCAL_IP");
++	struct in_addr a;
++
++	if (!s || !*s)
++		return 0;
++	return inet_pton(AF_INET, s, &a) == 1 ? ntohl(a.s_addr) : 0;
++}
++
++/* Map a peer's advertised IPv4 to the local odl device that reaches it.
++ * Returns -1 when the peer is unknown (caller keeps RCCL's choice). */
++static int odl_dev_for_peer(uint32_t peer_ip)
++{
++	const char *s = getenv("ODL_RCCL_PEERS");
++	char buf[512], *save = NULL, *tok;
++
++	if (!peer_ip || !s || !*s)
++		return -1;
++	snprintf(buf, sizeof(buf), "%s", s);
++
++	for (tok = strtok_r(buf, ",", &save); tok;
++	     tok = strtok_r(NULL, ",", &save)) {
++		char *eq = strchr(tok, '=');
++		struct in_addr a;
++		int dev;
++
++		if (!eq)
++			continue;
++		*eq = '\0';
++		if (inet_pton(AF_INET, tok, &a) != 1)
++			continue;
++		if (ntohl(a.s_addr) != peer_ip)
++			continue;
++		dev = atoi(eq + 1);
++		if (dev >= 0 && dev < ODL_TB5_MAX_RCCL_DEVICES)
++			return dev;
++	}
++	return -1;
++}
++
++/* Open (or reuse) the handle for ONE odl device and wait for its peer link. */
++static rcclResult_t get_shared_handle(int odl_dev, odl_tb5_t *out)
+ {
+ 	rcclResult_t res = rcclSuccess;
+ 
++	if (odl_dev < 0 || odl_dev >= ODL_TB5_MAX_RCCL_DEVICES)
++		return rcclInvalidArgument;
++
+ 	pthread_mutex_lock(&g_lock);
+-	if (!g_handle) {
+-		int rc = odl_tb5_open(&g_handle, (dev >= 0 && dev < num_devices) ? dev_map[dev] : dev);
++	if (!g_handles[odl_dev]) {
++		int rc = odl_tb5_open(&g_handles[odl_dev], odl_dev);
+ 
+ 		if (rc < 0) {
+ 			WARN("open /dev/odl_tb5_%d failed: %s",
+-			     dev, strerror(-rc));
+-			g_handle = NULL;
++			     odl_dev, strerror(-rc));
++			g_handles[odl_dev] = NULL;
+ 			res = rcclSystemError;
+ 			goto out;
+ 		}
+-		if (odl_tb5_wait_peer(g_handle, 10000) < 0) {
++		if (odl_tb5_wait_peer(g_handles[odl_dev], 10000) < 0) {
+ 			struct odl_tb5_peer_info info;
+ 
+ 			memset(&info, 0, sizeof(info));
+-			odl_tb5_get_peer(g_handle, &info);
++			odl_tb5_get_peer(g_handles[odl_dev], &info);
+ 			WARN("wait READY on /dev/odl_tb5_%d failed after 10s "
+ 			     "(state=%s)",
+-			     dev, odl_tb5_state_str(info.state));
+-			odl_tb5_close(g_handle);
+-			g_handle = NULL;
++			     odl_dev, odl_tb5_state_str(info.state));
++			odl_tb5_close(g_handles[odl_dev]);
++			g_handles[odl_dev] = NULL;
+ 			res = rcclSystemError;
+ 			goto out;
+ 		}
+ 	}
+-	g_handle_refs++;
+-	*out = g_handle;
++	g_handle_refs[odl_dev]++;
++	*out = g_handles[odl_dev];
+ out:
+ 	pthread_mutex_unlock(&g_lock);
+ 	return res;
+ }
+ 
+-static void put_shared_handle(void)
++static void put_shared_handle(int odl_dev)
+ {
++	if (odl_dev < 0 || odl_dev >= ODL_TB5_MAX_RCCL_DEVICES)
++		return;
+ 	pthread_mutex_lock(&g_lock);
+-	if (g_handle && --g_handle_refs == 0) {
+-		odl_tb5_close(g_handle);
+-		g_handle = NULL;
++	if (g_handles[odl_dev] && --g_handle_refs[odl_dev] == 0) {
++		odl_tb5_close(g_handles[odl_dev]);
++		g_handles[odl_dev] = NULL;
+ 	}
+ 	pthread_mutex_unlock(&g_lock);
+ }
+@@ -406,24 +481,37 @@ static rcclResult_t odl_tb5_listen(int dev, void *handle, void **listenComm)
+ 		return rcclSystemError;
+ 
+ 	lh->dev_id = dev;
++	lh->odl_dev = odl_dev_of(dev);
+ 	snprintf(lh->hw_id, sizeof(lh->hw_id), "%s", hw_ids[dev]);
+ 
+ 	/* Open the recv stream now (auto id, collision-free) and advertise its
+ 	 * real id so the peer's connect() can target it as dst. */
+-	if (get_shared_handle(dev, &lh->handle) != rcclSuccess) {
++	if (get_shared_handle(lh->odl_dev, &lh->handle) != rcclSuccess) {
+ 		free(lh);
+ 		return rcclSystemError;
+ 	}
+ 	if (odl_tb5_stream_open(lh->handle, 0, &lh->stream_id) < 0) {
+-		put_shared_handle();
++		put_shared_handle(lh->odl_dev);
+ 		free(lh);
+ 		return rcclSystemError;
+ 	}
+ 
+ 	if (handle) {
++		uint32_t my_ip = odl_local_ip();
++
+ 		memset(handle, 0, 64);
+ 		((uint8_t *)handle)[0] = lh->stream_id;
+ 		memcpy((uint8_t *)handle + 1, lh->hw_id, sizeof(lh->hw_id));
++		/* Identity of the link this listener sits on, so a peer with
++		 * several cables can pick the one that reaches us. Written in
++		 * the space after hw_id; old peers ignore it. */
++		((uint8_t *)handle)[ODL_HANDLE_IP_OFF - 1] =
++			my_ip ? ODL_HANDLE_ID_MARK : 0;
++		if (my_ip) {
++			uint32_t be = htonl(my_ip);
++
++			memcpy((uint8_t *)handle + ODL_HANDLE_IP_OFF, &be, 4);
++		}
+ 	}
+ 
+ 	DBG(1, "listen  dev=%d -> recv stream_id=%u (lh=%p)", dev, lh->stream_id, (void *)lh);
+@@ -439,6 +527,7 @@ static rcclResult_t odl_tb5_connect(int dev, void *handle, void **sendComm,
+ 	struct odl_tb5_comm *comm;
+ 	uint8_t peer_cid = ((uint8_t *)handle)[0];
+ 	uint8_t sid = 0;
++	int odl_dev = odl_dev_of(dev);
+ 
+ 	if (sendDevComm)
+ 		*sendDevComm = NULL;
+@@ -460,17 +549,35 @@ static rcclResult_t odl_tb5_connect(int dev, void *handle, void **sendComm,
+ 	if (!comm)
+ 		return rcclSystemError;   /* out of memory: genuinely fatal */
+ 
+-	if (get_shared_handle(dev, &comm->handle) != rcclSuccess) {
++	/* Multi-cable host: RCCL picks a device, but only one cable reaches
++	 * this peer. Use the advertised identity when we can resolve it. */
++	if (((uint8_t *)handle)[ODL_HANDLE_IP_OFF - 1] == ODL_HANDLE_ID_MARK) {
++		uint32_t be;
++
++		memcpy(&be, (uint8_t *)handle + ODL_HANDLE_IP_OFF, 4);
++		int peer_dev = odl_dev_for_peer(ntohl(be));
++
++		if (peer_dev >= 0 && peer_dev != odl_dev) {
++			DBG(1, "connect dev=%d: peer %u.%u.%u.%u is on odl dev %d",
++			    dev, (ntohl(be) >> 24) & 0xff, (ntohl(be) >> 16) & 0xff,
++			    (ntohl(be) >> 8) & 0xff, ntohl(be) & 0xff, peer_dev);
++			odl_dev = peer_dev;
++		}
++	}
++
++	if (get_shared_handle(odl_dev, &comm->handle) != rcclSuccess) {
+ 		/* Device not open or link not READY yet - transient. */
+ 		free(comm);
+-		DBG(1, "connect dev=%d: device not ready, asking RCCL to retry", dev);
++		DBG(1, "connect dev=%d (odl %d): not ready, asking RCCL to retry",
++		    dev, odl_dev);
+ 		return rcclSuccess;
+ 	}
++	comm->odl_dev = odl_dev;
+ 
+ 	/* Local send stream (auto-assigned); target the peer's advertised id. */
+ 	if (odl_tb5_stream_open(comm->handle, 0, &sid) < 0) {
+ 		/* No stream available yet - transient. */
+-		put_shared_handle();
++		put_shared_handle(comm->odl_dev);
+ 		free(comm);
+ 		DBG(1, "connect dev=%d: no stream available, asking RCCL to retry", dev);
+ 		return rcclSuccess;
+@@ -481,7 +588,7 @@ static rcclResult_t odl_tb5_connect(int dev, void *handle, void **sendComm,
+ 
+ 	if (comm_start_worker(comm) < 0) {
+ 		odl_tb5_stream_close(comm->handle, comm->stream_id);
+-		put_shared_handle();
++		put_shared_handle(comm->odl_dev);
+ 		free(comm);
+ 		return rcclSystemError;
+ 	}
+@@ -511,6 +618,7 @@ static rcclResult_t odl_tb5_accept(void *listenComm, void **recvComm,
+ 
+ 	/* Reuse the recv stream + handle ref already opened in listen(). */
+ 	comm->handle = lh->handle;
++	comm->odl_dev = lh->odl_dev;
+ 	comm->stream_id = lh->stream_id;
+ 	comm->dst_id = 0;
+ 	comm->is_send = 0;
+@@ -518,7 +626,7 @@ static rcclResult_t odl_tb5_accept(void *listenComm, void **recvComm,
+ 
+ 	if (comm_start_worker(comm) < 0) {
+ 		odl_tb5_stream_close(comm->handle, comm->stream_id);
+-		put_shared_handle();
++		put_shared_handle(comm->odl_dev);
+ 		free(comm);
+ 		return rcclSystemError;
+ 	}
+@@ -535,7 +643,7 @@ static rcclResult_t odl_tb5_closeListen(void *listenComm)
+ 	if (lh && !lh->accepted && lh->handle) {
+ 		/* accept() never took ownership — release the recv stream + ref. */
+ 		odl_tb5_stream_close(lh->handle, lh->stream_id);
+-		put_shared_handle();
++		put_shared_handle(lh->odl_dev);
+ 	}
+ 	free(lh);
+ 	return rcclSuccess;
+@@ -840,7 +948,7 @@ static rcclResult_t odl_tb5_closeSend(void *sendComm)
+ 	comm_stop_worker(comm);
+ 	if (comm->stream_id > 0)   /* may already be closed by stop_worker */
+ 		odl_tb5_stream_close(comm->handle, comm->stream_id);
+-	put_shared_handle();
++	put_shared_handle(comm->odl_dev);
+ 	free(comm);
+ 	return rcclSuccess;
+ }
