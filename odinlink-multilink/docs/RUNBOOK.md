@@ -227,43 +227,29 @@ point-to-point, so one master address is not reachable from every box.
 `NCCL_SOCKET_IFNAME` is per box and is not uniform either (a USB NIC comes up
 as `enp198s0f0u2u4`), so the launcher detects each box's LAN interface.
 
-## Status of the virtual-single-device plugin (0009/0010) — WIP, do not deploy
+## Virtual single device with per-connection negotiation (0009) — WORKING
 
-The design investigation is complete; the current 0010 does NOT pass and is
-parked as WIP. Findings, so the next session starts from knowledge and not
-from scratch:
+`0009-rccl-plugin-virtual-device-negotiation.patch` replaces the parked WIP:
+NCCL sees ONE net device; every connection is negotiated per peer and then
+carries its own dedicated data stream.
 
-1. **0007/0008 are correct and necessary** (unique device identity for NCCL
-   topo; NCCL handle overflow). Keep them.
-2. **The g_lock self-deadlock in listen()** (odl_listen_setup under the lock
-   calling get_shared_handle which takes it again) stalled NCCL before
-   listen(); fixed via `_locked` helper variants — that part of 0010 is right.
-3. **`odl_tb5_stream_wait_rx()` returns 0 on success** (data ready), negative
-   on timeout/error. `<= 0` in accept() threw the success case away and
-   busy-spun ~3M/s on an already-delivered hello. Fixed (`< 0`).
-4. **The remaining blocker is structural**: a shared per-cable stream cannot
-   multiplex multiple connections, because the driver's RX reassembly is
-   PER-STREAM single-buffer state (`rx_asm_len`/`rx_asm_next_frag`/one
-   `rx_asm_buf`). Interleaved multi-frame messages from several senders trip
-   the frag-gap check and are dropped. One sender at a time per stream works
-   (odl_stream_pingpong proves it); twelve NCCL channels on one stream cannot.
+- The driver reassembles received messages with per-stream state, so a data
+  stream must have exactly one sender. Every connection therefore opens its
+  own stream pair (connector S, acceptor R).
+- A per-cable CONTROL stream carries only single-frame messages (no
+  reassembly → safe to multiplex): `hello{S,C,L}` from the connector
+  ("I send from S, grant me on control stream C, for listener L") and
+  `grant{S,R}` back. A dispatcher thread per cable is the sole reader.
+- The listener tag L matters: NCCL exchanges each listen handle with ONE
+  specific peer, and without it a 3-box mesh crossed connections and
+  double-counted contributions (all-reduce returned 10 instead of 6).
+- connect() returns before the grant arrives; the send worker blocks on
+  dst_ready (published by the control dispatcher), so NCCL can post sends
+  immediately.
+- Watch the two g_lock re-entrancy traps: listen() runs under g_lock and the
+  control-plane setup must use the `_locked` handle helpers.
 
-**Design for the next iteration** (per-connection streams, the shape the
-driver actually supports):
+Verified: 2-rank and 3-rank all-reduce `exact=True` (repeat runs), zero
+transfers failed, fabric healthy afterwards. `ODL_RCCL_DEVICES` pinning is no
+longer needed (and should stay unset so all cables are visible).
 
-- Keep the per-cable shared stream as a CONTROL channel only — it carries
-  single-frame hello/grant messages (single-frame needs no reassembly, so
-  multiplexing it is safe).
-- connect(): open a dedicated send stream S, send `hello{S}` (single frame)
-  on the control stream, return success with dst unknown.
-- accept(): pop the pending hello, open a dedicated recv stream R, register
-  by_src[S] -> R, send `grant{S -> R}` (single frame) on the control stream.
-- The dispatcher routes grants to the connector's comm: sets `dst_id = R`;
-  the send worker queues requests until dst_id is set.
-- Data then flows per-connection (one sender per stream), which the driver
-  guarantees correct.
-- Teardown: close the per-connection streams; control stream stays.
-
-Debug tooling that made this tractable (keep): `0011-driver-trace-rx.patch`
-(`echo 1 > /sys/module/odl_tb5/parameters/trace_rx`) logs every frame's
-demux decision; `ODL_DEBUG=1` plugin trace lands in `/tmp/odl_plugin.<pid>.log`.
