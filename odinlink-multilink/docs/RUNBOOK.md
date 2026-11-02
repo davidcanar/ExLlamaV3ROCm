@@ -128,10 +128,24 @@ odl_pingpong server <dev> 4096 200 20
 odl_pingpong client <dev> 4096 200 20     # expect p50 ~33 us on Strix Halo
 ```
 
-Device↔peer mapping is probe-order dependent; identify it empirically with
-`odl_pingpong` (server on the peer, one dev at a time). On the reference 3-box
-mesh: Box1 `dev0`=Box2/`dev1`=Box3, Box2 `dev0`=Box1/`dev1`=Box3,
-Box3 `dev0`=Box2/`dev1`=Box1.
+### Device↔peer mapping is NOT stable
+
+Device indices are assigned in XDomain probe order, so they change across
+reboots and module reloads. Observed on the same 3-box mesh, before and after
+a synchronized reload:
+
+```
+first boot : Box1 dev0 = Box2, Box1 dev1 = Box3
+after      : Box1 dev0 = Box3, Box1 dev1 = Box2     <-- swapped
+```
+
+Never hardcode a mapping (that is also why `ODL_RCCL_PEERS` is passed
+explicitly rather than inferred). Re-derive it whenever the driver reloads:
+start a server on one peer device and try each local device, one at a time
+(`support/odl_stream_pingpong.py server|client`; the server prints its
+auto-assigned stream id, which the client takes as an argument). The pair that
+completes is the mapping. Mixing it up looks like a hang, because a stream id
+sent on the wrong cable has no matching stream on the peer.
 
 ## Troubleshooting
 
