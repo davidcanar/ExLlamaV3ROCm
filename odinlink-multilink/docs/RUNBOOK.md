@@ -289,12 +289,21 @@ fixed channel pattern never triggers.
    warmup hangs. `tools/ds41/odl_peer_probe.py` now derives the map on all three boxes at once and
    `tools/tp3_start.sh` hands each rank its own `ODL_RCCL_PEERS` on every start
    (`tp3_start.sh probe` prints it). With correct maps the world-3 warmup passes.
-2. **Still open: intermittent stall at the first large collective.** With correct maps, 3 of 6
-   starts stalled in the first prefill-sized all-reduce (the warm-up's 31-row chunk): every rank
-   inside the same collective, the RCCL proxy thread spinning, nearly every plugin comm worker idle
-   (no transfer queued), no driver message. It looks like a connection RCCL builds lazily for its
-   first Simple-protocol op that never completes. Next capture: `ODL_DEBUG=1` on all ranks. (The
-   failing starts all had odl_ar3 initialised; the one RCCL-only start passed — small sample.)
+2. **Fixed (patches/odinlink/0012): intermittent stall at the first large collective.** With
+   correct maps, about 1 start in 6 stalled in the first collective that connects new channels
+   or trees (the warm-up prefill, or the first 20 MiB all-reduce): every rank inside the same
+   collective, the RCCL proxy spinning, no driver message, and in the `ODL_DEBUG=1` trace one
+   send stuck with `dst=0` — its grant never delivered. The plugin's connector registry was
+   indexed by the local send stream id alone, while stream ids are allocated per device and both
+   cables hand out the same low ids: two pending connects with the same id on different cables
+   overwrote each other's entry and one grant went to the wrong comm. 0012 keys it by
+   (device, stream id). `perf/tp3/rccl_stall.sh` reproduces it on bare ranks in ~2 s per attempt
+   (2 of 12 hung before, 0 of 20 after, collision present in 12 of the 20). It was independent
+   of odl_ar3 (hung with it off too).
+   The `rccl3_allreduce` "hang" above was its exit, not the data path: rank 0 printed
+   `exact=True` and every transfer in the 10:12 traces completed; the script then never returned
+   from teardown. (Its 12.1 us per 4 MiB is the enqueue time: there is no sync before the timer
+   stops.)
 3. **Frame loss on the raw DMA path.** Under concurrent load all three boxes logged
    `RX CRC error ... frame dropped` followed by `stream N fragment gap ... dropping message`, often
    two boxes in the same second. The driver drops the whole message and nothing retransmits it,

@@ -1,0 +1,55 @@
+diff --git a/rccl/src/odl_tb5_plugin.c b/rccl/src/odl_tb5_plugin.c
+index 6f137a6..2a3da70 100644
+--- a/rccl/src/odl_tb5_plugin.c
++++ b/rccl/src/odl_tb5_plugin.c
+@@ -166,9 +166,18 @@ static struct odl_ctrl g_ctrl[ODL_TB5_MAX_RCCL_DEVICES];
+ static int             g_ctrl_count;
+ static int             g_ctrl_ready;
+ 
+-/* Connector registry: dedicated send stream id -> comm, so the control
+- * dispatcher can publish the granted destination. Under g_lock. */
+-static struct odl_tb5_comm *g_conn_by_sid[256];
++/* Connector registry: (cable, dedicated send stream id) -> comm, so the control
++ * dispatcher can publish the granted destination. Under g_lock.
++ *
++ * Keyed by the cable's odl device too: stream ids are allocated per device, and
++ * every device hands out the same low ids (20, 21, ...), so on a multi-cable host
++ * two pending connects to different peers routinely get the same S at the same
++ * time. Keyed by S alone, the second connect overwrote the first entry, the
++ * first peer's grant was published to the second comm, and the first comm's send
++ * worker waited for dst_ready forever (TP=3: RCCL hangs at the first collective
++ * that connects new channels, intermittently, depending on how the per-device
++ * id counters line up). */
++static struct odl_tb5_comm *g_conn_by_sid[ODL_TB5_MAX_RCCL_DEVICES][256];
+ 
+ static struct odl_rccl_stats *stats_map;
+ static int stats_fd = -1;
+@@ -441,7 +450,7 @@ static void *ctrl_thread(void *arg)
+ 			struct odl_tb5_comm *comm;
+ 
+ 			pthread_mutex_lock(&g_lock);
+-			comm = g_conn_by_sid[buf[1]];
++			comm = g_conn_by_sid[ct->odl_dev][buf[1]];
+ 			pthread_mutex_unlock(&g_lock);
+ 			if (comm) {
+ 				pthread_mutex_lock(&comm->q_lock);
+@@ -814,7 +823,7 @@ static rcclResult_t odl_tb5_connect(int dev, void *handle, void **sendComm,
+ 	}
+ 
+ 	pthread_mutex_lock(&g_lock);
+-	g_conn_by_sid[sid] = comm;
++	g_conn_by_sid[comm->odl_dev][sid] = comm;
+ 	pthread_mutex_unlock(&g_lock);
+ 
+ 	/* hello {S, C, L}: "I send from S; grant me on my control stream C;
+@@ -1241,8 +1250,8 @@ static rcclResult_t odl_tb5_closeSend(void *sendComm)
+ 	DBG(1, "close   comm=%p sid=%u is_send=%d", (void *)comm, comm->stream_id, comm->is_send);
+ 	if (comm->is_send) {
+ 		pthread_mutex_lock(&g_lock);
+-		if (g_conn_by_sid[comm->stream_id] == comm)
+-			g_conn_by_sid[comm->stream_id] = NULL;
++		if (g_conn_by_sid[comm->odl_dev][comm->stream_id] == comm)
++			g_conn_by_sid[comm->odl_dev][comm->stream_id] = NULL;
+ 		pthread_mutex_unlock(&g_lock);
+ 	}
+ 	comm_stop_worker(comm);

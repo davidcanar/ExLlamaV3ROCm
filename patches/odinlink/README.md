@@ -107,6 +107,20 @@ so adding fields mid-struct corrupts `net->napi.state` and plugging a cable
 hangs the machine (`napi_enable` BUG under `rtnl_lock`).
 `odinlink-multilink/check-tb-handler-abi.sh` enforces the layout at build time.
 
+`0012-rccl-plugin-per-cable-connector-registry.patch` (plugin only, MIT) fixes
+the intermittent TP=3 RCCL hang at the first collective that connects new
+channels or trees. The control dispatcher delivers grants through a connector
+registry that was indexed by the local send stream id alone, but stream ids are
+allocated per odl device and every cable hands out the same low ids (20, 21,
+...). When two pending connects to different peers got the same id, the second
+overwrote the first, one peer's grant was published to the wrong comm (which
+could then send to the wrong stream) and the other connection's send worker
+waited for its grant forever (an `ODL_DEBUG=1` trace shows a send stuck with
+`dst=0`). The registry is now keyed by (odl device, stream id). Reproduced with
+`perf/tp3/rccl_stall.sh` (the TP=3 start-up collectives on bare ranks, ~2 s per
+attempt): 2 of 12 starts hung before, 0 of 20 after, with the collision present
+in 12 of those 20 traces.
+
 Bring-up, addressing scheme and verification:
 [`odinlink-multilink/docs/RUNBOOK.md`](../../odinlink-multilink/docs/RUNBOOK.md).
 
