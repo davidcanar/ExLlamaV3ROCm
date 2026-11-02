@@ -61,8 +61,8 @@ export EXL3_TP_BUDGETS=${EXL3_TP_BUDGETS:-100,100,100}
 # Model selection: default is the 2.9bpw quant; export EXL3_TP_MODEL_DIR to
 # serve another checkpoint (e.g. model-3.5bpw). Paths must mirror on every box.
 export EXL3_TP_MODEL_DIR=${EXL3_TP_MODEL_DIR:-$ROOT/model}
-export EXL3_TP_SAFE_CTX=${EXL3_TP_SAFE_CTX:-1048576}
-export EXL3_TP_CACHE_TOKENS=${EXL3_TP_CACHE_TOKENS:-1048576}
+export EXL3_TP_SAFE_CTX=${EXL3_TP_SAFE_CTX:-524288}
+export EXL3_TP_CACHE_TOKENS=${EXL3_TP_CACHE_TOKENS:-524288}
 # DSpark (MTP speculative decoding) across all three ranks; opt out with
 # EXL3_TP_DSPARK=0. Validated after the pow2 split landed.
 export EXL3_TP_DSPARK=${EXL3_TP_DSPARK:-1}
