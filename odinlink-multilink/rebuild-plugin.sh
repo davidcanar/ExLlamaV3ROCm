@@ -34,8 +34,14 @@ if [ ! -d "$SRC/.git" ]; then
     git clone "$ODL_REPO" "$SRC"
 fi
 
-# Re-apply the series only when the tree is not already at it.
-if ! grep -q ODL_RCCL_PEERS "$SRC/rccl/src/odl_tb5_plugin.c" 2>/dev/null; then
+# Re-apply the series whenever it changes. A marker file records the hash of
+# the patch set that produced the tree: checking for one feature string is not
+# enough, because a NEWER patch would be skipped whenever an older one had
+# already left its own marker behind.
+SERIES_SHA=$(cat "$REPO"/patches/odinlink/[0-9]*.patch | sha256sum | cut -d' ' -f1)
+MARKER=$SRC/.odl-series-sha
+
+if [ "$(cat "$MARKER" 2>/dev/null)" != "$SERIES_SHA" ]; then
     echo "== resetting $SRC to $ODL_PIN and applying patches/odinlink =="
     git -C "$SRC" fetch -q origin
     git -C "$SRC" checkout -q "$ODL_PIN"
@@ -46,8 +52,9 @@ if ! grep -q ODL_RCCL_PEERS "$SRC/rccl/src/odl_tb5_plugin.c" 2>/dev/null; then
         git -C "$SRC" apply "$p"
         echo "   applied $(basename "$p")"
     done
+    printf '%s\n' "$SERIES_SHA" > "$MARKER"
 else
-    echo "== $SRC already carries the series =="
+    echo "== $SRC already carries this series ($SERIES_SHA) =="
 fi
 
 echo "== cmake build (lib + RCCL v7 plugin) =="

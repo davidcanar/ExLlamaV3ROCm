@@ -197,3 +197,32 @@ why this map is explicit rather than inferred.)
 
 `ODL_RCCL_DEVICES` still filters which devices are exposed at all; leave it
 unset on a multi-link host so both cables are visible.
+
+## RCCL with more than one OdinLink device (TP>2)
+
+Two NCCL-side details bite as soon as a host exposes two odl devices; neither
+shows up with one cable, so a working 2-node setup proves nothing about them.
+
+**1. Every net device needs a unique identity.** NCCL builds one topology node
+per net device and matches them by the properties the plugin reports. Returning
+the same `name`/`pciPath` for both (and `guid = dev`, i.e. 0 for the first)
+collapses them, and the first collective then fails with:
+
+```
+ncclInternalError: Could not find NET with id 0
+```
+
+`patches/odinlink/0007` gives each device a distinct name
+(`OdinLink-TB5/odl_tb5_N`), pciPath and non-zero guid.
+
+**2. Kill leftovers before rerunning.** A launcher killed by `timeout` does not
+kill the remote python: orphaned ranks keep retrying bootstrap and holding
+streams, and the next run then hangs against them. Symptoms are several
+`rccl3_allreduce.py` processes per box (`pgrep -af rccl3_allreduce`), all stuck
+after `ODL_TB5 net plugin loaded`. `support/rccl3_run.sh` now pre-cleans, uses a
+random bootstrap port per run, and traps EXIT to clean again.
+
+Bootstrap must ride the LAN, not the 10.0.2.x mesh: that mesh is
+point-to-point, so one master address is not reachable from every box.
+`NCCL_SOCKET_IFNAME` is per box and is not uniform either (a USB NIC comes up
+as `enp198s0f0u2u4`), so the launcher detects each box's LAN interface.

@@ -1,0 +1,47 @@
+diff --git a/rccl/src/odl_tb5_plugin.c b/rccl/src/odl_tb5_plugin.c
+index 1a1e417..5df9ee2 100644
+--- a/rccl/src/odl_tb5_plugin.c
++++ b/rccl/src/odl_tb5_plugin.c
+@@ -450,13 +450,29 @@ static rcclResult_t odl_tb5_devices(int *ndev)
+ 
+ static rcclResult_t odl_tb5_getProperties(int dev, rcclNetProperties_v7_t *props)
+ {
++	/* Per-device strings must outlive the call; NCCL keeps the pointers. */
++	static char names[ODL_TB5_MAX_RCCL_DEVICES][64];
++	static char pci_paths[ODL_TB5_MAX_RCCL_DEVICES][64];
++
+ 	if (dev < 0 || dev >= num_devices)
+ 		return rcclInvalidArgument;
+ 
+ 	memset(props, 0, sizeof(*props));
+-	props->name = (char *)"OdinLink-TB5";
+-	props->pciPath = (char *)"/sys/bus/thunderbolt";
+-	props->guid = (uint64_t)dev;
++	/*
++	 * Every property that identifies a device must be UNIQUE here. NCCL builds
++	 * one topology node per net device and matches them by these properties; a
++	 * multi-cable host exposes two odl devices, and with an identical name and
++	 * pciPath for both they collapse into a single node, after which the
++	 * topology lookup fails with "Could not find NET with id 0". A one-cable
++	 * host never hits it, which is why this only shows up at TP>2.
++	 */
++	snprintf(names[dev], sizeof(names[dev]), "OdinLink-TB5/odl_tb5_%d",
++		 dev_map[dev]);
++	snprintf(pci_paths[dev], sizeof(pci_paths[dev]),
++		 "/sys/bus/thunderbolt/devices/domain%d", dev_map[dev] % 2);
++	props->name = names[dev];
++	props->pciPath = pci_paths[dev];
++	props->guid = 0x0D1ULL << 32 | (uint64_t)(dev_map[dev] + 1);
+ 	props->ptrSupport = NCCL_PTR_HOST;   /* RCCL stages GPU<->host itself */
+ 	props->speed = 80000;
+ 	props->port = dev;
+@@ -465,7 +481,8 @@ static rcclResult_t odl_tb5_getProperties(int dev, rcclNetProperties_v7_t *props
+ 	props->maxRecvs = 1;
+ 	props->netDeviceType = 0;            /* NCCL_NET_DEVICE_HOST */
+ 	props->netDeviceVersion = 0;
+-	DBG(1, "getProperties dev=%d name=%s ptrSupport=HOST", dev, props->name);
++	DBG(1, "getProperties dev=%d name=%s pci=%s ptrSupport=HOST",
++	    dev, props->name, props->pciPath);
+ 	return rcclSuccess;
+ }
+ 
