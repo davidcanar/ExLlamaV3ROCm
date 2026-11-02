@@ -121,6 +121,21 @@ waited for its grant forever (an `ODL_DEBUG=1` trace shows a send stuck with
 attempt): 2 of 12 starts hung before, 0 of 20 after, with the collision present
 in 12 of those 20 traces.
 
+`0013-odl-tb5-rx-repost-reserve-before-post.patch` (driver) fixes one-way links
+after both ends of a cable moved to a 7.2 kernel. `odl_tb5_rx_repost()` read
+`rx_posted` once and then counted locally, but it runs both from process context
+(stream open) and from the RX completion path, which refills after every frame.
+A stream opened while its peer was already sending got refilled by both at once
+and posted about 2 x `rx_target` (4063 of the 4096 pool frames in one trace),
+leaving fewer than `ODL_TB5_TX_POOL_RESERVE` frames free: every send on that
+cable then failed `can_send` until inbound frames returned their slots, about one
+per peer ping. The DMA handshake still passes, so `odl-state` reports READY and
+only the data path is one-way - the box that opened its stream last cannot send.
+Each frame is now reserved in `rx_posted` before it is posted. Found 2026-11-02
+right after moving all three boxes to 7.2.14: `tools/ds41/tp3_start.sh probe`
+showed data flowing only from the lower- to the higher-numbered box on every
+cable (the probe starts on box1 first).
+
 Bring-up, addressing scheme and verification:
 [`odinlink-multilink/docs/RUNBOOK.md`](../../odinlink-multilink/docs/RUNBOOK.md).
 

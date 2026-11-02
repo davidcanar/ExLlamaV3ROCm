@@ -1,0 +1,69 @@
+diff --git a/driver/odl_tb5_ring_dma.c b/driver/odl_tb5_ring_dma.c
+index cfac953..b5995b9 100644
+--- a/driver/odl_tb5_ring_dma.c
++++ b/driver/odl_tb5_ring_dma.c
+@@ -2269,12 +2269,31 @@ int odl_tb5_stream_wait_rx(struct odl_tb5_stream *stream, u32 timeout_ms)
+ 
+ void odl_tb5_rx_repost(struct odl_tb5_device *dev)
+ {
+-	int posted = atomic_read(&dev->rx_posted);
+-	int target = dev->rx_target;
++	int target = READ_ONCE(dev->rx_target);
++	int posted;
+ 
+-	while (posted < target) {
++	/*
++	 * Reserve each frame in rx_posted BEFORE posting it, and stop as soon
++	 * as a reservation would exceed rx_target. This runs concurrently:
++	 * from process context (STREAM_OPEN, the DMA verify) and from the RX
++	 * completion path (MSI-X, ring work, the hrtimer poll), which refills
++	 * after every consumed frame. The previous loop read rx_posted once and
++	 * counted locally, so callers that started together each posted the
++	 * whole shortfall: a stream opened while its peer was already sending
++	 * posted about 2 x rx_target, drained the frame pool below
++	 * ODL_TB5_TX_POOL_RESERVE, and every send on that cable then failed
++	 * can_send until enough inbound frames had returned their slots. With
++	 * 7.2 kernels on both ends this hit, reliably, whichever side opened
++	 * its stream last.
++	 */
++	for (;;) {
+ 		struct odl_tb5_frame_slot *slot;
+ 
++		if (atomic_inc_return(&dev->rx_posted) > target) {
++			atomic_dec(&dev->rx_posted);
++			break;
++		}
++
+ 		slot = odl_tb5_frame_pool_get(&dev->frame_pool);
+ 		if (!slot) {
+ 			/*
+@@ -2284,8 +2303,10 @@ void odl_tb5_rx_repost(struct odl_tb5_device *dev)
+ 			 * be a bare break, which is why the loss had no
+ 			 * fingerprint.
+ 			 */
+-			int shortfall = target - posted;
++			int shortfall;
+ 
++			posted = atomic_dec_return(&dev->rx_posted);
++			shortfall = target - posted;
+ 			atomic_inc(&dev->rx_repost_starved);
+ 			if (shortfall > atomic_read(&dev->rx_repost_short))
+ 				atomic_set(&dev->rx_repost_short, shortfall);
+@@ -2303,15 +2324,14 @@ void odl_tb5_rx_repost(struct odl_tb5_device *dev)
+ 
+ 		if (dev->transport->ring_rx(dev, &slot->frame) < 0) {
+ 			odl_tb5_frame_pool_put(&dev->frame_pool, slot);
++			atomic_dec(&dev->rx_posted);
+ 			break;
+ 		}
+-
+-		atomic_inc(&dev->rx_posted);
+-		posted++;
+ 	}
+ 
+ 	/* Low-water mark, so a transient dip that never fully starves is still
+ 	 * visible after the fact. */
++	posted = atomic_read(&dev->rx_posted);
+ 	if (posted < atomic_read(&dev->rx_posted_min))
+ 		atomic_set(&dev->rx_posted_min, posted);
+ }
