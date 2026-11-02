@@ -12,7 +12,7 @@ speculative decoding ("DSpark") and a 512K-token context.
 | controller (run on Box1) | `exl3ds4.sh` | `tools/ds41/tp3_start.sh` |
 | quant | [2.9 bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw) (196 GiB) | [3.5 bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw) (240 GiB), or the 2.9 bpw |
 | decode all-reduce | `odl_ar2` (two parties, one cable) | `odl_ar3` (one hop to each peer, over its own cable) |
-| server | DSpark, four cached conversations in one shared pool, per-rank NVMe spill, image input | DSpark, one cached conversation |
+| server | DSpark, four cached conversations in one shared pool, per-rank NVMe spill, image input | DSpark, four cached conversations in one shared pool, per-rank NVMe spill |
 
 This repository is the working deployment, packaged for reinstallation: an installer,
 the two controllers, the server, and the patches it needs on top of ExLlamaV3, OdinLink
@@ -57,8 +57,11 @@ Prompt processing runs at ~290–410 tok/s (2K–32K context). The decode all-re
 run over `odl_ar3`, a one-hop all-reduce on the OdinLink mesh (28 µs per 10 KB
 all-reduce, against 140 µs for three-rank RCCL), which took plain decode from 17.2
 to 21 tok/s and DSpark from 23.0 to 30.2. Greedy plain output is byte-identical to
-the RCCL path. Details: [docs/tp3-runtime.md](docs/tp3-runtime.md) and
-[docs/tp3-review-2026-11-02.md](docs/tp3-review-2026-11-02.md).
+the RCCL path. The conversation cache works as on TP=2 (`perf/tp3/session_check.py`):
+a 10K-token conversation came back from cache after a different conversation had run
+(10,058 of 10,075 prompt tokens reused), and after it was spilled to NVMe it reloaded
+in 0.8 s instead of a 29 s prefill. Details: [docs/tp3-runtime.md](docs/tp3-runtime.md)
+and [docs/tp3-review-2026-11-02.md](docs/tp3-review-2026-11-02.md).
 
 ## What you need
 
@@ -216,7 +219,7 @@ Per-request options beyond the OpenAI ones:
 | `"cache_salt": "..."` | prompt-cache namespace; a new salt drops every cached conversation |
 | `"reasoning_effort"`, `"chat_template_kwargs": {"thinking": false}` | thinking budget / off |
 
-At TP=2 the server keeps four conversation slots by default (`EXL3_TP_SESSIONS=4`) over
+The server keeps four conversation slots by default (`EXL3_TP_SESSIONS=4`) over
 one shared 512K-token pool. It recognizes a returning conversation from the
 prompt prefix itself, so clients need no session id: a turn that still contains
 the previous prompt (modulo the template's one-token generation header) returns
@@ -225,9 +228,7 @@ request, gets another slot instead of overwriting the first. When all slots are
 hot, the least-recently-used conversation is spilled to one local NVMe image per
 rank and reloaded on its next turn instead of re-prefilling; images last for the
 server's lifetime only. `"session": N` can pin a hot slot, but auto-matching is
-the normal path. TP=3 runs the single-conversation engine: the last conversation's
-prompt is reused on its next turn, and a different conversation replaces it.
-One request runs at a time; others queue, so GPU work stays serialized.
+the normal path. One request runs at a time; others queue, so GPU work stays serialized.
 
 ## Configuration
 
@@ -272,9 +273,12 @@ On other machines, override the rig's addresses and paths:
 `EXL3_TP_MODEL_DIR` (default `$EXL3DS4_ROOT/model`), `EXL3_TP_SAFE_CTX` /
 `EXL3_TP_CACHE_TOKENS` (524288), `EXL3_TP_DSPARK` (1), `EXL3_TP_BUDGETS` (GiB per rank,
 `100,100,100`), `EXL3_TP_ODL_AR3` (1; `0` puts decode back on RCCL), `EXL3_TP_NCCL_SYNC`
-(`stream`), `EXL3_TP_SPAN` and `NCCL_MAX_NCHANNELS` (4). The multi-session pool, the
-NVMe tier and vision are off at TP=3 (`EXL3_TP_SESSIONS=1`, `EXL3_TP_DISK_CACHE=0`,
-`EXL3_TP_VISION=0`); they are validated at TP=2 only.
+(`stream`), `EXL3_TP_SPAN`, `NCCL_MAX_NCHANNELS` (4), and the conversation cache knobs
+with the TP=2 defaults: `EXL3_TP_SESSIONS` (4), `EXL3_TP_PREFIX_*`, `EXL3_TP_DISK_CACHE`
+(1), `EXL3_TP_DISK_CACHE_DIR` (`$EXL3DS4_ROOT/diskcache`), `EXL3_TP_DISK_CACHE_GIB` (32),
+`EXL3_TP_DISK_TIMEOUT` (300). Rank 0 sends an SSE keep-alive comment after 30 s
+without output (`KYOJIN_SSE_PING_S`), so clients do not time out during a long prefill.
+Vision is off at TP=3 (`EXL3_TP_VISION=0`; validated at TP=2 only).
 
 | variable | default | meaning |
 |---|---|---|
@@ -293,8 +297,8 @@ rank started by hand).
 
 - If any rank dies mid-request, restart all of them (`exl3ds4.sh restart`, or
   `tp3_start.sh stop` then `start`).
-- One request runs at a time; at TP=2 four cached conversations share the pool but
-  their GPU work is serialized. Pages are grow-only within a conversation's life;
+- One request runs at a time; four cached conversations share the pool but their
+  GPU work is serialized. Pages are grow-only within a conversation's life;
   freedom comes from whole-session spill or eviction.
 - Spilled images are one-shot: a server restart starts with an empty disk tier
   and every conversation re-prefills.

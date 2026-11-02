@@ -86,10 +86,15 @@ two seconds per attempt) and is the quickest check after any driver or plugin ch
 
 ## Status
 
-- Validated: DSpark, 512K cache, the single-conversation engine with prompt reuse,
-  3.5 and 2.9 bpw. Greedy plain output is byte-identical to the RCCL-only path.
-- Off and not validated at TP=3: the multi-session pool, the NVMe tier and vision
-  (`EXL3_TP_SESSIONS=1`, `EXL3_TP_DISK_CACHE=0`, `EXL3_TP_VISION=0`).
+- Validated: DSpark, 512K cache, 3.5 and 2.9 bpw, and the TP=2 conversation cache
+  (`EXL3_TP_SESSIONS=4`, control protocol 5, per-rank NVMe spill): `perf/tp3/session_check.py`
+  resumes a 10K-token conversation from cache after a different one ran, keeps a thinking-on
+  conversation whose client drops the reasoning, and reloads a spilled conversation from
+  NVMe on all three ranks (`cold_loads=1`, no fallbacks). Greedy plain output is
+  byte-identical to the RCCL-only path. Until 2026-11-02 TP=3 ran the single-conversation
+  engine, where any other conversation (a client's title request, a test) overwrote the
+  cached one and its next turn re-prefilled from scratch.
+- Off and not validated at TP=3: vision (`EXL3_TP_VISION=0`).
 - RCCL has no retransmit over OdinLink: a frame dropped by a cable (RX CRC error, rare)
   during a prefill all-reduce hangs the server until it is restarted.
 - Not measured yet: decode beyond 32K context, prefill at full context.
@@ -102,3 +107,4 @@ two seconds per attempt) and is the quickest check after any driver or plugin ch
 | `perf/tp3/ar3_bench.sh` | RCCL vs `odl_ar3` all-reduce microbenchmark |
 | `perf/tp3/rccl_stall.sh` | start-up collective repro (`ODL_DEBUG=1` keeps plugin traces of failing attempts) |
 | `perf/tp3/http_check.py` | one DSpark and one plain request against the running server |
+| `perf/tp3/session_check.py` | conversation cache: interleaved conversations, thinking on, NVMe spill and reload |

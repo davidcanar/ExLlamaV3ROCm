@@ -58,9 +58,17 @@ export EXL3_TP_ODL_AR2=0
 # odl_ar3 mesh decode all-reduces (see tp3_serve.sh); must match on every rank
 export EXL3_TP_ODL_AR3=${EXL3_TP_ODL_AR3:-1}
 # First-light simplifications: single session, no vision tower, no NVMe tier.
-export EXL3_TP_SESSIONS=${EXL3_TP_SESSIONS:-1}
+# Conversation cache as on TP=2 (exl3ds4.sh): 4 slots share the one 512K pool, a returning
+# conversation is matched by its prompt prefix, and when all slots are hot the least-recently-
+# used one spills to a per-rank NVMe image. The session count, the pool geometry and the disk
+# knobs must match on every rank (tp3_start.sh forwards overrides; the handshake refuses a
+# mismatch). EXL3_TP_SESSIONS=1 is the single-conversation engine.
+export EXL3_TP_SESSIONS=${EXL3_TP_SESSIONS:-4}
 export EXL3_TP_VISION=${EXL3_TP_VISION:-0}
-export EXL3_TP_DISK_CACHE=${EXL3_TP_DISK_CACHE:-0}
+export EXL3_TP_DISK_CACHE=${EXL3_TP_DISK_CACHE:-1}
+export EXL3_TP_DISK_CACHE_DIR=${EXL3_TP_DISK_CACHE_DIR:-$ROOT/diskcache}
+export EXL3_TP_DISK_CACHE_GIB=${EXL3_TP_DISK_CACHE_GIB:-32}
+export EXL3_TP_DISK_TIMEOUT=${EXL3_TP_DISK_TIMEOUT:-300}
 export EXL3_TP_BUDGETS=${EXL3_TP_BUDGETS:-100,100,100}
 # Model selection: default is the 2.9bpw quant; export EXL3_TP_MODEL_DIR to
 # serve another checkpoint (e.g. model-3.5bpw). Paths must mirror on every box.
