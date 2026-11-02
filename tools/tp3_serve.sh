@@ -22,13 +22,20 @@ export EXLLAMA_MASTER_PORT=$MASTER_PORT
 export NCCL_SOCKET_IFNAME=${EXL3_IFACE:-eno1}
 export NCCL_IB_DISABLE=1
 export NCCL_NET=ODL_TB5
-# Box1 this boot: dev1=Box2, dev0=Box3 (re-derive after any odl_tb5 reload)
+# Cable map: tp3_start.sh probes it on every start (tools/ds41/odl_peer_probe.py) and passes
+# ODL_RCCL_PEERS in; the default below is only the fallback for a direct launch (measured
+# 2026-11-02 after the 10:42 odl_tb5 reload: Box1 dev0=Box3, dev1=Box2)
 export ODL_RCCL_LOCAL_IP=${ODL_RCCL_LOCAL_IP:-10.0.2.1}
 export ODL_RCCL_PEERS=${ODL_RCCL_PEERS:-10.0.2.2=1,10.0.2.3=0}
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 export NCCL_MAX_NCHANNELS=${NCCL_MAX_NCHANNELS:-4}
 export EXL3_TP_NCCL_SYNC=${EXL3_TP_NCCL_SYNC:-stream}
 export EXL3_TP_ODL_AR2=0
+# Decode-sized all-reduces over the OdinLink mesh (odl_ar3: one hop to each peer over its own
+# cable, stream-ordered, no host sync; ~40 us vs ~170 us for 3-rank RCCL at 10 KB). Prefill-sized
+# collectives stay on RCCL. Every rank must agree (the setup is collective and falls back to RCCL
+# on all ranks if any rank has it off). Build: ~/exl3ds4/odl_ar3/build.sh on every box.
+export EXL3_TP_ODL_AR3=${EXL3_TP_ODL_AR3:-1}
 export EXL3_TP_SESSIONS=${EXL3_TP_SESSIONS:-1}
 export EXL3_TP_VISION=${EXL3_TP_VISION:-0}
 export EXL3_TP_DISK_CACHE=${EXL3_TP_DISK_CACHE:-0}

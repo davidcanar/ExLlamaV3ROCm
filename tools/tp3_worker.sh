@@ -11,9 +11,10 @@
 #   - EXL3_TP_ODL_AR2=0: the odl_ar2 decode path is 2-party; RCCL handles all
 #     collectives at world size 3
 #
-# The ODL_RCCL_PEERS map matches the current driver load. Device indices follow
-# XDomain probe order and DO change across reloads -- re-derive after any
-# odl_tb5 reload (odinlink-multilink docs/RUNBOOK.md, "mapping is NOT stable").
+# The ODL_RCCL_PEERS defaults below are only a fallback: tp3_start.sh probes the live cable
+# map on every start (tools/ds41/odl_peer_probe.py) and passes each rank its own map. Device
+# indices follow XDomain probe order and DO change across reloads (odinlink-multilink
+# docs/RUNBOOK.md, "mapping is NOT stable"); "./tp3_start.sh probe" prints the current one.
 set -euo pipefail
 
 NODE_RANK=${1:?usage: tp3_worker.sh <node-rank 1|2> [master-port] [control-port]}
@@ -23,12 +24,13 @@ ROOT=/home/davidcanar/exl3ds4
 ODL_BUILD=/home/davidcanar/.cache/odinlink/build
 
 case "$NODE_RANK" in
-1)  # Box2: dev0=Box1, dev1=Box3 (this boot)
+1)  # Box2: dev0=Box3, dev1=Box1 (measured 2026-11-02 after the 10:42 reload; the old
+    # 10.0.2.1=0,10.0.2.3=1 default was stale and cross-wired RCCL -> 3-rank warmup hangs)
     LOCAL_IP=${EXL3_TP_LOCAL_IP_OVERRIDE:-10.0.2.2}
-    PEERS=${ODL_RCCL_PEERS:-10.0.2.1=0,10.0.2.3=1}
+    PEERS=${ODL_RCCL_PEERS:-10.0.2.1=1,10.0.2.3=0}
     IFACE=${EXL3_IFACE:-eno1}
     ;;
-2)  # Box3: dev0=Box1, dev1=Box2 (this boot)
+2)  # Box3: dev0=Box1, dev1=Box2 (measured 2026-11-02)
     LOCAL_IP=${EXL3_TP_LOCAL_IP_OVERRIDE:-10.0.2.3}
     PEERS=${ODL_RCCL_PEERS:-10.0.2.1=0,10.0.2.2=1}
     IFACE=${EXL3_IFACE:-enp198s0f0u2u4}
@@ -53,6 +55,8 @@ export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 export NCCL_MAX_NCHANNELS=${NCCL_MAX_NCHANNELS:-4}
 export EXL3_TP_NCCL_SYNC=${EXL3_TP_NCCL_SYNC:-stream}
 export EXL3_TP_ODL_AR2=0
+# odl_ar3 mesh decode all-reduces (see tp3_serve.sh); must match on every rank
+export EXL3_TP_ODL_AR3=${EXL3_TP_ODL_AR3:-1}
 # First-light simplifications: single session, no vision tower, no NVMe tier.
 export EXL3_TP_SESSIONS=${EXL3_TP_SESSIONS:-1}
 export EXL3_TP_VISION=${EXL3_TP_VISION:-0}
