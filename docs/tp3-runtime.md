@@ -6,17 +6,17 @@ How the three-node stack is put together. How to install and start it is in the
 
 ```bash
 cd ~/exl3ds4
-EXL3_TP_MODEL_DIR=$HOME/exl3ds4/model-3.5bpw ./tools/ds41/tp3_start.sh start   # stop | status | logs | probe
+EXL3_TP_MODEL_DIR=$HOME/exl3ds4/model-3.5bpw ./tools/ds41/tp3_start.sh start   # stop | restart | status | logs | probe | watch | unwatch
 ```
 
 ## Files (tools/ds41/)
 
 | File | Role |
 |---|---|
-| `tp3_start.sh` | Controller (start/stop/status/logs/probe), run on Box1. Probes the cable map, starts the workers over ssh, gates rank 0 on their model load, starts rank 0. |
+| `tp3_start.sh` | Controller (start/stop/restart/status/logs/probe/watch/unwatch), run on Box1. Probes the cable map, starts the workers over ssh, gates rank 0 on their model load, starts rank 0, and leaves the [watchdog](#watchdog) running. |
 | `tp3_serve.sh`, `tp3_serve.py` | Rank 0 (Box1): `tp_serve.py` with the single rank-1 channel replaced by `MultiControlChannel` plus per-worker handshake verification. The HTTP layer, its arguments and `TPEngine` are reused verbatim. |
 | `tp3_worker.sh`, `tp3_worker.py` | Ranks 1..N-1 (Box2 = 1, Box3 = 2): `tp_rank1.py` accepting any rank >= 1; `tp_engine.Rank1Worker` is rank-agnostic. |
-| `tp3_channel.py` | `MultiControlChannel`: the `ControlChannel` surface (`send`/`recv`/`request`/`request_with_blobs`/`set_recv_timeout`/`close`) fanned out over N-1 workers. **Send to all, then receive from all**: a worker replies only after its model call finished, and that call contains collectives, so sending to worker 2 after worker 1 replied would deadlock both. Replies are compared modulo the `rank` field; divergence raises `WorkerDiverged`. |
+| `tp3_channel.py` | `MultiControlChannel`: the `ControlChannel` surface (`send`/`recv`/`request`/`request_with_blobs`/`set_recv_timeout`/`close`) fanned out over N-1 workers. **Send to all, then receive from all**: a worker replies only after its model call finished, and that call contains collectives, so sending to worker 2 after worker 1 replied would deadlock both. Replies must agree except in per-worker fields (`rank`, the size of each worker's own spill image `bytes`, the error text `reason`/`message`); any other difference raises `WorkerDiverged`. |
 | `odl_peer_probe.py` | Cable map: pings on every `/dev/odl_tb5_N` and prints which box answered on which device, as `ODL_RCCL_PEERS`. Both controllers (`tp3_start.sh`, `exl3ds4.sh`) run it on every start. |
 
 ## What a start does
@@ -40,6 +40,39 @@ EXL3_TP_MODEL_DIR=$HOME/exl3ds4/model-3.5bpw ./tools/ds41/tp3_start.sh start   #
 The NCCL bootstrap and the control channel ride the LAN (`EXLLAMA_MASTER_ADDR`, Box1's
 LAN IP): every `10.0.2.x` Thunderbolt link is point-to-point, so no single address on the
 mesh reaches every box. All tensor traffic rides OdinLink.
+
+## Watchdog
+
+`tp3_start.sh start` leaves `tp3_start.sh _watchdog` running on Box1 (pid in
+`logs/tp3-watchdog.pid`, events in `logs/tp3-watchdog.log`; `EXL3_TP3_WATCHDOG=0` starts
+without it, `watch` attaches one to a stack that is already up, `unwatch` removes it).
+Every `EXL3_TP3_WATCH_INTERVAL` seconds (15) it asks each box about its rank
+(`tp3_start.sh _state`, over ssh for the workers): is the pid in `logs/tp3-rankN.pid` still
+that rank's python, and has a worker logged `failed; restart ALL ranks` since the start it
+watches (`logs/tp3-watchdog.offsets` holds the log sizes at that start)? A worker that hits a
+protocol error prints that line and then waits for its GPU child, which may sit in a
+collective until the NCCL timeout; rank 0 cannot resynchronize after it either way. An
+unreachable box proves nothing and is skipped. When a rank is down or failed the watchdog
+stops every rank (SIGINT to each rank's process group, SIGKILL 5 s later) and runs the start
+again with the same settings: the environment of the `start` it came from, or, for `watch`
+and `restart`, the running rank 0's (read from `/proc/<pid>/environ`), so a restart cannot
+silently fall back to the default model. A restart that is not serving within
+`EXL3_TP3_WATCH_LOAD_TIMEOUT` seconds (900) counts as a failure; consecutive failures wait
+30 s, 60 s, ... up to 15 minutes, and 30 minutes up resets that.
+
+The watchdog never judges a rank by HTTP, so a slow answer during a long prefill can never
+trigger a restart. A hang inside a collective (a frame lost by RCCL, below) ends when
+NCCL's 10-minute timeout takes the ranks down; the watchdog restarts them then. It cannot
+fix the fabric: if a box rebooted or the cable probe stays incomplete, it keeps retrying
+with backoff and logs each attempt. It does not survive a reboot of Box1, and `stop` (which
+removes `logs/tp3.want`) is the only clean way to take TP=3 down.
+
+Every rank starts under `setsid`, so its python, the spawned GPU process and the resource
+tracker share a process group (`logs/tp3-rankN.pgid`). A stop signals the group, the pid and
+its children, then any rank process by name (as the launcher always did), so the GPU process
+goes down too, even when it is stuck in a collective after its parent exited. The liveness
+checks match only this install tree's python running the rank script, never an editor with
+the file open.
 
 ## Model split at world size 3
 
@@ -102,7 +135,15 @@ two seconds per attempt) and is the quickest check after any driver or plugin ch
   all-reduce, which was the plugin's connector registry (`patches/odinlink/0012`); no prompt
   longer than 512K has been run since.
 - RCCL has no retransmit over OdinLink: a frame dropped by a cable (RX CRC error, rare)
-  during a prefill all-reduce hangs the server until it is restarted.
+  during a prefill all-reduce hangs the server until NCCL's 10-minute timeout takes the
+  ranks down; the watchdog then restarts them.
+- 2026-11-02 17:31: the stack went down after a spill. Both workers wrote their images, but
+  the image trailer carries a timestamp whose text length varies, so their sizes differed by
+  a byte (839100 / 839101). Rank 0 compared the `spill_ok` replies including that size, read
+  a divergence, and evicted a session the workers had already spilled; both died on `evict
+  of unknown session` and rank 0 waited in its next prefill all-reduce until the NCCL
+  timeout. Fixed in `tp3_channel.py` (per-worker fields are not compared);
+  `tools/ds41/test_tp3_channel.py` reproduces it with the real engine and two real workers.
 - Not measured yet: decode beyond 32K context, prefill at full context.
 
 ## Tools

@@ -169,10 +169,12 @@ From Box1:
 ```bash
 cd ~/exl3ds4
 EXL3_TP_MODEL_DIR=$HOME/exl3ds4/model-3.5bpw ./tools/ds41/tp3_start.sh start
-./tools/ds41/tp3_start.sh status    # rank 0 /health and the worker processes
+./tools/ds41/tp3_start.sh status    # rank 0 /health, the worker processes, the watchdog
 ./tools/ds41/tp3_start.sh logs      # follow rank 0
-./tools/ds41/tp3_start.sh stop      # stops all three boxes
+./tools/ds41/tp3_start.sh restart   # stop + start, keeping the running stack's settings
+./tools/ds41/tp3_start.sh stop      # stops the watchdog and all three boxes
 ./tools/ds41/tp3_start.sh probe     # print the cable map of all three boxes (server stopped)
+./tools/ds41/tp3_start.sh watch     # attach a watchdog to a stack that is already up (unwatch: remove it)
 ```
 
 `start` probes the cables on all three boxes at once, starts the workers (rank 1 on
@@ -181,6 +183,19 @@ rank 0. The server is ready about three minutes later, when
 `curl -s localhost:1234/health` reports `"status": "ok"`. Without
 `EXL3_TP_MODEL_DIR` it serves the 2.9 bpw quant from `~/exl3ds4/model`. Logs:
 `~/exl3ds4/logs/tp3-rank0.log` on Box1, `tp3-rank1.log` on Box2, `tp3-rank2.log` on Box3.
+
+`start` also leaves a watchdog running on Box1 (`~/exl3ds4/logs/tp3-watchdog.log`). When
+the stack dies it restarts all three ranks with the settings they were started with: a
+rank's process exited, or a worker logged that it failed (rank 0 cannot resynchronize after
+that, and would otherwise sit in its next collective until the 10-minute NCCL timeout). The
+server is back about three minutes later, with an empty conversation cache. Repeated
+failures back off (30 s, doubling to 15 minutes; reset after 30 minutes up). It never
+judges a rank by HTTP, so a long prefill is not taken for a hang; a hang inside a
+collective ends when NCCL's own timeout takes the ranks down, and the watchdog restarts
+them then. Each rank runs in its own process group, so a stop or restart also kills the
+GPU processes it spawned, even one stuck in a collective. `EXL3_TP3_WATCHDOG=0` starts
+without a watchdog. Always stop TP=3 with `tp3_start.sh stop` (before starting TP=2, for
+instance): to the watchdog, any other way of killing it is a crash.
 
 ### Requests
 
@@ -302,8 +317,9 @@ rank started by hand).
 
 ## Known limitations
 
-- If any rank dies mid-request, restart all of them (`exl3ds4.sh restart`, or
-  `tp3_start.sh stop` then `start`).
+- If any rank dies mid-request, all of them have to restart: `exl3ds4.sh restart` at
+  TP=2; at TP=3 the watchdog does it. The request in flight is lost either way, and so is
+  the conversation cache. Nothing starts a stack at boot.
 - One request runs at a time; four cached conversations share the pool but their
   GPU work is serialized. Pages are grow-only within a conversation's life;
   freedom comes from whole-session spill or eviction.
@@ -351,7 +367,7 @@ setup.sh, env.sh       installer; shared ROCm/HIP environment
 exl3ds4.sh             TP=2 controller: start | stop | restart | status | logs | probe
 tools/ds41/            the OpenAI server, the TP engine and the launchers (+ CPU tests)
   tp_serve.py          TP=2 rank 0 (tp_serve_rank0.sh); tp_rank1.py / tp_rank1.sh is rank 1
-  tp3_start.sh         TP=3 controller: start | stop | status | logs | probe
+  tp3_start.sh         TP=3 controller + watchdog: start | stop | restart | status | logs | probe | watch
   tp3_serve.py         TP=3 rank 0 (tp3_serve.sh); tp3_worker.py / tp3_worker.sh are ranks 1-2
   tp3_channel.py       rank 0's fan-out control channel to N-1 workers
   odl_peer_probe.py    per-boot OdinLink cable map, used by both controllers
