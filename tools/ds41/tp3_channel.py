@@ -7,7 +7,7 @@ changes there: this module provides an object with the same surface that
 
   - accepts N-1 worker connections on one listening socket,
   - sends every frame to EVERY worker before receiving any reply, and
-  - verifies the workers' replies are identical (modulo their rank field).
+  - verifies the workers' replies agree (per-worker fields aside, see _PER_WORKER).
 
 The send-all-then-recv-all ordering is not an optimization choice: a worker
 reply arrives only after its model call finishes, and that call contains RCCL
@@ -29,9 +29,34 @@ class WorkerDiverged(tp_engine.ProtocolError):
     """Workers replied differently to the same frame: a lockstep violation."""
 
 
+# Reply fields that legitimately differ between workers; everything else (the op, session
+# and request ids, counts) is lockstep state and must match exactly.
+#   rank             each worker's own id
+#   bytes            spill_ok: the size of THIS worker's disk image. The image trailer holds a
+#                    wall-clock timestamp whose JSON text varies in length, so two workers'
+#                    images of one session often differ by a byte. Comparing it turned good
+#                    spills into "divergences" (2026-11-02: 839100 vs 839101 bytes): rank 0
+#                    evicted a session both workers had already spilled, both died on "evict
+#                    of unknown session", and rank 0 sat in its next collective until the
+#                    10-minute NCCL watchdog took the whole stack down.
+#   reason, message  the free-text detail of spill_error / load_error / error replies (paths,
+#                    errno text); the op already says what happened
+_PER_WORKER = frozenset({"rank", "bytes", "reason", "message"})
+
+
 def _comparable(reply: dict) -> dict:
-    """Reply content minus rank-identifying fields (workers legitimately differ there)."""
-    return {k: v for k, v in reply.items() if k != "rank"}
+    """Reply content minus the per-worker fields (_PER_WORKER)."""
+    return {k: v for k, v in reply.items() if k not in _PER_WORKER}
+
+
+def _agree(replies: list[dict]) -> dict:
+    """The first worker's reply, once every other worker's reply says the same."""
+    first = replies[0]
+    want = _comparable(first)
+    for i, rep in enumerate(replies[1:], start=1):
+        if _comparable(rep) != want:
+            raise WorkerDiverged(f"worker replies diverged: worker1={first} worker{i + 1}={rep}")
+    return first
 
 
 class MultiControlChannel:
@@ -86,54 +111,34 @@ class MultiControlChannel:
                 ch.send_with_blobs(msg, blobs)
 
     def recv(self) -> dict:
-        replies = [ch.recv() for ch in self.channels]
-        first = replies[0]
-        want = _comparable(first)
-        for i, rep in enumerate(replies[1:], start=1):
-            if _comparable(rep) != want:
-                raise WorkerDiverged(
-                    f"worker replies diverged: worker1={first} worker{i + 1}={rep}")
-        return first
+        return _agree([ch.recv() for ch in self.channels])
 
     def recv_blob(self) -> bytes:
         # No current op ships blobs worker -> rank 0; fail loudly if one appears.
         raise NotImplementedError("tp3: worker->rank0 blobs are not part of the protocol")
 
     def request(self, msg: dict, timeout: float = 30.0) -> dict:
-        with self.lock:
-            for ch in self.channels:
-                old = ch.conn.gettimeout()
-                ch.conn.settimeout(timeout)
-                ch.send(msg)
-            replies = []
-            for ch in self.channels:
-                try:
-                    replies.append(ch.recv())
-                finally:
-                    ch.conn.settimeout(ch.conn.gettimeout())
-        first = replies[0]
-        want = _comparable(first)
-        for i, rep in enumerate(replies[1:], start=1):
-            if _comparable(rep) != want:
-                raise WorkerDiverged(
-                    f"worker replies diverged: worker1={first} worker{i + 1}={rep}")
-        return first
+        return self._exchange(lambda ch: ch.send(msg), timeout)
 
     def request_with_blobs(self, msg: dict, blobs: list[bytes], timeout: float = 120.0) -> dict:
+        return self._exchange(lambda ch: ch.send_with_blobs(msg, blobs), timeout)
+
+    def _exchange(self, send, timeout: float) -> dict:
+        """Send one frame to every worker, then read every reply under `timeout`. Every
+        socket gets its own previous timeout back afterwards, success or not (as
+        ControlChannel.request does), so a later recv -- the drain of a late disk reply --
+        runs under the channel's normal timeout rather than this call's."""
         with self.lock:
-            for ch in self.channels:
-                ch.conn.settimeout(timeout)
-                ch.send_with_blobs(msg, blobs)
-            replies = [ch.recv() for ch in self.channels]
-            for ch in self.channels:
-                ch.conn.settimeout(self.channels[0].timeout)
-        first = replies[0]
-        want = _comparable(first)
-        for i, rep in enumerate(replies[1:], start=1):
-            if _comparable(rep) != want:
-                raise WorkerDiverged(
-                    f"worker replies diverged: worker1={first} worker{i + 1}={rep}")
-        return first
+            olds = [ch.conn.gettimeout() for ch in self.channels]
+            try:
+                for ch in self.channels:
+                    ch.conn.settimeout(timeout)
+                    send(ch)
+                replies = [ch.recv() for ch in self.channels]
+            finally:
+                for ch, old in zip(self.channels, olds):
+                    ch.conn.settimeout(old)
+        return _agree(replies)
 
     def close(self) -> None:
         for ch in self.channels:
