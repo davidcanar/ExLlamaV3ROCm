@@ -290,8 +290,9 @@ class SessionRanks:
 
     def __init__(self, *, spec: bool = False, sessions: int = 4, pool_pages: int = 32,
                  page_size: int = PAGE, session_opts: dict | None = None, span: int | None = None,
-                 record: bool = False, ctx: int | None = None):
-        cls = SessionSpecBackend if spec else SessionBackend
+                 record: bool = False, ctx: int | None = None, backend_cls=None,
+                 tokenizer=None, vision: bool = False):
+        cls = backend_cls or (SessionSpecBackend if spec else SessionBackend)
         self.be0, self.be1 = cls(pool_pages, page_size), cls(pool_pages, page_size)
         if span is not None:
             self.be0.span = self.be1.span = span
@@ -315,17 +316,20 @@ class SessionRanks:
         self.chan = tp_engine.ControlChannel.listen("127.0.0.1", port, accept_timeout=30.0)
         hello = {"op": "hello", "proto": tp_engine.PROTO_SESSIONS, "vocab_size": VOCAB,
                  "dspark": spec, "sessions": sessions, "pool_pages": pool_pages,
-                 "page_size": page_size}
+                 "page_size": page_size, "vision": vision}
         self.chan.send(hello)
         ok = self.chan.recv()
         assert ok.get("op") == "hello_ok" and ok.get("proto") == tp_engine.PROTO_SESSIONS \
             and ok.get("sessions") == sessions and ok.get("pool_pages") == pool_pages, ok
+        if vision:
+            assert ok.get("vision_capable") is True
         if record:
             self.chan = _RecordingChannel(self.chan, self.frames)
         opts = {"prefix_slots": 2, "min_tokens": 8}
         opts.update(session_opts or {})
         self.engine = tp_engine.TPEngine(
-            self.be0, self.chan, Tok(), ctx=pool_pages * page_size - 2 if ctx is None else ctx,
+            self.be0, self.chan, tokenizer if tokenizer is not None else Tok(),
+            ctx=pool_pages * page_size - 2 if ctx is None else ctx,
             eos_id=None, sessions=sessions, session_opts=opts, log=lambda *_: None)
         assert self.engine.mgr is not None and self.engine.sessions == sessions
 

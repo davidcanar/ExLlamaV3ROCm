@@ -177,7 +177,7 @@ def build_tp_engine(args: argparse.Namespace) -> Any:
               f"ids 1..{sessions}; /tp/status reports the pool)", flush=True)
     if vision:
         print("tp-serve: vision on (rank 0 tower + aligner loaded; image requests ship their rows "
-              "to rank 1 per request; image prompts bypass the prefix cache)", flush=True)
+              "to rank 1 per request; content-stable image ids use the prefix cache)", flush=True)
     else:
         print("tp-serve: vision off (image requests are refused with 400; EXL3_TP_VISION=0, a "
               "degraded load or a text-only model -- see the load log)", flush=True)

@@ -36,10 +36,10 @@ degrading to text-only):
   (CPU, off the event loop) decodes safely (data:/base64/http(s), byte + pixel caps) and plans
   the exact token span from the tower's own resize math; `prompt_ids(prompt, images)` splices
   each occurrence into its unique dynamic-id range, so lengths account for the expansion
-- image requests bypass the prefix cache entirely (no restore, no save): the dynamic ids are
-  unique per allocation, so cross-request identity would need pixel hashing -- deliberately
-  not attempted in this first version. Text requests keep the cache, including against the
-  text prefix an image request left in the cache (identical ids, still valid)
+- image occurrences use content-addressed dynamic ids: the full sha256 of the source bytes +
+  token grid plus the per-content occurrence index selects a range from the engine allocator.
+  Identical conversation history therefore has identical ids, so image and text prompts share
+  the normal prefix/session cache; different images and duplicate occurrences never alias
 - DSpark composes with vision (the drafter never sees image ids: it drafts from the anchor
   and verifies text rows) -- and a first vision run that does not fit VRAM beside the drafter
   is practical per launch with `EXL3_TP_DSPARK=0 ./exl3ds4.sh restart` (both ranks read it;
@@ -123,7 +123,7 @@ Multiple cached sessions (Stage 1, 2026-10-30, `tp_sessions.py`; EXL3_TP_SESSION
   matches the session whose entire committed sequence is a prefix of the new prompt, modulo the
   generation-header 1-token rewrite (see tp_sessions). A divergent conversation sharing only the
   system prompt matches nothing and gets its own slot. An explicit per-request "session" id
-  overrides the search; image and warm-up requests are ephemeral slots that free themselves.
+  overrides the search; warm-up requests are ephemeral slots that free themselves.
 - rank 0 owns every allocation decision and sends the session's full page list in each begin
   frame; rank 1 validates it against its own records (growth-only, no page shared between
   sessions, in range) and mirrors the same block table, so the two ranks can never quietly
@@ -1489,6 +1489,7 @@ class Rank1Worker:
         self.prompt_len = 0        # prefilled rows of the active request (memory-trim gating at end)
         self.stashes: dict[int, tuple[int, Any]] = {}   # proto 4: key -> (position, stash)
         self.embeddings = None     # image rows of the request being armed (imgmeta -> begin)
+        self.embeddings_req = None  # request id: an aborted shipment must not poison the next one
         # proto 5 (multi-session): per-session records {sid: {"pages": [...], "stashes": {}}},
         # plus the page -> sid claim map every begin validates against (no page may belong to
         # two sessions; a session's list only ever grows) and the active request's page mapping
@@ -1624,6 +1625,7 @@ class Rank1Worker:
         self.embeddings = [make_mm_embedding(d["first_index"], d["tensor"], alias=d["alias"],
                                              metadata={"source": "rank0-wire"})
                            for d in described]
+        self.embeddings_req = msg.get("req")
         self.channel.send({"op": "imgmeta_ok", "req": msg.get("req"), "images": len(self.embeddings),
                            "rows": sum(int(d["rows"]) for d in described)})
 
@@ -1827,8 +1829,14 @@ class Rank1Worker:
         if len(ids) < 2:
             raise ValueError("rank 1: prompt must hold at least 2 token ids")
         # Image rows ride as dynamic ids >= 1e9; they are legal only when an imgmeta shipment
-        # with covering ranges preceded this begin (rank 1 never sees the tower itself)
+        # with covering ranges preceded this begin (rank 1 never sees the tower itself). If the
+        # previous request shipped rows but failed before its begin, they belong to that old req
+        # and must not poison this one. A shipment tagged with THIS req is still strict below.
         embeds = self.embeddings or None
+        if embeds is not None and self.embeddings_req != msg.get("req"):
+            self.embeddings = None
+            self.embeddings_req = None
+            embeds = None
         mm_ids = [t for t in ids if t >= FIRST_MM_EMBEDDING_INDEX]
         if mm_ids and embeds is None:
             raise ValueError(f"rank 1: prompt holds {len(mm_ids)} image row id(s) but no imgmeta "
@@ -2028,9 +2036,10 @@ class Rank1Worker:
         self.spec = False
         self.round_k = None
         self.embeddings = None     # the next image request ships its own rows
+        self.embeddings_req = None
         if self.proto >= PROTO_SESSIONS:
-            # whole sessions freed at the settled end of their request (ephemeral image and
-            # warm-up slots; the drops above already emptied their stashes)
+            # whole sessions freed at the settled end of their request (ephemeral warm-up
+            # slots; the drops above already emptied their stashes)
             self._drop_sessions(msg.get("evict"))
         trim = getattr(self.backend, "trim_memory", None)    # rank 0 trims on long requests;
         if trim is not None and self.prompt_len > getattr(self.backend, "span", 0):
@@ -2052,6 +2061,7 @@ class Rank1Worker:
         self.round_k = None
         self.prompt_len = 0
         self.embeddings = None
+        self.embeddings_req = None
         self.alloc = None
         self.sid = 0
 
@@ -2330,9 +2340,9 @@ class TPEngine:
         """Request image records -> prepared images (CPU, off the event loop: fetch, decode,
         geometry). Raises ImageError (a ValueError) on anything wrong; the server answers 400.
 
-        The span each image will occupy is fixed here (unique dynamic-id range + exact row
-        count from the tower's own resize math), so `prompt_ids` can expand placeholders and
-        count the expanded length before any GPU work happens."""
+        The span each image will occupy is fixed here (content-stable dynamic-id range + exact
+        row count from the tower's own resize math), so `prompt_ids` can expand placeholders,
+        count the expanded length and reuse prior checkpoints before any GPU work happens."""
         if not self.supports_vision:
             raise tp_vision.ImageError("this server has no vision support (no tower loaded: "
                                        "EXL3_TP_VISION=0, a failed load, or a text-only model)")
@@ -2342,7 +2352,7 @@ class TPEngine:
         if len(records) > limit:
             raise tp_vision.ImageError(f"{len(records)} images exceed the per-request limit of "
                                        f"{limit} (EXL3_TP_MAX_IMAGES)")
-        return [tp_vision.prepare_one(r, self.vision_cfg, self._mm_alloc) for r in records]
+        return tp_vision.prepare_many(records, self.vision_cfg, self._mm_alloc)
 
     def _vision_encode(self, images: list[tp_vision.PreparedImage]) -> list:
         """Run the tower + aligner for each image (model thread, no collectives) and bind the
@@ -2807,7 +2817,7 @@ class TPEngine:
         (both ranks: the end frame's "rewind"), so the checkpoint matches the next turn.
 
         Multi-session mode settles the ACTIVE session's record the same way (mgr.finish), and
-        frees ephemeral slots (image/warm-up) at this settled boundary: the end frame carries
+        frees ephemeral slots (warm-up) at this settled boundary: the end frame carries
         their sid in "evict" and rank 1 frees the record after the drops/save above."""
         px = self._active_px()
         if px is None:
@@ -2870,7 +2880,7 @@ class TPEngine:
              ephemeral: bool = False) -> dict[str, Any]:
         # routing phase 1 (pure) -> everything fallible (vision encode + shipment) -> commit
         plan = self._session_plan(ids, max_tokens, spec=False,
-                                  ephemeral=ephemeral or bool(images), explicit_sid=session)
+                                  ephemeral=ephemeral, explicit_sid=session)
         embeddings = self._vision_encode(images) if images else None
         if embeddings:
             self._ship_embeddings(images, embeddings)    # imgmeta + blobs + imgmeta_ok, before begin
@@ -3063,7 +3073,7 @@ class TPEngine:
         import torch                                                    # the whole request runs under inference_mode (as the script)
         # routing phase 1 (pure) -> vision encode/shipment -> commit (nothing fails after it)
         plan = self._session_plan(ids, max_tokens, spec=True,
-                                  ephemeral=ephemeral or bool(images), explicit_sid=session)
+                                  ephemeral=ephemeral, explicit_sid=session)
         embeddings = self._vision_encode(images) if images else None
         if embeddings:
             self._ship_embeddings(images, embeddings)    # imgmeta + blobs + imgmeta_ok, before begin
@@ -3223,11 +3233,9 @@ class TPEngine:
                              f"{cache_cap - 2} usable tokens (EXL3_TP_CACHE_TOKENS={cache_cap}); "
                              f"refused before any rank dispatch")
         max_tokens = max(1, min(int(max_tokens), self.ctx - len(ids) - 1))
-        # Image requests bypass the prefix cache for now: the dynamic ids are unique per
-        # allocation, so identifying "the same image" across requests needs pixel hashing
-        # (deliberately not in this first version). cache_prompt stays effective for text.
-        if images:
-            cache_prompt = False
+        # prepare_images gives each image occurrence a stable content-addressed id range for
+        # this engine's lifetime, so image prompts follow the same cache/session path as text.
+        # An explicit cache_prompt=false still opts out for either modality.
         # Spec mode is chosen here, once per request, at the settled start boundary. Sampled
         # requests draft too (exact speculative sampling, see _accept_sampled) unless
         # EXL3_TP_SPEC_SAMPLED=0 restores the greedy-only rule; an explicit opt-out always runs

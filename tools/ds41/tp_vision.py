@@ -14,7 +14,7 @@ This module is everything around it that must be testable without a GPU:
   ``DeepseekV41VisionModel.preprocess``/``plan_resize`` so ``prompt_ids`` can expand image
   placeholders to their exact token spans BEFORE the tower runs (the tower's own result is
   asserted to match at generate time -- a silent drift is impossible);
-- per-image unique index ranges and text aliases for the ``indexed_embeddings`` mechanism
+- content-stable, per-occurrence index ranges and text aliases for ``indexed_embeddings``
   (``exllamav3/tokenizer/mm_embedding.py``: dynamic token ids >= 1000000000 whose rows ride
   in ``params["indexed_embeddings"]``, the native multimodal path of this tree -- the MoE
   ``bias_vl`` routing, the Engram n-gram block and the PLE mapping all key off those ids);
@@ -45,6 +45,8 @@ DEFAULT_MAX_IMAGES = 8
 # exllamav3.tokenizer.mm_embedding.FIRST_MM_EMBEDDING_INDEX (dynamic multimodal id base).
 # Imported lazily by tp_engine where the library is available; asserted equal there.
 FIRST_MM_EMBEDDING_INDEX = 1000000000
+# PrefixCache / SessionManager sequences use array("i"): never let a dynamic id cross int32.
+LAST_MM_EMBEDDING_INDEX = (1 << 31) - 1
 
 _DATA_URL = re.compile(r"^data:([^;,]*)(;[^,]*)?,", re.IGNORECASE)
 
@@ -216,22 +218,39 @@ def num_image_tokens(n_llm_h: int, n_llm_w: int) -> int:
 
 
 class MMIndexAllocator:
-    """Hands out contiguous dynamic-id ranges >= FIRST_MM_EMBEDDING_INDEX, never reusing one.
+    """Hand out contiguous dynamic-id ranges >= FIRST_MM_EMBEDDING_INDEX.
 
-    The library's own global allocator does the same for aliases typed into ``tokenizer.encode``;
-    the engine drives expansion itself (occurrence order of ``<｜deepseek_image｜>``), so it keeps
-    its own monotonic counter. Rank 1 never allocates: its ranges arrive over the wire, and the
-    never-reuse rule keeps a stale rank-1 copy of a previous request's rows from ever aliasing a
-    new image's ids."""
+    Unkeyed allocations are always fresh. A keyed allocation reuses its range only when both
+    the full image-content identity and the occurrence index match, so a continuing prompt gets
+    stable ids while different images -- including duplicate occurrences in one prompt -- can
+    never alias. Rank 1 never allocates: its ranges arrive over the wire with the matching rows.
+    """
 
     def __init__(self, first: int = FIRST_MM_EMBEDDING_INDEX):
         self.next = int(first)
         self._lock = threading.Lock()
+        self._by_identity: dict[object, tuple[int, int]] = {}
 
-    def allocate(self, n: int) -> int:
+    def allocate(self, n: int, *, reuse_key: object = None) -> int:
+        n = int(n)
+        if n < 1:
+            raise ValueError("an image dynamic-id range must contain at least one token")
         with self._lock:
+            if reuse_key is not None:
+                previous = self._by_identity.get(reuse_key)
+                if previous is not None:
+                    idx, previous_n = previous
+                    if previous_n != n:
+                        raise ValueError(f"image identity {reuse_key!r} changed span from "
+                                         f"{previous_n} to {n} tokens")
+                    return idx
+            if self.next + n - 1 > LAST_MM_EMBEDDING_INDEX:
+                raise ImageError("the int32 multimodal id space is exhausted; restart the "
+                                 "server before submitting new unique images")
             idx = self.next
-            self.next += int(n)
+            self.next += n
+            if reuse_key is not None:
+                self._by_identity[reuse_key] = (idx, n)
             return idx
 
 
@@ -242,7 +261,7 @@ class PreparedImage:
     pil: Any                                    # decoded RGB PIL image (kept for the tower)
     n_llm_h: int
     n_llm_w: int
-    first_index: int                            # dynamic-id base (>= 1e9), unique process-wide
+    first_index: int                            # stable engine-lifetime dynamic-id base (>= 1e9)
     alias: str                                  # unique text alias (logs / metadata only)
     key: str = ""                               # sha256 of the source bytes + grid (identity)
     source: str = ""                            # where the bytes came from (logs)
@@ -262,19 +281,46 @@ class PreparedImage:
         return self.n_tokens
 
 
-def prepare_one(record: dict, v, alloc: MMIndexAllocator, *, max_pixels: int | None = None) -> PreparedImage:
+def prepare_one(record: dict, v, alloc: MMIndexAllocator, *, max_pixels: int | None = None,
+                occurrence: int = 0, _occurrences: dict[str, int] | None = None) -> PreparedImage:
     """record -> PreparedImage (CPU: fetch, decode, geometry). The tower runs later, on the
-    model thread, from ``pil``."""
+    model thread, from ``pil``.
+
+    The full source-byte digest + vision geometry + per-content occurrence is the allocator's
+    reuse identity, so a continuing prompt gets stable ids while duplicates stay nonoverlapping.
+    ``prepare_many`` supplies the per-request occurrence map; the short ``key`` is metadata only.
+    """
     raw, source = load_image_bytes(record)
     image = decode_image(raw, max_pixels=max_pixels)
     n_llm_h, n_llm_w = plan_grid(image.width, image.height, v)
-    first = alloc.allocate(num_image_tokens(n_llm_h, n_llm_w))
     h = hashlib.sha256()
-    h.update(str((n_llm_h, n_llm_w)).encode())
+    geometry = (n_llm_h, n_llm_w, v.patch_size, v.downsample_ratio, v.max_n_token,
+                v.min_pixels, v.max_wh_ratio)
+    h.update(repr(geometry).encode())
     h.update(raw)
+    identity = h.hexdigest()
+    if _occurrences is not None:
+        occurrence = _occurrences.get(identity, 0)
+        _occurrences[identity] = occurrence + 1
+    occurrence = int(occurrence)
+    if occurrence < 0:
+        raise ValueError("image occurrence must be non-negative")
+    first = alloc.allocate(num_image_tokens(n_llm_h, n_llm_w), reuse_key=(identity, occurrence))
     return PreparedImage(pil=image, n_llm_h=n_llm_h, n_llm_w=n_llm_w, first_index=first,
-                         alias=f"<$EMB_{first}$>", key=h.hexdigest()[:16], source=source,
+                         alias=f"<$EMB_{first}$>", key=identity[:16], source=source,
                          size=(image.width, image.height))
+
+
+def prepare_many(records: list[dict], v, alloc: MMIndexAllocator,
+                 *, max_pixels: int | None = None) -> list[PreparedImage]:
+    """Prepare one request's images, counting duplicate occurrences independently per content.
+
+    Content identity does not depend on list position: [A, B] and [B, A] keep the same ranges
+    for A and B. Only a repeated copy of the same content advances its occurrence number.
+    """
+    occurrences: dict[str, int] = {}
+    return [prepare_one(record, v, alloc, max_pixels=max_pixels, _occurrences=occurrences)
+            for record in records]
 
 
 def expand_prompt_ids(ids: list[int], images: list[PreparedImage], image_token_id: int) -> list[int]:
@@ -337,11 +383,12 @@ def encode_imgmeta(images: list[PreparedImage]) -> tuple[dict, list[bytes]]:
     """The imgmeta control frame and the binary payloads that follow it, in order.
 
     ``rows`` must already be the tower's output on every image (generate fills it before
-    shipping). Each entry carries the dynamic-id range it owns; rank 1 rebuilds its
-    ``indexed_embeddings`` list from exactly these numbers, so the two ranks agree on which
-    id maps to which row without shipping a single id again."""
+    shipping). Entries and blobs are sorted together by dynamic-id base: content-addressed
+    ranges can arrive in first-seen order rather than request order, while rank 1 requires
+    strictly increasing, nonoverlapping ranges. Each entry carries its own range, so request
+    order is irrelevant to the indexed-embedding lookup."""
     specs, blobs = [], []
-    for img in images:
+    for img in sorted(images, key=lambda im: int(im.first_index)):
         if img.rows is None:
             raise ValueError(f"image {img.alias} has no tower rows to ship")
         dtype, raw = pack_rows(img.rows)

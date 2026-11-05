@@ -27,8 +27,9 @@ search (validated; wrong type/range is a clean error).
 use_cache ("cache_prompt": false) skips checkpoint restore/save for one request but never
 changes session identity: the request still runs in the conversation it belongs to (its
 writes must land on that session's rows), exactly as the single-session engine still
-updates its record on no-cache requests. Image and warm-up requests are ephemeral: they
-allocate a slot and pages for one request, never match, and free themselves at end.
+updates its record on no-cache requests. Warm-up requests are ephemeral: they allocate a
+slot and pages for one request, never match, and free themselves at end. Image conversations
+use the same persistent sessions as text because their content-addressed ids are stable.
 
 Stage 2 (tp_disk.py) layers NVMe whole-session spill/restore on top of the same records;
 this module stays importable and testable without it.
@@ -106,7 +107,7 @@ class Session:
         self.pages: list[int] = []       # logical page i -> physical page pages[i]
         self.tick = 0
         self.active = False
-        self.ephemeral = False           # image/warm-up requests: freed at end, never matched
+        self.ephemeral = False           # warm-up requests: freed at end, never matched
         self.last_prompt_len = 0         # h: position h-1 is the generation header the next turn rewrites
 
     @property
@@ -523,7 +524,7 @@ class SessionManager:
             session.last_prompt_len = int(prompt_len)
 
     def release_ephemeral(self, session: Session) -> list:
-        """Drop an ephemeral session (image/warm-up requests can never match: unique ids).
+        """Drop an ephemeral warm-up session (its generated ids can never match).
         Returns its Checkpoints (there are none: ephemeral sessions never save)."""
         assert session.ephemeral, "release_ephemeral on a persistent session"
         self.counters["ephemeral_freed"] += 1

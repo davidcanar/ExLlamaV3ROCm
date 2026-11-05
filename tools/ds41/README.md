@@ -246,9 +246,10 @@ generation header, exactly where the single-session cache restored). Longest mat
 ties go to the most recently used. A prompt that shares only the system prompt diverges
 inside the previous prompt and can never hijack its slot; verbatim tool echoes and header
 rewrites both match. `"session": N` (1..S) pins a hot slot for testing or explicit clients;
-a spilled slot must be recalled by auto-match, not by an explicit id. Image and warm-up
-requests are ephemeral: they get a slot for one request, never match, and free themselves at
-the settled end, preserving the vision cache-bypass rule.
+a spilled slot must be recalled by auto-match, not by an explicit id. Warm-up requests are
+ephemeral: they get a slot for one request, never match, and free themselves at the settled
+end. Image conversations are persistent — their content-stable dynamic ids let them match and
+reuse their own checkpoints.
 
 **Whole-session LRU eviction and spill.** When a new request needs a slot or pages, the
 least-recently-used inactive conversation is the victim. With the disk tier on, both ranks
@@ -312,13 +313,15 @@ all key off them).
   (`render_chat_vl`); `prepare_images` (CPU, off the event loop) loads bytes safely — data:
   URLs, bare base64 and http(s), capped at 32 MiB fetched / 100 Mpx decoded, EXIF-oriented,
   every failure a clean 400 — and plans each image's exact token span from the tower's own
-  resize math; `prompt_ids(prompt, images)` splices each placeholder into its image's unique
-  dynamic-id range, so context/cache bounds check the *expanded* length; `generate` runs the
-  tower once per image on the model thread, ships the rows, prefills and decodes as usual.
-- **Prefix cache:** image requests bypass it entirely and run in an ephemeral slot (unique ids
-  per allocation make cross-request identity a pixel-hash problem, deliberately not attempted
-  here). Text requests keep their conversation's cache, including against the text prefix an
-  image request left behind.
+  resize math; `prompt_ids(prompt, images)` splices each placeholder into its image's
+  content-stable, per-occurrence dynamic-id range, so context/cache bounds check the *expanded*
+  length; `generate` runs the tower once per image on the model thread, ships the rows,
+  prefills and decodes as usual.
+- **Prefix cache:** the full SHA-256 of the source bytes + token grid, plus the image's
+  per-content occurrence index, selects a stable dynamic-id range from the engine allocator.
+  Continuing multimodal conversations therefore use the same session/prefix checkpoints as
+  text; different images and duplicate occurrences never alias. This reuses trunk KV state;
+  the vision tower still runs once per image on each request.
 - **DSpark composes** with vision (the drafter only ever sees the anchor and text rows). A
   first run that does not fit VRAM beside the drafter is practical per launch:
   `EXL3_TP_DSPARK=0 ./exl3ds4.sh restart` (both ranks read it, budgets fall back to the
@@ -333,8 +336,10 @@ multi-session build on 2026-10-30):
 42** comes back verbatim with plain decoding and with DSpark (`"speculative": true`, 5 draft
 tokens accepted), streamed over SSE (chunked deltas + `[DONE]`), at 336 expanded prompt
 tokens and ~1.4 s per request end to end; `data:image/png;base64,AAAA` is a clean 400 that
-reaches neither rank's model; image requests report `cached_tokens: 0` (cache bypassed) and a
-text follow-up after image traffic still restores 1644 of its prompt tokens.
+reaches neither rank's model. With the content-stable ids deployed on 2026-11-05, a live
+text/image conversation reused 991 of 1001 text-follow-up tokens, 1001 of 1333 tokens on the
+first image turn, and 1333 of 1343 tokens on the following turn with the same image in
+history; the image turns remained in one persistent slot and freed no ephemeral session.
 
 ## Launch (from Box1)
 
@@ -437,12 +442,14 @@ combined sessions+disk run: **44 passed**.
   and a re-vendor of the real Kyojin tree rebuilding `ds41_serve.py` byte for byte.
 - `test_tp_vision.py` - the vision support: safe image loading (data:/base64/http(s), byte +
   pixel caps, scheme refusal), the V4.1 geometry plan against the architecture's own
-  `plan_resize`, unique dynamic-id ranges/aliases and placeholder expansion, JSON+binary frame
-  sharing on one channel, sha256-validated rank-1 reconstruction (corruption/overlap/truncation
-  refused), `indexed_embeddings` on every prefill chunk at unchanged offsets (never on text),
-  engine end-to-end pairs over loopback (tower stand-in, bit-exact rows on rank 1, cache
-  bypass, broken-prompt refusals before any dispatch), and the vendored HTTP layer over the
-  real `TPEngine` with images (needs the exllamav3 tree on `PYTHONPATH`; skips otherwise).
+  `plan_resize`, content-stable per-occurrence ranges/aliases and placeholder expansion,
+  JSON+binary frame sharing on one channel, sha256-validated rank-1 reconstruction
+  (corruption/overlap/truncation refused, ranges sorted for content-addressed reuse),
+  `indexed_embeddings` on every prefill chunk at unchanged offsets (never on text), engine
+  end-to-end pairs over loopback (tower stand-in, bit-exact rows on rank 1, cache reuse in
+  plain/DSpark and multi-session modes, NVMe spill/reload, aborted-shipment cleanup,
+  broken-prompt refusals before any dispatch), and the vendored HTTP layer over the real
+  `TPEngine` with images (needs the exllamav3 tree on `PYTHONPATH`; skips otherwise).
 
 ## Knobs and defaults
 
@@ -520,9 +527,10 @@ enforces its own local disk cap and directory.
    `EXL3_TP_IMAGE_HTTP=0` turns them off). The NVMe tier trusts `EXL3_TP_DISK_CACHE_DIR`
    (0o700, local storage): checksums detect corruption, but the stash region is a pickle and
    is not a sandbox. Never point the tier at untrusted storage.
-6. **Vision first-version limits:** image prompts bypass the prefix cache and use an ephemeral
-   conversation slot (no pixel-hash identity yet — a repeated image re-encodes and
-   re-prefills); prompts must end on a text token; the tower runs only on rank 0 (a second
+6. **Vision limits:** prompts must end on a text token; the tower runs only on rank 0 and
+   re-encodes every image on each request even when the trunk KV prefix is restored (a second
    concurrent image request queues behind the one in-flight request, as everything else).
+   Dynamic-id reuse is process-lifetime; cold disk images remain one-shot and are swept at
+   restart, so allocator state is never persisted.
 7. **No restart persistence.** Spilled images live only for the server's lifetime; the next
    process sweeps stale images and every conversation starts from a fresh prefill.

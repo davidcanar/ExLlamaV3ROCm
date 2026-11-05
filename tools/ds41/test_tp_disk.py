@@ -96,8 +96,8 @@ class DiskHarness:
 
     def __init__(self, *, spec: bool = False, sessions: int = 2, pool_pages: int = 32,
                  disk_root: Path, cap_gib: float | None = None, disk_on: bool = True,
-                 record: bool = False):
-        cls = DiskSpecBackend if spec else DiskBackend
+                 record: bool = False, backend_cls=None, tokenizer=None, vision: bool = False):
+        cls = backend_cls or (DiskSpecBackend if spec else DiskBackend)
         self.be0, self.be1 = cls(pool_pages, PAGE), cls(pool_pages, PAGE)
         self.sessions = sessions
         self.errors: list[BaseException] = []
@@ -125,15 +125,18 @@ class DiskHarness:
         self.chan = tp_engine.ControlChannel.listen("127.0.0.1", port, accept_timeout=30.0)
         self.chan.send({"op": "hello", "proto": tp_engine.PROTO_SESSIONS, "vocab_size": 129280,
                         "dspark": spec, "sessions": sessions, "pool_pages": pool_pages,
-                        "page_size": PAGE})
+                        "page_size": PAGE, "vision": vision})
         ok = self.chan.recv()
         assert ok.get("op") == "hello_ok" and ok.get("sessions") == sessions, ok
+        if vision:
+            assert ok.get("vision_capable") is True
         if record:
             from test_tp_sessions import _RecordingChannel
             self.chan = _RecordingChannel(self.chan, self.frames)
         loud = print if os.environ.get("TP_DISK_DEBUG") else (lambda *_: None)
         self.engine = tp_engine.TPEngine(
-            self.be0, self.chan, Tok(), ctx=pool_pages * PAGE - 2, eos_id=None,
+            self.be0, self.chan, tokenizer if tokenizer is not None else Tok(),
+            ctx=pool_pages * PAGE - 2, eos_id=None,
             sessions=sessions, session_opts={"prefix_slots": 2, "min_tokens": 8},
             disk_opts=self.opts0, log=loud)
         assert self.engine.mgr is not None

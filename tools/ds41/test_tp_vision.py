@@ -13,7 +13,8 @@ without any GPU, model weights or the real tower:
   reconstruction, protocol version/handshake validation;
 - indexed_embeddings on EVERY prefill chunk (both ranks, chunk offsets unchanged) and never
   on text requests;
-- prefix-cache safety: image requests restore and save nothing, text requests keep the cache;
+- prefix-cache reuse: stable image identity lets continuing multimodal conversations restore
+  and save checkpoints in single- and multi-session modes, with and without DSpark;
 - text-path regressions at the frame level (the ops rank 1 sees are unchanged).
 
 The engine-level pairs additionally exercise make_mm_embedding, so they need the exllamav3
@@ -41,6 +42,9 @@ import ds41_testkit as kit  # noqa: E402
 import tp_engine  # noqa: E402
 import tp_vision  # noqa: E402
 import test_tp_control as ctrl  # noqa: E402  (loopback helpers of the main suite)
+import test_tp_prefix_cache as cache_tests  # noqa: E402
+import test_tp_sessions as session_tests  # noqa: E402
+import test_tp_disk as disk_tests  # noqa: E402
 from ds41_engine import SPECIAL_TOKENS  # noqa: E402
 from test_tp_chunked_prefill import FakeCore, make_backend  # noqa: E402
 
@@ -215,6 +219,15 @@ def test_allocator_is_monotonic_and_never_reuses():
     assert len(seen) == 200                                        # every range unique under threads
 
 
+def test_allocator_refuses_to_cross_the_int32_cache_id_boundary():
+    alloc = tp_vision.MMIndexAllocator(first=tp_vision.LAST_MM_EMBEDDING_INDEX - 3)
+    assert alloc.allocate(4) == tp_vision.LAST_MM_EMBEDDING_INDEX - 3
+    with pytest.raises(tp_vision.ImageError, match="exhausted"):
+        alloc.allocate(1)
+    with pytest.raises(ValueError, match="at least one"):
+        alloc.allocate(0)
+
+
 def test_prepare_one_assigns_unique_alias_and_span():
     alloc = tp_vision.MMIndexAllocator()
     one = tp_vision.prepare_one({"data": base64.b64encode(tiny_png()).decode()}, VCFG, alloc)
@@ -223,6 +236,39 @@ def test_prepare_one_assigns_unique_alias_and_span():
     assert one.alias != two.alias and one.key != two.key
     assert one.token_ids == list(range(FIRST, FIRST + one.n_tokens))
     assert one.n_tokens == tp_vision.num_image_tokens(one.n_llm_h, one.n_llm_w)
+
+
+def test_prepare_one_reuses_only_the_same_content_and_occurrence():
+    alloc = tp_vision.MMIndexAllocator()
+    record = {"data": base64.b64encode(tiny_png()).decode("ascii")}
+    one = tp_vision.prepare_one(record, VCFG, alloc, occurrence=0)
+    next_after_first = alloc.next
+    same = tp_vision.prepare_one(record, VCFG, alloc, occurrence=0)
+    duplicate = tp_vision.prepare_one(record, VCFG, alloc, occurrence=1)
+    other = tp_vision.prepare_one({"data": base64.b64encode(tiny_png(32, 32)).decode("ascii")},
+                                  VCFG, alloc, occurrence=0)
+    assert same.first_index == one.first_index                  # same image occurrence: cache hit
+    assert alloc.next == next_after_first + duplicate.n_tokens + other.n_tokens
+    assert one.key == same.key == duplicate.key                # display key is content-only
+    assert len({one.first_index, duplicate.first_index, other.first_index}) == 3
+    spans = sorted((im.first_index, im.first_index + im.n_tokens)
+                   for im in (one, duplicate, other))
+    assert all(a[1] <= b[0] for a, b in zip(spans, spans[1:]))  # no image can alias another
+
+
+def test_prepare_many_reuses_ids_per_content_not_list_position():
+    alloc = tp_vision.MMIndexAllocator()
+    a = {"data": base64.b64encode(tiny_png(64, 48)).decode("ascii")}
+    b = {"data": base64.b64encode(tiny_png(32, 40, (10, 20, 200))).decode("ascii")}
+    first = tp_vision.prepare_many([a, a, b, a], VCFG, alloc)
+    next_after_first = alloc.next
+    repeated = tp_vision.prepare_many([a, a, b, a], VCFG, alloc)
+    reordered = tp_vision.prepare_many([b, a], VCFG, alloc)
+    assert [im.first_index for im in repeated] == [im.first_index for im in first]
+    assert len({im.first_index for im in first}) == 4            # A,A,B,A: three A occurrences
+    assert reordered[0].first_index == first[2].first_index      # B is occurrence 0 anywhere
+    assert reordered[1].first_index == first[0].first_index      # A is occurrence 0 anywhere
+    assert alloc.next == next_after_first                        # lookups never burn new ranges
 
 
 def test_expand_prompt_ids_splices_each_occurrence_in_order():
@@ -273,6 +319,16 @@ def test_imgmeta_round_trip_reconstructs_ranges_and_rows():
     assert [d["rows"] for d in described] == [6, 10]
     assert torch.equal(described[0]["tensor"], preps[0].rows)
     assert torch.equal(described[1]["tensor"], preps[1].rows)     # bf16 rides an int16 view
+
+
+def test_imgmeta_sorts_content_addressed_ranges_and_blobs_together():
+    early = _prepared_with_rows(6, 8, FIRST)
+    late = _prepared_with_rows(10, 8, FIRST + 100, dtype=torch.bfloat16)
+    meta, blobs = tp_vision.encode_imgmeta([late, early])         # new content can precede old
+    described = tp_vision.decode_imgmeta(meta, blobs)
+    assert [d["first_index"] for d in described] == [FIRST, FIRST + 100]
+    assert torch.equal(described[0]["tensor"], early.rows)
+    assert torch.equal(described[1]["tensor"], late.rows)
 
 
 def test_imgmeta_refuses_corruption_and_bad_ranges():
@@ -456,6 +512,7 @@ class VisionBackend(ctrl.ScriptedBackend):
         state = stash["state"]
         self.calls.append(("restore", int(position)))
         self._pos[state] = int(position)
+        self._k = 0                    # the scripted reply belongs to each new HTTP request
         return state
 
     def stash(self, state):
@@ -486,7 +543,7 @@ class VisionBackend(ctrl.ScriptedBackend):
 class VisionPair:
     """Rank-0 TPEngine + rank-1 Rank1Worker over a real loopback channel, vision-capable."""
 
-    def __init__(self, script, *, ctx=4096, span=8, dim=8):
+    def __init__(self, script, *, ctx=4096, span=8, dim=8, prefix=None):
         self.be0 = VisionBackend(script, span=span, dim=dim)
         self.be1 = VisionBackend(script, span=span, dim=dim)
         self.port = ctrl.free_port()
@@ -495,6 +552,7 @@ class VisionPair:
         self.chan0 = None
         self.engine = None
         self.ctx = ctx
+        self.prefix = prefix
 
     def start(self):
         def rank1():
@@ -515,7 +573,7 @@ class VisionPair:
         ok = self.chan0.recv()
         assert ok.get("op") == "hello_ok" and ok.get("vision_capable") is True
         self.engine = tp_engine.TPEngine(self.be0, self.chan0, VisionTokenizer(),
-                                         ctx=self.ctx, eos_id=1)
+                                         ctx=self.ctx, eos_id=1, prefix=self.prefix)
 
     def run(self, prompt: str, images, *, max_tokens=4, **kw):
         async def go():
@@ -557,6 +615,29 @@ def _two_images(engine):
     ])
 
 
+class SessionVisionBackend(session_tests.SessionBackend):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.vision = FakeTower(VCFG)
+        self.vision_cfg = VCFG
+
+
+class SessionSpecVisionBackend(session_tests.SessionSpecBackend):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.vision = FakeTower(VCFG)
+        self.vision_cfg = VCFG
+
+
+DiskVisionBackend = disk_tests._disk_subclass(SessionVisionBackend)
+
+
+def _vision_session_ranks(spec: bool):
+    cls = SessionSpecVisionBackend if spec else SessionVisionBackend
+    return session_tests.SessionRanks(spec=spec, sessions=4, pool_pages=64, backend_cls=cls,
+                                      tokenizer=VisionTokenizer(), vision=True)
+
+
 @needs_exl
 def test_engine_prepare_prompt_ids_and_generate_end_to_end():
     pair = VisionPair(ctrl.ids_of("vision holds!"), span=8)
@@ -566,6 +647,8 @@ def test_engine_prepare_prompt_ids_and_generate_end_to_end():
         assert eng.supports_vision and eng.image_token_id == IMAGE_TOKEN
         images = _two_images(eng)
         assert images[0].first_index != images[1].first_index
+        repeated = _two_images(eng)
+        assert [im.first_index for im in repeated] == [im.first_index for im in images]
         prompt = "a<｜deepseek_image｜>b<｜deepseek_image｜>c"
         ids = eng.prompt_ids(prompt, images)
         plain = eng.prompt_ids(prompt)                              # text view: 2 placeholder ids
@@ -576,7 +659,7 @@ def test_engine_prepare_prompt_ids_and_generate_end_to_end():
         stats = eng.last_stats
         assert stats["images"] == 2
         assert stats["image_tokens"] == images[0].n_tokens + images[1].n_tokens
-        assert stats["cached_tokens"] == 0                           # cache bypassed for images
+        assert stats["cached_tokens"] == 0                           # first request is cold
         # both ranks prefilled the SAME expanded ids, with the SAME embedding ranges attached
         assert [c["ids"] for c in pair.be0.prefill_calls] == [c["ids"] for c in pair.be1.prefill_calls]
         for be in (pair.be0, pair.be1):
@@ -593,21 +676,124 @@ def test_engine_prepare_prompt_ids_and_generate_end_to_end():
 
 
 @needs_exl
-def test_image_request_left_the_prefix_cache_unharmed_for_text():
-    pair = VisionPair(ctrl.ids_of("cache!"), span=8)
+def test_image_conversation_reuses_the_prefix_cache_and_text_still_serves():
+    pair = VisionPair(ctrl.ids_of("cache!"), span=8,
+                      prefix=tp_engine.PrefixCache(slots=2, min_tokens=1, save_end=True))
     try:
         pair.start()
         eng = pair.engine
         assert eng.prefix is not None
         images = _two_images(eng)
-        pair.run("look<｜deepseek_image｜> and <｜deepseek_image｜> here", images)
-        assert eng.prefix.ckpts == []                               # no checkpoint saved (bypass)
+        prompt = "look<｜deepseek_image｜> and <｜deepseek_image｜> here"
+        first = "".join(pair.run(prompt, images))
+        assert eng.last_stats["cached_tokens"] == 0
+        assert eng.prefix.ckpts                                     # image state is now reusable
+
+        repeated = _two_images(eng)
+        assert [im.first_index for im in repeated] == [im.first_index for im in images]
+        second = "".join(pair.run(prompt + first + " again", repeated))
+        assert second == first == "cach"
+        assert eng.last_stats["cached_tokens"] > 0
+        assert eng.last_stats["spec_used"] is False
+
         out = "".join(pair.run("plain text only", None))            # text requests still serve
         assert out == "cach"
         assert eng.last_stats["spec_used"] is False
         assert not pair.errors
     finally:
         pair.stop()
+
+
+@needs_exl
+@pytest.mark.parametrize("spec", [False, True])
+def test_multisession_text_image_history_reuses_cache(spec):
+    """The deployed path: text -> image -> another turn with the same image in history.
+
+    Run against both normal routing and a no-matching control. Reuse must not change replies;
+    every off run prefills everything, while both on image turns resume their persistent slot.
+    """
+    on, off = _vision_session_ranks(spec), _vision_session_ranks(spec)
+    off.engine.mgr.min_match = 10 ** 9
+    record = {"data": base64.b64encode(tiny_png(64, 48)).decode("ascii")}
+
+    def script(r):
+        text = "a stable text prefix with enough tokens for a checkpoint. "
+        out = [r.run(r.engine.prompt_ids(text), max_tokens=6)]
+
+        images = r.engine.prepare_images([record])
+        image_prompt = text + out[-1][0] + "<｜deepseek_image｜> after the screenshot"
+        image_ids = r.engine.prompt_ids(image_prompt, images)
+        out.append(r.run(image_ids, images=images, max_tokens=6))
+
+        repeated = r.engine.prepare_images([record])
+        assert [im.first_index for im in repeated] == [im.first_index for im in images]
+        continued_prompt = image_prompt + out[-1][0] + " and one more turn"
+        continued_ids = r.engine.prompt_ids(continued_prompt, repeated)
+        out.append(r.run(continued_ids, images=repeated, max_tokens=6))
+        return out
+
+    try:
+        got_on = script(on)
+        on.check()
+        got_off = script(off)
+        off.check()
+    finally:
+        on.stop()
+        off.stop()
+
+    assert [text for text, _ in got_on] == [text for text, _ in got_off]
+    assert got_on[0][1]["cached_tokens"] == 0
+    assert got_on[1][1]["cached_tokens"] > 0       # text prefix reused on the image turn
+    assert got_on[2][1]["cached_tokens"] > 0       # image KV reused on the following turn
+    assert [s["session"] for _, s in got_on] == [1, 1, 1]
+    assert all(s["cached_tokens"] == 0 for _, s in got_off)
+    assert on.engine.mgr.counters["ephemeral_freed"] == 0
+    if spec:
+        assert on.be0.stale_drafts == 0 and off.be0.stale_drafts == 0
+
+
+@needs_exl
+def test_image_session_spills_and_reloads_with_its_cache(tmp_path):
+    on = disk_tests.DiskHarness(sessions=2, pool_pages=24, disk_root=tmp_path / "on",
+                                backend_cls=DiskVisionBackend, tokenizer=VisionTokenizer(), vision=True)
+    off = disk_tests.DiskHarness(sessions=2, pool_pages=24, disk_root=tmp_path / "off", disk_on=False,
+                                 backend_cls=DiskVisionBackend, tokenizer=VisionTokenizer(), vision=True)
+    record = {"data": base64.b64encode(tiny_png(64, 48)).decode("ascii")}
+
+    def script(r):
+        alpha = "alpha has a persistent multimodal conversation. "
+        out = [r.run(r.engine.prompt_ids(alpha), max_tokens=4)]
+        images = r.engine.prepare_images([record])
+        image_prompt = alpha + out[-1][0] + "<｜deepseek_image｜> cached image state"
+        image_ids = r.engine.prompt_ids(image_prompt, images)
+        out.append(r.run(image_ids, images=images, max_tokens=4))
+
+        out.append(r.run(r.engine.prompt_ids("beta is a completely different conversation. "),
+                         max_tokens=4))
+        out.append(r.run(r.engine.prompt_ids("gamma takes the last slot and spills alpha. "),
+                         max_tokens=4))
+
+        repeated = r.engine.prepare_images([record])
+        assert [im.first_index for im in repeated] == [im.first_index for im in images]
+        continued = image_prompt + out[1][0] + " and now alpha returns"
+        out.append(r.run(r.engine.prompt_ids(continued, repeated), images=repeated, max_tokens=4))
+        return out
+
+    try:
+        got_on = script(on)
+        on.check()
+        got_off = script(off)
+        off.check()
+    finally:
+        on.stop()
+        off.stop()
+
+    assert [text for text, _ in got_on] == [text for text, _ in got_off]
+    assert got_on[1][1]["cached_tokens"] > 0
+    assert got_on[-1][1]["cached_tokens"] > 0       # cold reload restored the image checkpoint
+    assert got_off[-1][1]["cached_tokens"] == 0     # eviction-only control re-prefills
+    assert on.engine.mgr.counters["cold_loads"] == 1
+    assert on.engine.mgr.counters["ephemeral_freed"] == 0
 
 
 @needs_exl
@@ -651,6 +837,24 @@ def test_engine_refuses_broken_image_prompts_before_any_dispatch():
             pair.run("x<｜deepseek_image｜>y", images[:1])
         eng.ctx = pair.ctx
         assert pair.be0.prefill_calls == [] and pair.be1.prefill_calls == []   # nothing dispatched
+        assert not pair.errors
+    finally:
+        pair.stop()
+
+
+@needs_exl
+def test_aborted_image_shipment_does_not_poison_the_next_text_request():
+    pair = VisionPair(ctrl.ids_of("cache!"), span=8)
+    try:
+        pair.start()
+        eng = pair.engine
+        images = _two_images(eng)
+        embeddings = eng._vision_encode(images)
+        eng._ship_embeddings(images, embeddings)       # req 0 arms rows, then aborts before begin
+        out = "".join(pair.run("plain text only", None))
+        pair.sync()
+        assert out == "cach"
+        assert eng.last_stats["spec_used"] is False
         assert not pair.errors
     finally:
         pair.stop()
