@@ -291,9 +291,10 @@ class IlvRanks:
     def __init__(self, *, spec: bool = False, sessions: int = 4, concurrency: int = 2,
                  pool_pages: int = 64, page_size: int = PAGE, session_opts: dict | None = None,
                  span: int | None = None, chunk: int | None = None, delay: float = 0.002,
-                 ctx: int | None = None, slots: int | None = None):
+                 ctx: int | None = None, slots: int | None = None, backend_cls=None,
+                 tokenizer=None, image_skip: bool = True):
         self.fatal: list[BaseException] = []
-        cls = IlvSpecBackend if spec else IlvBackend
+        cls = backend_cls or (IlvSpecBackend if spec else IlvBackend)
         slots = concurrency if slots is None else slots
         self.be0 = cls(pool_pages, page_size, slots=slots, delay=delay)
         self.be1 = cls(pool_pages, page_size, slots=slots)
@@ -325,10 +326,12 @@ class IlvRanks:
         self.chan = _RecordingChannel(chan, self.frames)
         opts = {"prefix_slots": 2, "min_tokens": 8}
         opts.update(session_opts or {})
+        self.hello_ok = ok
         self.engine = tp_engine.TPEngine(
-            self.be0, self.chan, Tok(), ctx=pool_pages * page_size - 2 if ctx is None else ctx,
+            self.be0, self.chan, tokenizer if tokenizer is not None else Tok(),
+            ctx=pool_pages * page_size - 2 if ctx is None else ctx,
             eos_id=None, sessions=sessions, session_opts=opts, concurrency=concurrency,
-            log=lambda *_: None, on_fatal=self.fatal.append)
+            log=lambda *_: None, on_fatal=self.fatal.append, image_skip=image_skip)
         assert self.engine.proto == want
         if chunk is not None:
             self.engine.interleave_chunk = chunk

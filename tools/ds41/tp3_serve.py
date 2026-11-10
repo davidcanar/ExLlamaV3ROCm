@@ -151,8 +151,10 @@ def build_tp_engine(args: argparse.Namespace) -> Any:
     # workers' hello_ok all report rank 1 (the worker class predates tp3), which
     # the multi-channel normalizes away when comparing replies.
     channel.send(hello)
+    image_skip = True        # every worker must accept row-less history images (image_skip)
     for i in range(nworkers):
         reply = channel.channels[i].recv()
+        image_skip = image_skip and bool(reply.get("image_skip", False))
         if reply.get("op") != "hello_ok" or int(reply.get("proto", -1)) != proto:
             startup_health.abort(f"worker {i + 1} handshake failed: {reply}")
             raise SystemExit(f"tp3-serve: worker {i + 1} handshake failed: {reply}")
@@ -196,8 +198,11 @@ def build_tp_engine(args: argparse.Namespace) -> Any:
         print(f"tp-serve: interleaved requests ON (up to {concurrency} in flight, one model step at a "
               f"time, fair share by GPU time; /tp/status pool.scheduler)", flush=True)
     if vision:
-        print("tp-serve: vision on (rank 0 tower + aligner loaded; image requests ship their rows "
-              "to rank 1 per request; content-stable image ids use the prefix cache)", flush=True)
+        print("tp-serve: vision on (rank 0 tower + aligner loaded; content-stable image ids use the "
+              "prefix cache; " + ("a request encodes and ships only the images past its restore "
+                                  "point)" if image_skip else
+                                  "a worker without image_skip: every request ships every image)"),
+              flush=True)
     else:
         print("tp-serve: vision off (image requests are refused with 400; EXL3_TP_VISION=0, a "
               "degraded load or a text-only model -- see the load log)", flush=True)
@@ -214,7 +219,8 @@ def build_tp_engine(args: argparse.Namespace) -> Any:
                               eos_id=tp_engine.eos_id_of(args.model, tokenizer), seed=args.seed,
                               sessions=sessions, concurrency=concurrency,
                               on_fatal=tp_engine.exit_on_fatal_hook(lambda line: print(line, flush=True)),
-                              log=lambda line: print(line, flush=True))   # the launchers log to a file
+                              log=lambda line: print(line, flush=True),   # the launchers log to a file
+                              image_skip=image_skip)
 
 
 def _prefix_cache_line(engine) -> str:

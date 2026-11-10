@@ -27,6 +27,7 @@ Nothing here imports exllamav3, torch or PIL at module level: the control-protoc
 from __future__ import annotations
 
 import base64
+import bisect
 import hashlib
 import math
 import os
@@ -346,6 +347,56 @@ def expand_prompt_ids(ids: list[int], images: list[PreparedImage], image_token_i
     if spent != len(images):
         raise ImageError(f"the prompt has {spent} image placeholder(s) but {len(images)} image(s) were sent")
     return out
+
+
+# ---- which images a prefill reads (rank 0 ships only those; rank 1 requires only those) ----------------------
+
+
+def _range_index(ranges) -> tuple[list[int], list[int]]:
+    """Sorted (firsts, ends) of nonoverlapping [first, end) id ranges, for bisect lookups."""
+    rs = sorted((int(a), int(b)) for a, b in ranges)
+    return [a for a, _ in rs], [b for _, b in rs]
+
+
+def uncovered_image_ids(ids, start: int, ranges) -> list[int]:
+    """The image ids (>= FIRST_MM_EMBEDDING_INDEX) at prompt positions >= ``start`` that none of
+    ``ranges`` ([first, end) per shipped image) covers, in prompt order.
+
+    A prefill from ``start`` (a restored checkpoint, 0 for a fresh state) feeds only
+    ``ids[start:]``: an image id below ``start`` is never embedded again -- the restored state
+    already holds its effect -- so it needs no rows. Every id past ``start`` must have them."""
+    firsts, ends = _range_index(ranges)
+    out = []
+    for t in ids[max(0, int(start)):]:
+        t = int(t)
+        if t < FIRST_MM_EMBEDDING_INDEX:
+            continue
+        j = bisect.bisect_right(firsts, t) - 1
+        if j < 0 or t >= ends[j]:
+            out.append(t)
+    return out
+
+
+def images_after(images: list[PreparedImage], ids, start: int) -> list[PreparedImage]:
+    """The images a prefill from position ``start`` reads: those with at least one id at a
+    position >= ``start``, in the order given. ``start`` 0 (fresh state, cold reload, cache
+    off) keeps every image. Images wholly below ``start`` -- the screenshots earlier in a
+    resumed conversation -- need neither a tower pass nor a shipment."""
+    images = list(images or [])
+    if not images or int(start) <= 0:
+        return images
+    order = sorted(range(len(images)), key=lambda i: int(images[i].first_index))
+    firsts = [int(images[i].first_index) for i in order]
+    ends = [int(images[i].first_index) + int(images[i].n_tokens) for i in order]
+    keep: set[int] = set()
+    for t in ids[int(start):]:
+        t = int(t)
+        if t < FIRST_MM_EMBEDDING_INDEX:
+            continue
+        j = bisect.bisect_right(firsts, t) - 1
+        if j >= 0 and t < ends[j]:
+            keep.add(order[j])
+    return [img for i, img in enumerate(images) if i in keep]
 
 
 # ---- rank 0 -> rank 1 wire codec (control-channel blob frames) -----------------------------------------------

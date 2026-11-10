@@ -147,6 +147,7 @@ def build_tp_engine(args: argparse.Namespace) -> Any:
             or int(reply.get("rank", -1)) != 1:
         startup_health.abort(f"rank 1 handshake failed: {reply}")
         raise SystemExit(f"tp-serve: rank 1 handshake failed: {reply}")
+    image_skip = bool(reply.get("image_skip", False))   # rank 1 accepts row-less history images
     if not bool(reply.get("vision_capable", False)):
         startup_health.abort("rank 1 does not speak this control protocol's vision frames "
                              f"(proto {proto}); sync tools/ds41 on both boxes and restart")
@@ -189,8 +190,11 @@ def build_tp_engine(args: argparse.Namespace) -> Any:
         print(f"tp-serve: interleaved requests ON (up to {concurrency} in flight, one model step at a "
               f"time, fair share by GPU time; /tp/status pool.scheduler)", flush=True)
     if vision:
-        print("tp-serve: vision on (rank 0 tower + aligner loaded; image requests ship their rows "
-              "to rank 1 per request; content-stable image ids use the prefix cache)", flush=True)
+        print("tp-serve: vision on (rank 0 tower + aligner loaded; content-stable image ids use the "
+              "prefix cache; " + ("a request encodes and ships only the images past its restore "
+                                  "point)" if image_skip else
+                                  "rank 1 without image_skip: every request ships every image)"),
+              flush=True)
     else:
         print("tp-serve: vision off (image requests are refused with 400; EXL3_TP_VISION=0, a "
               "degraded load or a text-only model -- see the load log)", flush=True)
@@ -209,7 +213,8 @@ def build_tp_engine(args: argparse.Namespace) -> Any:
                               # (no watchdog on TP=2: stay up latched unless EXL3_TP_EXIT_ON_FATAL=1)
                               on_fatal=tp_engine.exit_on_fatal_hook(lambda line: print(line, flush=True),
                                                                      default_on=False),
-                              log=lambda line: print(line, flush=True))   # the launchers log to a file
+                              log=lambda line: print(line, flush=True),   # the launchers log to a file
+                              image_skip=image_skip)
 
 
 def _prefix_cache_line(engine) -> str:

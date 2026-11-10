@@ -111,6 +111,10 @@ Image input (protocol 4/5, 2026-10-29) loads the tower + aligner on rank 0 only:
 cache resident) and 4.2 s at startup. Rank 1 loads nothing; each image request
 ships the tower's output rows over the control channel (~0.3 MiB per image at
 bf16, sha256-checked) and both ranks attach them as `indexed_embeddings`.
+Since 2026-11-10 only the images past a request's restore point are encoded and
+shipped: a resumed screenshot conversation (11 browser captures, 1440x900, ~150K
+tokens) had spent 12-20 s at the start of every turn re-encoding and re-shipping all
+of them, ~2.4 GB per worker over 53 minutes, while the other conversation waited.
 
 Live numbers (running server, DSpark on, greedy, one 800×600 PNG ≈ 326 image
 tokens + chat template = 336 prompt tokens): **~1.4 s end to end** over HTTP —

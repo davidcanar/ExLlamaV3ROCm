@@ -15,6 +15,10 @@ without any GPU, model weights or the real tower:
   on text requests;
 - prefix-cache reuse: stable image identity lets continuing multimodal conversations restore
   and save checkpoints in single- and multi-session modes, with and without DSpark;
+- image_skip: a resumed conversation encodes and ships only the images past its restore point
+  (proto 4, 5 and the interleaved proto 6), every stand-in prefill asserts it carries the rows
+  of the image ids it feeds, and a restore point that moved after the plan is fatal before any
+  begin frame;
 - text-path regressions at the frame level (the ops rank 1 sees are unchanged).
 
 The engine-level pairs additionally exercise make_mm_embedding, so they need the exllamav3
@@ -26,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import importlib.util
+from array import array
 import io
 import json
 import sys
@@ -45,6 +50,7 @@ import test_tp_control as ctrl  # noqa: E402  (loopback helpers of the main suit
 import test_tp_prefix_cache as cache_tests  # noqa: E402
 import test_tp_sessions as session_tests  # noqa: E402
 import test_tp_disk as disk_tests  # noqa: E402
+import test_tp_interleave as ilv  # noqa: E402
 from ds41_engine import SPECIAL_TOKENS  # noqa: E402
 from test_tp_chunked_prefill import FakeCore, make_backend  # noqa: E402
 
@@ -488,6 +494,25 @@ class FakeTower:
                            token_string=torch.full((1, n), -1, dtype=torch.long))
 
 
+def _assert_rows_cover(ids, start, embeddings):
+    """A prefill from `start` feeds ids[start:-1]: every image id among them must arrive with
+    its rows (the real embedding module would index a missing row; rank 1 refuses the begin)."""
+    embs = list(embeddings or [])
+    for p in range(int(start), len(ids) - 1):
+        t = int(ids[p])
+        if t >= FIRST:
+            covered = any(int(e.first_index) <= t < int(e.first_index) + int(e.mm_length) for e in embs)
+            assert covered, f"prefill fed image id {t} at position {p} without its rows"
+
+
+class _RowsCover:
+    """Stand-in mixin: every prefill must carry the rows of the image ids it feeds."""
+
+    def prefill(self, ids, state, spec=False, start=0, embeddings=None, *rest, **kw):
+        _assert_rows_cover(ids, start, embeddings)
+        return super().prefill(ids, state, spec, start, embeddings, *rest, **kw)
+
+
 class VisionBackend(ctrl.ScriptedBackend):
     """ScriptedBackend + prefill recording with embeddings + a tower handle and vision cfg.
 
@@ -523,6 +548,7 @@ class VisionBackend(ctrl.ScriptedBackend):
         self.calls.append(("drop_stash", stash["pos"]))
 
     def prefill(self, ids, state, spec=False, start=0, embeddings=None):
+        _assert_rows_cover(ids, start, embeddings)
         self.prefill_calls.append({
             "ids": [int(t) for t in ids], "spec": bool(spec), "start": int(start),
             "embeddings": None if embeddings is None else list(embeddings),
@@ -543,7 +569,7 @@ class VisionBackend(ctrl.ScriptedBackend):
 class VisionPair:
     """Rank-0 TPEngine + rank-1 Rank1Worker over a real loopback channel, vision-capable."""
 
-    def __init__(self, script, *, ctx=4096, span=8, dim=8, prefix=None):
+    def __init__(self, script, *, ctx=4096, span=8, dim=8, prefix=None, image_skip=True):
         self.be0 = VisionBackend(script, span=span, dim=dim)
         self.be1 = VisionBackend(script, span=span, dim=dim)
         self.port = ctrl.free_port()
@@ -553,6 +579,8 @@ class VisionPair:
         self.engine = None
         self.ctx = ctx
         self.prefix = prefix
+        self.image_skip = image_skip
+        self.hello_ok: dict = {}
 
     def start(self):
         def rank1():
@@ -572,8 +600,10 @@ class VisionPair:
                          "dspark": False, "vision": True})
         ok = self.chan0.recv()
         assert ok.get("op") == "hello_ok" and ok.get("vision_capable") is True
+        self.hello_ok = ok
         self.engine = tp_engine.TPEngine(self.be0, self.chan0, VisionTokenizer(),
-                                         ctx=self.ctx, eos_id=1, prefix=self.prefix)
+                                         ctx=self.ctx, eos_id=1, prefix=self.prefix,
+                                         image_skip=self.image_skip)
 
     def run(self, prompt: str, images, *, max_tokens=4, **kw):
         async def go():
@@ -615,14 +645,14 @@ def _two_images(engine):
     ])
 
 
-class SessionVisionBackend(session_tests.SessionBackend):
+class SessionVisionBackend(_RowsCover, session_tests.SessionBackend):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.vision = FakeTower(VCFG)
         self.vision_cfg = VCFG
 
 
-class SessionSpecVisionBackend(session_tests.SessionSpecBackend):
+class SessionSpecVisionBackend(_RowsCover, session_tests.SessionSpecBackend):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.vision = FakeTower(VCFG)
@@ -632,10 +662,10 @@ class SessionSpecVisionBackend(session_tests.SessionSpecBackend):
 DiskVisionBackend = disk_tests._disk_subclass(SessionVisionBackend)
 
 
-def _vision_session_ranks(spec: bool):
+def _vision_session_ranks(spec: bool, **kw):
     cls = SessionSpecVisionBackend if spec else SessionVisionBackend
     return session_tests.SessionRanks(spec=spec, sessions=4, pool_pages=64, backend_cls=cls,
-                                      tokenizer=VisionTokenizer(), vision=True)
+                                      tokenizer=VisionTokenizer(), vision=True, **kw)
 
 
 @needs_exl
@@ -1085,3 +1115,239 @@ def test_vendored_server_image_request_end_to_end():
     asyncio.run(go())
     pair.sync()
     pair.stop()
+
+
+# ---- image_skip: only the images a prefill reads get a tower pass and a shipment ---------------------------------
+
+
+def _img(first: int, alias: str, n_h: int = 2, n_w: int = 3) -> tp_vision.PreparedImage:
+    return tp_vision.PreparedImage(pil=None, n_llm_h=n_h, n_llm_w=n_w, first_index=first, alias=alias)
+
+
+def _rec(width: int, height: int) -> dict:
+    return {"data": base64.b64encode(tiny_png(width, height)).decode("ascii")}
+
+
+def test_images_after_keeps_exactly_the_images_the_prefill_reads():
+    a, b, c = _img(FIRST, "a"), _img(FIRST + 1000, "b", 3, 2), _img(FIRST + 2000, "c")
+    ids = [5, 6] + a.token_ids + [7, 8, 9] + b.token_ids + [10] + c.token_ids + [11, 12]
+    pb = 2 + a.n_tokens + 3                     # b's first position
+    pc = pb + b.n_tokens + 1                    # c's first position
+    assert tp_vision.images_after([a, b, c], ids, 0) == [a, b, c]          # fresh state: every image
+    assert tp_vision.images_after([a, b, c], ids, pb) == [b, c]            # restored past a
+    assert tp_vision.images_after([a, b, c], ids, pb + 1) == [b, c]        # b straddles the point: kept
+    assert tp_vision.images_after([a, b, c], ids, pc + c.n_tokens) == []   # all of them in history
+    assert tp_vision.images_after([c, a, b], ids, pb) == [c, b]            # request order kept
+    assert tp_vision.images_after([a, b, c], ids[:pc], pb) == [b]          # c is not in this prompt
+    assert tp_vision.images_after([], ids, pb) == [] and tp_vision.images_after(None, ids, 0) == []
+
+
+def test_uncovered_image_ids_checks_only_positions_from_start():
+    a, b = _img(FIRST, "a"), _img(FIRST + 1000, "b")
+    ids = [5] + a.token_ids + [6] + b.token_ids + [7]
+    pb = 1 + a.n_tokens + 1
+    only_b = [(b.first_index, b.first_index + b.n_tokens)]
+    assert tp_vision.uncovered_image_ids(ids, 0, only_b) == a.token_ids    # a is fed again: rows needed
+    assert tp_vision.uncovered_image_ids(ids, pb, only_b) == []            # a lies below the restore point
+    assert tp_vision.uncovered_image_ids(ids, pb, []) == b.token_ids
+    assert tp_vision.uncovered_image_ids(ids, len(ids), []) == []
+    short = [(b.first_index, b.first_index + b.n_tokens - 1)]
+    assert tp_vision.uncovered_image_ids(ids, pb, short) == [b.token_ids[-1]]
+
+
+def test_prefix_cache_peek_is_plan_without_the_lru_touch():
+    px = tp_engine.PrefixCache(slots=3, min_tokens=1)
+    seq = list(range(100, 140))
+    px.kv_ids = array("i", seq)
+    c1 = px.add(1, array("i", seq[:10]), "s1")
+    c2 = px.add(2, array("i", seq[:30]), "s2")
+    prompt = array("i", seq[:35] + [7])
+    before = (c1.used, c2.used)
+    assert px.peek(prompt) is c2 and (c1.used, c2.used) == before     # same pick, LRU untouched
+    assert px.plan(prompt) is c2 and c2.used > before[1] and c1.used == before[0]
+    assert px.peek(array("i", [1, 2, 3])) is None
+
+
+@needs_exl
+def test_resumed_image_conversation_encodes_and_ships_only_the_new_images():
+    """Turn 2 resumes a conversation with two screenshots in its history and adds text only: no
+    tower pass, no shipment, and rank 1 prefills without rows. Turn 3 adds a third image: only
+    that one is encoded and shipped. The replies equal the ship-everything engine's."""
+    ra, rb, rc = _rec(64, 48), _rec(32, 40), _rec(40, 56)
+
+    def conversation(image_skip):
+        pair = VisionPair(ctrl.ids_of("screens!"), span=8, image_skip=image_skip,
+                          prefix=tp_engine.PrefixCache(slots=2, min_tokens=1, save_end=True))
+        try:
+            pair.start()
+            eng = pair.engine
+            out, stats, towers = [], [], []
+
+            def turn(prompt, records):
+                images = eng.prepare_images(records)
+                out.append("".join(pair.run(prompt, images)))
+                stats.append(dict(eng.last_stats))
+                towers.append(len(pair.be0.vision.seen))
+                return images
+
+            p1 = "look<｜deepseek_image｜> and <｜deepseek_image｜> here"
+            turn(p1, [ra, rb])
+            p2 = p1 + out[-1] + " and the next question"
+            turn(p2, [ra, rb])
+            p3 = p2 + out[-1] + " plus a new one<｜deepseek_image｜> to compare"
+            third = turn(p3, [ra, rb, rc])
+            assert not pair.errors
+            rows1 = [c["embeddings"] for c in pair.be1.prefill_calls]
+            return out, stats, towers, rows1, third, pair.hello_ok, dict(eng.vision_counters)
+        finally:
+            pair.stop()
+
+    out_on, st_on, tw_on, rows_on, third, hello, vc_on = conversation(True)
+    out_off, st_off, tw_off, rows_off, _, _, vc_off = conversation(False)
+    assert out_on == out_off
+    assert hello.get("image_skip") is True
+    assert st_on[0]["cached_tokens"] == 0 and all(s["cached_tokens"] > 0 for s in st_on[1:])
+    assert [s["images_encoded"] for s in st_on] == [2, 0, 1]
+    assert [s["images_encoded"] for s in st_off] == [2, 2, 3]
+    assert tw_on == [2, 2, 3] and tw_off == [2, 4, 7]                    # tower passes so far
+    # rank 1 prefilled turn 2 with no rows at all and turn 3 with the new image's only
+    assert rows_on[1] is None
+    assert [e.first_index for e in rows_on[2]] == [third[2].first_index]
+    assert [len(r) for r in rows_off] == [2, 2, 3]
+    assert vc_on == {"image_requests": 3, "images": 7, "encoded": 3, "skipped": 4}
+    assert vc_off == {"image_requests": 3, "images": 7, "encoded": 7, "skipped": 0}
+
+
+@needs_exl
+@pytest.mark.parametrize("spec", [False, True])
+def test_multisession_turns_ship_only_new_images(spec):
+    """Proto 5: text -> one screenshot -> a second screenshot -> a text-only turn, all in one
+    session. Each image is encoded and shipped once (the turn that adds it); the replies equal
+    the ship-everything engine's and both ranks make the same model calls."""
+    r1, r2 = _rec(64, 48), _rec(32, 40)
+
+    def script(r):
+        eng = r.engine
+        text = "a stable text prefix with enough tokens for a checkpoint. "
+        out = [r.run(eng.prompt_ids(text), max_tokens=6)]
+        p2 = text + out[-1][0] + "<｜deepseek_image｜> after the screenshot"
+        imgs = eng.prepare_images([r1])
+        out.append(r.run(eng.prompt_ids(p2, imgs), images=imgs, max_tokens=6))
+        p3 = p2 + out[-1][0] + " and a second one<｜deepseek_image｜> to compare"
+        imgs = eng.prepare_images([r1, r2])
+        out.append(r.run(eng.prompt_ids(p3, imgs), images=imgs, max_tokens=6))
+        p4 = p3 + out[-1][0] + " and one more text turn"
+        imgs = eng.prepare_images([r1, r2])
+        out.append(r.run(eng.prompt_ids(p4, imgs), images=imgs, max_tokens=6))
+        return out
+
+    on = _vision_session_ranks(spec, record=True)
+    off = _vision_session_ranks(spec, record=True, image_skip=False)
+    try:
+        got_on = script(on)
+        on.check()
+        got_off = script(off)
+        off.check()
+    finally:
+        on.stop()
+        off.stop()
+    assert [t for t, _ in got_on] == [t for t, _ in got_off]
+    assert [s.get("images_encoded") for _, s in got_on] == [None, 1, 1, 0]
+    assert [s.get("images_encoded") for _, s in got_off] == [None, 1, 2, 2]
+    assert all(s["cached_tokens"] > 0 for _, s in got_on[1:])
+    assert [s["session"] for _, s in got_on] == [1, 1, 1, 1]
+    assert [f["n"] for f in on.frames if f.get("op") == "imgmeta"] == [1, 1]
+    assert [f["n"] for f in off.frames if f.get("op") == "imgmeta"] == [1, 2, 2]
+    assert on.engine.vision_counters == {"image_requests": 3, "images": 5, "encoded": 2, "skipped": 3}
+    if spec:
+        assert on.be0.stale_drafts == 0 and off.be0.stale_drafts == 0
+
+
+def _ilv_vision(base):
+    """An interleave stand-in (test_tp_interleave) with the tower stand-in and the row cover check."""
+    class IlvVision(_RowsCover, base):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.vision = FakeTower(VCFG)
+            self.vision_cfg = VCFG
+    return IlvVision
+
+
+@needs_exl
+@pytest.mark.parametrize("spec", [False, True])
+def test_interleaved_image_turns_ship_only_new_images(spec):
+    """The deployed shape (proto 6, two requests in flight): a screenshot conversation's turns
+    interleave with a text conversation's. History images get no tower pass and no shipment;
+    both ranks still make the same model calls and the replies equal the ship-everything run."""
+    cls = _ilv_vision(ilv.IlvSpecBackend if spec else ilv.IlvBackend)
+    r1, r2 = _rec(64, 48), _rec(32, 40)
+
+    def script(r):
+        eng = r.engine
+        ta = "conversation alpha shares screenshots, with enough text to checkpoint. "
+        tb = "conversation beta is plain text and keeps generating meanwhile. "
+        (a1, _), (b1, _) = r.gather(r.one("a1", eng.prompt_ids(ta), 10),
+                                    r.one("b1", eng.prompt_ids(tb), 10))
+        pa = ta + a1 + "<｜deepseek_image｜> first screenshot"
+        pb = tb + b1 + " second beta turn"
+        imgs = eng.prepare_images([r1])
+        (a2, s2), (b2, _) = r.gather(r.one("a2", eng.prompt_ids(pa, imgs), 10, images=imgs),
+                                     r.one("b2", eng.prompt_ids(pb), 10))
+        pa += a2 + " and a new one<｜deepseek_image｜> beside it"
+        pb += b2 + " third beta turn"
+        imgs = eng.prepare_images([r1, r2])
+        (a3, s3), (b3, _) = r.gather(r.one("a3", eng.prompt_ids(pa, imgs), 10, images=imgs),
+                                     r.one("b3", eng.prompt_ids(pb), 10))
+        pa += a3 + " text only now"
+        pb += b3 + " fourth beta turn"
+        imgs = eng.prepare_images([r1, r2])
+        (a4, s4), (b4, _) = r.gather(r.one("a4", eng.prompt_ids(pa, imgs), 10, images=imgs),
+                                     r.one("b4", eng.prompt_ids(pb), 10))
+        return [a1, b1, a2, b2, a3, b3, a4, b4], [s2, s3, s4]
+
+    on = ilv.IlvRanks(spec=spec, concurrency=2, backend_cls=cls, tokenizer=VisionTokenizer())
+    off = ilv.IlvRanks(spec=spec, concurrency=2, backend_cls=cls, tokenizer=VisionTokenizer(),
+                       image_skip=False)
+    try:
+        replies_on, stats_on = script(on)
+        on.check()
+        replies_off, stats_off = script(off)
+        off.check()
+        ship_on = [f["n"] for f in on.ops("imgmeta")]
+        ship_off = [f["n"] for f in off.ops("imgmeta")]
+        assert on.hello_ok.get("image_skip") is True
+        assert not on.fatal and not off.fatal
+        if spec:
+            assert on.be0.stale_drafts == 0 and off.be0.stale_drafts == 0
+    finally:
+        on.stop()
+        off.stop()
+    assert replies_on == replies_off
+    assert [s["images_encoded"] for s in stats_on] == [1, 1, 0]
+    assert [s["images_encoded"] for s in stats_off] == [1, 2, 2]
+    assert all(s["cached_tokens"] > 0 for s in stats_on)
+    assert ship_on == [1, 1] and ship_off == [1, 2, 2]
+
+
+@needs_exl
+def test_a_moved_restore_point_is_fatal_before_the_begin_leaves():
+    """If the restore point ever moved after the pre-commit peek (a routing bug), the request
+    would prefill image ids without rows. Rank 0 catches it before the begin frame: fatal
+    (restart all ranks), no begin and no shipment reach rank 1, no tower pass ran."""
+    cls = _ilv_vision(ilv.IlvBackend)
+    r = ilv.IlvRanks(concurrency=2, backend_cls=cls, tokenizer=VisionTokenizer())
+    try:
+        eng = r.engine
+        text = "a conversation with enough text for a checkpoint before its image. "
+        a1, _ = r.run(eng.prompt_ids(text), 8)
+        imgs = eng.prepare_images([_rec(64, 48)])
+        ids = eng.prompt_ids(text + a1 + "<｜deepseek_image｜> look", imgs)
+        eng._pinned_restore = lambda plan, ids_, use_cache: len(ids_) - 1   # the simulated bug
+        begins = len(r.ops("begin"))
+        with pytest.raises(RuntimeError, match="RoutingDrift.*restart ALL ranks"):
+            asyncio.run(r.one("drift", ids, 8, images=imgs))
+        assert len(r.ops("begin")) == begins and not r.ops("imgmeta")
+        assert r.fatal and isinstance(r.fatal[0], tp_engine.RoutingDrift)
+        assert r.be0.vision.seen == []
+    finally:
+        r.stop()

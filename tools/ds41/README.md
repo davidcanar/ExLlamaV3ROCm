@@ -390,13 +390,24 @@ all key off them).
   every failure a clean 400 — and plans each image's exact token span from the tower's own
   resize math; `prompt_ids(prompt, images)` splices each placeholder into its image's
   content-stable, per-occurrence dynamic-id range, so context/cache bounds check the *expanded*
-  length; `generate` runs the tower once per image on the model thread, ships the rows,
-  prefills and decodes as usual.
+  length; `generate` runs the tower on the model thread for the images its prefill reads,
+  ships their rows, prefills and decodes as usual.
 - **Prefix cache:** the full SHA-256 of the source bytes + token grid, plus the image's
   per-content occurrence index, selects a stable dynamic-id range from the engine allocator.
   Continuing multimodal conversations therefore use the same session/prefix checkpoints as
-  text; different images and duplicate occurrences never alias. This reuses trunk KV state;
-  the vision tower still runs once per image on each request.
+  text; different images and duplicate occurrences never alias.
+- **Only the images the prefill reads** get a tower pass and a shipment (2026-11-10): those
+  with an id at or past the request's restore point. The screenshots earlier in a resumed
+  conversation are inside the restored state, so a turn that adds text to a history of 11
+  screenshots runs no tower and ships nothing (before, every turn re-encoded and re-shipped
+  them all: 12-20 s per turn on a 150K-token conversation, in one step nothing could
+  interleave with, and ~2.4 GB per worker in 53 minutes on the control channel). Rank 0 reads
+  the restore point with a pure peek (`PrefixCache.peek`) before its fallible pre-work and
+  re-checks the cover before `begin` (`RoutingDrift`, fatal, if the point ever moved); rank 1
+  requires rows only for image ids from the begin's `start` on. Workers say `image_skip` in
+  `hello_ok`; rank 0 ships every image to a worker that does not. `/tp/status` reports
+  `pool.vision` (images seen, encoded, skipped) and each image request's stats carry
+  `images_encoded`.
 - **DSpark composes** with vision (the drafter only ever sees the anchor and text rows). A
   first run that does not fit VRAM beside the drafter is practical per launch:
   `EXL3_TP_DSPARK=0 ./exl3ds4.sh restart` (both ranks read it, budgets fall back to the

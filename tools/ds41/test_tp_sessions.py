@@ -291,7 +291,7 @@ class SessionRanks:
     def __init__(self, *, spec: bool = False, sessions: int = 4, pool_pages: int = 32,
                  page_size: int = PAGE, session_opts: dict | None = None, span: int | None = None,
                  record: bool = False, ctx: int | None = None, backend_cls=None,
-                 tokenizer=None, vision: bool = False):
+                 tokenizer=None, vision: bool = False, image_skip: bool = True):
         cls = backend_cls or (SessionSpecBackend if spec else SessionBackend)
         self.be0, self.be1 = cls(pool_pages, page_size), cls(pool_pages, page_size)
         if span is not None:
@@ -322,7 +322,7 @@ class SessionRanks:
         assert ok.get("op") == "hello_ok" and ok.get("proto") == tp_engine.PROTO_SESSIONS \
             and ok.get("sessions") == sessions and ok.get("pool_pages") == pool_pages, ok
         if vision:
-            assert ok.get("vision_capable") is True
+            assert ok.get("vision_capable") is True and ok.get("image_skip") is True
         if record:
             self.chan = _RecordingChannel(self.chan, self.frames)
         opts = {"prefix_slots": 2, "min_tokens": 8}
@@ -330,7 +330,8 @@ class SessionRanks:
         self.engine = tp_engine.TPEngine(
             self.be0, self.chan, tokenizer if tokenizer is not None else Tok(),
             ctx=pool_pages * page_size - 2 if ctx is None else ctx,
-            eos_id=None, sessions=sessions, session_opts=opts, log=lambda *_: None)
+            eos_id=None, sessions=sessions, session_opts=opts, log=lambda *_: None,
+            image_skip=image_skip)
         assert self.engine.mgr is not None and self.engine.sessions == sessions
 
     def run(self, ids, max_tokens=12, **kw):

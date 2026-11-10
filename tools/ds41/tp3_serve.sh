@@ -51,7 +51,7 @@ export EXL3_TP_SESSIONS=${EXL3_TP_SESSIONS:-4}
 # default 512) = prefill rows per step while other requests run.
 export EXL3_TP_CONCURRENCY=${EXL3_TP_CONCURRENCY:-$(( EXL3_TP_SESSIONS < 4 ? EXL3_TP_SESSIONS : 4 ))}
 # Image input: rank 0 loads the vision tower + aligner (~0.7 GiB) beside its shard and ships
-# each image's rows to the workers per request (they never load it). Same defaults as TP=2.
+# the rows of the images a request reads past its restore point (workers never load it).
 export EXL3_TP_VISION=${EXL3_TP_VISION:-1}
 export EXL3_TP_MAX_IMAGES=${EXL3_TP_MAX_IMAGES:-20}
 export EXL3_TP_DISK_CACHE=${EXL3_TP_DISK_CACHE:-1}

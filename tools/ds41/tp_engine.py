@@ -32,6 +32,14 @@ degrading to text-only):
   OUTPUT ROWS, not the tower. Rank 0 computes them once per image, ships them as one imgmeta
   frame + raw binary frames (sha256-validated), and both ranks attach the same list to every
   prefill chunk; decode steps never see image ids (a prompt must end on a text token)
+- only the images the prefill READS get a tower pass and a shipment (2026-11-10): those with
+  an id at or past the restore point. A resumed conversation's earlier screenshots are inside
+  the restored state, so a turn that adds 40 text tokens to a history of 11 screenshots runs
+  no tower and ships no rows (it used to pay ~12-20 s for both, in one step nothing could
+  interleave with). Rank 0 reads the restore point with a pure peek before its fallible
+  pre-work and re-checks the cover before begin (RoutingDrift, fatal, if it ever moved);
+  rank 1 requires rows only for image ids from the begin's "start" on. Workers advertise
+  "image_skip" in hello_ok; rank 0 ships every image to a worker that does not
 - the vendored chat layer renders one `<｜deepseek_image｜>` per image; `prepare_images`
   (CPU, off the event loop) decodes safely (data:/base64/http(s), byte + pixel caps) and plans
   the exact token span from the tower's own resize math; `prompt_ids(prompt, images)` splices
@@ -74,7 +82,8 @@ raw bytes, which no JSON frame can start with):
   rank 0 -> rank 1: {"op": "hello", "proto": 4, "vocab_size": V, "dspark": B, "vision": B}   handshake
                     {"op": "begin", "req": N, "ids": [int, ...], "spec": B}     new request (fresh state)
                       ids may hold image rows as dynamic ids >= 1000000000 when an
-                      imgmeta frame with matching ranges preceded the begin
+                      imgmeta frame with matching ranges preceded the begin (only the
+                      ids at positions >= "start" need a range: image_skip)
                       + "restore": K, "start": S   prefix cache: restore checkpoint K (position S)
                                                    and prefill only ids[S:]
                       + "drop": [K, ...]           drop these checkpoints (after the restore)
@@ -98,7 +107,8 @@ raw bytes, which no JSON frame can start with):
                     the first step's token (spec: the first round's anchor) is the prompt's last
                     token; every frame names its request; end + "reset": true forgets the session
   rank 1 -> rank 0: {"op": "hello_ok", "proto": 4, "rank": 1, "vocab_size": V, "dspark": B,
-                     "vision_capable": B}   (proto-4 workers speak imgmeta + binary frames)
+                     "vision_capable": B,   (proto-4 workers speak imgmeta + binary frames)
+                     "image_skip": B}       (rows needed only from the restore point on)
                     {"op": "imgmeta_ok", "req": N, "images": K, "rows": R}      vision rows landed intact
                     {"op": "pong"}
                     {"op": "error", "message": "..."}                          rank 1 failed; restart both
@@ -319,6 +329,13 @@ class RankLocalError(RuntimeError):
     """A rank-0-only step failed AFTER the collective part of a model call completed on every
     rank (drafter priming after a prefill chunk, the logits copy after a verify): the ranks are
     still in step, so it fails one request, never the engine."""
+
+
+class RoutingDrift(RuntimeError):
+    """Rank 0's routing committed a request whose prefill would read image ids it shipped no
+    rows for (the restore point moved after the pre-commit peek -- a bug, never expected).
+    Raised before the begin frame leaves, so no collective is half-run; fatal anyway, because
+    the commit already changed rank 0's session records: restart all ranks."""
 
 
 class RequestCancelled(Exception):
@@ -1651,7 +1668,10 @@ class Rank1Worker:
         ok = {"op": "hello_ok", "proto": proto, "rank": 1,
               "vocab_size": int(self.backend.vocab_size),
               "dspark": bool(getattr(self.backend, "dspark", False)),
-              "vision_capable": True}   # proto 4: imgmeta + binary frames understood
+              "vision_capable": True,   # proto 4: imgmeta + binary frames understood
+              # image ids below a begin's restore point need no rows (rank 0 ships only the
+              # images its prefill reads); rank 0 ships every image to a worker without this
+              "image_skip": True}
         if proto >= PROTO_SESSIONS:
             want_sessions = int(hello.get("sessions", 0) or 0)
             self.page_size = int(getattr(self.backend, "page_size", 256) or 256)
@@ -2007,18 +2027,23 @@ class Rank1Worker:
             self.embeddings = None
             self.embeddings_req = None
             embeds = None
+        # Only the ids the prefill feeds -- positions from the restore point on -- need rows:
+        # an image below it is already inside the restored state, so rank 0 ships no rows for
+        # it ("image_skip" in hello_ok). `start` itself is validated against the restored
+        # checkpoint below; a bogus one fails there.
         mm_ids = [t for t in ids if t >= FIRST_MM_EMBEDDING_INDEX]
-        if mm_ids and embeds is None:
-            raise ValueError(f"rank 1: prompt holds {len(mm_ids)} image row id(s) but no imgmeta "
-                             "shipment preceded the begin")
+        feed_from = int(msg.get("start") or 0)
+        ranges = [] if embeds is None else \
+            [(e.first_index, int(e.first_index) + int(e.mm_length)) for e in embeds]
         if embeds is not None and not mm_ids:
             raise ProtocolError("rank 1: imgmeta shipped but the begin ids hold no image rows")
-        if embeds is not None:
-            ranges = [(e.first_index, int(e.first_index) + int(e.mm_length)) for e in embeds]
-            for t in mm_ids:
-                if not any(a <= t < b for a, b in ranges):
-                    raise ValueError(f"rank 1: image row id {t} is outside every shipped range "
-                                     f"({[(a, b) for a, b in ranges]})")
+        missing = tp_vision.uncovered_image_ids(ids, feed_from, ranges) if mm_ids else []
+        if missing and embeds is None:
+            raise ValueError(f"rank 1: prompt holds {len(missing)} image row id(s) from position "
+                             f"{feed_from} on but no imgmeta shipment preceded the begin")
+        if missing:
+            raise ValueError(f"rank 1: image row id {missing[0]} is outside every shipped range "
+                             f"({[(a, b) for a, b in ranges]})")
         bad = [t for t in ids if FIRST_MM_EMBEDDING_INDEX > t >= self.backend.vocab_size or t < 0]
         if bad:
             raise ValueError(f"rank 1: prompt token id {bad[0]} outside the vocabulary")
@@ -2491,13 +2516,20 @@ class PrefixCache:
         self._tick += 1
         c.used = self._tick
 
-    def plan(self, ids: array) -> Checkpoint | None:
-        """The longest checkpoint valid for this prompt's prefill (ids[:-1]), or None."""
+    def peek(self, ids: array) -> Checkpoint | None:
+        """What plan() would pick, without touching the LRU order (pure): the engine reads the
+        restore point early, before its fallible pre-work, to ship only the image rows the
+        prefill from there reads."""
         limit = min(_common_prefix(self.kv_ids, ids), len(ids) - 1)
         best = None
         for c in self.ckpts:
             if c.pos <= limit and (best is None or c.pos > best.pos):
                 best = c
+        return best
+
+    def plan(self, ids: array) -> Checkpoint | None:
+        """The longest checkpoint valid for this prompt's prefill (ids[:-1]), or None."""
+        best = self.peek(ids)
         if best is not None:
             self._touch(best)
         return best
@@ -2654,7 +2686,8 @@ def _is_fatal(exc: BaseException) -> bool:
     """Errors after which the ranks can no longer be trusted to agree: a dead, timed-out or
     garbled control channel (rank 1 died, a frame was cut). Everything else fails one request
     and the others carry on (its own end frame already settled it on both ranks)."""
-    if isinstance(exc, (ChannelClosed, ProtocolError, RankDesync, ConnectionError, TimeoutError)):
+    if isinstance(exc, (ChannelClosed, ProtocolError, RankDesync, RoutingDrift, ConnectionError,
+                        TimeoutError)):
         return True                     # (socket.timeout is TimeoutError)
     return isinstance(exc, OSError) and exc.errno in _CHANNEL_ERRNOS
 
@@ -2685,7 +2718,8 @@ class TPEngine:
                  prefix: "PrefixCache | bool | None" = None, sessions: int | None = None,
                  session_opts: dict | None = None, disk_opts: dict | None = None,
                  concurrency: int | None = None,
-                 on_fatal: Callable[[BaseException], None] | None = None):
+                 on_fatal: Callable[[BaseException], None] | None = None,
+                 image_skip: bool = True):
         self.backend = backend
         # called once, from the model thread, after a fatal error failed every request: the
         # servers exit rank 0 there (tp_serve/tp3_serve), so the watchdog -- which watches the
@@ -2702,6 +2736,12 @@ class TPEngine:
         self.vision_cfg = getattr(backend, "vision_cfg", None)
         self._mm_alloc = tp_vision.MMIndexAllocator()
         self.image_token_id = self._resolve_image_token()
+        # A request runs the tower for, and ships, only the images its prefill reads -- those
+        # from the restore point on; the screenshots earlier in a resumed conversation are
+        # already inside the restored state. False ships every image every request (the
+        # servers pass False unless every worker's hello_ok says "image_skip").
+        self.image_skip = bool(image_skip)
+        self.vision_counters = {"image_requests": 0, "images": 0, "encoded": 0, "skipped": 0}
         self.requests = 0
         self.last_stats: dict[str, Any] = {}
         self._gen = _torch_generator(seed)
@@ -2890,6 +2930,66 @@ class TPEngine:
         if reply.get("op") != "imgmeta_ok" or int(reply.get("images", -1)) != len(embeddings) \
                 or int(reply.get("rows", -1)) != sum(e.mm_length for e in embeddings):
             raise RuntimeError(f"rank 1 rejected the image shipment: {reply}")
+
+    def _pinned_restore(self, plan, ids: list[int], use_cache: bool) -> int:
+        """The restore position _prefix_begin will pick for this request, read BEFORE the
+        fallible pre-work (vision) with a pure peek at the same checkpoint list. Nothing between
+        here and _prefix_begin touches that list: the plan was made at admission and the model
+        thread ran nothing since, the commit evicts only OTHER sessions (a matched session is
+        never its own victim) and grows pages. 0 when the point is not known yet -- a cold
+        session's checkpoints exist only after the disk reload inside the commit -- or there is
+        none (new or ephemeral session, cache off): 0 ships every image, as before."""
+        if not use_cache:
+            return 0
+        if self.mgr is None:
+            px = self.prefix
+        else:
+            if plan is None or plan.get("load_cold") is not None or plan.get("is_new") \
+                    or plan.get("ephemeral"):
+                return 0
+            sess = plan.get("session")
+            if sess is None or getattr(sess, "ephemeral", False):
+                return 0
+            px = sess.px
+        if px is None:
+            return 0
+        ck = px.peek(array("i", ids))
+        return int(ck.pos) if ck is not None else 0
+
+    def _arm_images(self, images, ids: list[int], plan, use_cache: bool):
+        """Tower + shipment for the images this request's prefill reads (before the commit,
+        where a failure is still clean). Returns (embeddings or None, the images shipped).
+
+        A resumed conversation restores its checkpoint and prefills only the new turn, so the
+        images below the restore point are never embedded again: they get no tower pass and
+        no shipment (a screenshot-heavy conversation used to pay both for every image on every
+        turn, in one step nothing else could interleave with)."""
+        if not images:
+            return None, []
+        pinned = self._pinned_restore(plan, ids, use_cache) if self.image_skip else 0
+        need = tp_vision.images_after(images, ids, pinned)
+        embeddings = None
+        if need:
+            embeddings = self._vision_encode(need)
+            self._ship_embeddings(need, embeddings)    # imgmeta + blobs + imgmeta_ok, before begin
+        vc = self.vision_counters
+        vc["image_requests"] += 1
+        vc["images"] += len(images)
+        vc["encoded"] += len(need)
+        vc["skipped"] += len(images) - len(need)
+        return embeddings, need
+
+    def _check_image_cover(self, ids: list[int], start: int, shipped: list) -> None:
+        """Before the begin frame leaves: every image id the prefill from `start` feeds has
+        rows (rank 1 refuses the begin otherwise, and a row-less image id would fault inside a
+        collective on this rank). Fails only if the restore point moved after the pinned peek
+        -- a routing bug: fatal, never a mis-spliced prefill."""
+        bad = tp_vision.uncovered_image_ids(
+            ids, start, [(im.first_index, int(im.first_index) + int(im.n_tokens)) for im in shipped])
+        if bad:
+            raise RoutingDrift(f"request {self._rid}: the prefill from position {start} reads "
+                               f"{len(bad)} image id(s) without shipped rows (first {bad[0]}); "
+                               f"the restore point moved after the image plan")
 
     # -- tokenization (Kyojin HFTokenizer semantics: specials parsed from the prompt text, no extra BOS)
     def count_tokens(self, text: str) -> int:
@@ -3440,15 +3540,15 @@ class TPEngine:
         use_cache, images = job.use_cache, job.images
         rid = job.rid
         # routing phase 1 (pure, done at admission) -> everything fallible (vision encode +
-        # shipment) -> commit
+        # shipment of the images the prefill reads) -> commit
         plan = job.plan
-        embeddings = self._vision_encode(images) if images else None
-        if embeddings:
-            self._ship_embeddings(images, embeddings)    # imgmeta + blobs + imgmeta_ok, before begin
+        embeddings, shipped = self._arm_images(images, ids, plan, use_cache)
         begin = {"op": "begin", "req": rid, "ids": [int(t) for t in ids]}
         alloc = self._session_commit(plan, begin)
         job.ctx = self._req
         ck, start, pending, evicted = self._prefix_begin(ids, False, use_cache, begin)
+        if images:
+            self._check_image_cover(ids, start, shipped)
         self.channel.send(begin)
         end = {"op": "end", "req": rid}
         state = None
@@ -3527,7 +3627,8 @@ class TPEngine:
         if self.mgr is not None and self._req is not None:
             stats["session"] = self._req.session.sid
         if images:
-            stats.update(images=len(images), image_tokens=sum(1 for t in ids if t >= FIRST_MM_EMBEDDING_INDEX))
+            stats.update(images=len(images), image_tokens=sum(1 for t in ids if t >= FIRST_MM_EMBEDDING_INDEX),
+                         images_encoded=len(shipped))
         return stats
 
     def _finish_request(self, state, end: dict, start: int, spec: bool, committed: list[int] | None,
@@ -3667,6 +3768,8 @@ class TPEngine:
             st["disk"] = self.tier.status()
         if self._interleave:
             st["scheduler"] = self.scheduler_status()
+        if self.supports_vision:
+            st["vision"] = {"image_skip": self.image_skip, **self.vision_counters}
         return st
 
     # -- one spec request (the model thread; mirrors the round/accept sequence of Rank1Worker)
@@ -3675,16 +3778,16 @@ class TPEngine:
         ids, max_tokens, stops, cancel, emit = job.ids, job.max_tokens, job.stops, job.cancel, job.emit
         spec_k, eos_id, sampler, use_cache, images = job.spec_k, job.eos_id, job.sampler, job.use_cache, job.images
         rid = job.rid
-        # routing phase 1 (pure, at admission) -> vision encode/shipment -> commit (nothing
-        # fails after it)
+        # routing phase 1 (pure, at admission) -> vision encode/shipment of the images the
+        # prefill reads -> commit (nothing fails after it)
         plan = job.plan
-        embeddings = self._vision_encode(images) if images else None
-        if embeddings:
-            self._ship_embeddings(images, embeddings)    # imgmeta + blobs + imgmeta_ok, before begin
+        embeddings, shipped = self._arm_images(images, ids, plan, use_cache)
         begin = {"op": "begin", "req": rid, "ids": [int(t) for t in ids], "spec": True}
         alloc = self._session_commit(plan, begin)
         job.ctx = self._req
         ck, start, pending, evicted = self._prefix_begin(ids, True, use_cache, begin)
+        if images:
+            self._check_image_cover(ids, start, shipped)
         self.channel.send(begin)
         end = {"op": "end", "req": rid}
         state = None
@@ -3824,7 +3927,8 @@ class TPEngine:
         if self.mgr is not None and self._req is not None:
             stats["session"] = self._req.session.sid
         if images:
-            stats.update(images=len(images), image_tokens=sum(1 for t in ids if t >= FIRST_MM_EMBEDDING_INDEX))
+            stats.update(images=len(images), image_tokens=sum(1 for t in ids if t >= FIRST_MM_EMBEDDING_INDEX),
+                         images_encoded=len(shipped))
         return stats
 
     # -- the scheduler: the one model thread ---------------------------------------------------
