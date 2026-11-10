@@ -42,16 +42,28 @@ WD_INTERVAL=${EXL3_TP3_WATCH_INTERVAL:-15}
 WD_LOAD_TIMEOUT=${EXL3_TP3_WATCH_LOAD_TIMEOUT:-900}
 FAIL_MARK="failed; restart ALL ranks"   # tp3_worker.py's last line when it cannot go on
 
-wait_loaded() {   # <host> <rank> <timeout_s>
-    local h=$1 r=$2 t=${3:-600} i=0
-    while [ $i -lt $t ]; do
-        if ssh -o BatchMode=yes -o ConnectTimeout=5 "$h" \
-             "grep -q 'cache .* tokens' $LOG/tp3-rank$r.log 2>/dev/null"; then
-            echo "  rank$r loaded (${i}s)"; return 0
-        fi
-        sleep 5; i=$((i+5))
+wait_loading() {  # <host> <rank> <timeout_s>: 0 once the worker of THIS start has begun its load,
+                  # i.e. logged its "cache N tokens" line, which it prints before it blocks in the
+                  # NCCL init that rank 0's load completes (a worker cannot finish loading before
+                  # rank 0 is up). Only the log written since record_offsets counts: the log is
+                  # appended across starts, and an older start's line would pass at once. 1 if the
+                  # worker exits first or the time runs out.
+    local h=$1 r=$2 t=${3:-600} i=0 off s f="$LOG/tp3-rank$2"
+    off=$(offset_of "$r")
+    case $off in ''|*[!0-9]*) off=0;; esac   # log size unknown: the whole log (an old line passes)
+    while [ "$i" -lt "$t" ]; do
+        s=$("${SSH[@]}" "$h" "if tail -c +$((off + 1)) $f.log 2>/dev/null | grep -q 'cache .* tokens'; then echo loading; elif kill -0 \$(cat $f.pid 2>/dev/null) 2>/dev/null; then echo starting; else echo exited; fi" 2>/dev/null)
+        case $s in
+            loading)
+                echo "  rank$r loading (${i}s)"; return 0;;
+            exited)
+                echo "  !! rank$r exited before it began loading; the end of its log:"
+                "${SSH[@]}" "$h" "tail -c +$((off + 1)) $f.log | tail -n 5" 2>/dev/null | sed 's/^/     /'
+                return 1;;
+        esac
+        sleep 5; i=$((i + 5))
     done
-    echo "  !! rank$r did not finish loading in ${t}s"; return 1
+    echo "  !! rank$r did not begin loading in ${t}s"; return 1
 }
 
 # Env overrides forwarded to the workers over ssh (ssh forwards nothing). The per-box OdinLink
@@ -225,10 +237,11 @@ start_stack() {   # probe, workers, rank 0 (no watchdog); 1 on any failure it ca
     start_worker "$B3" 2 "$P2" "$fwd" || return 1
     # Rank 0's load performs the world-size-3 NCCL warmup, which needs every
     # worker already loading; and the workers block in their own NCCL init
-    # until it runs. Gate on the model being loaded, not on a fixed sleep.
-    echo "== waiting for workers to finish loading before rank 0 =="
-    wait_loaded "$B2" 1 || return 1
-    wait_loaded "$B3" 2 || return 1
+    # until it runs. Gate on each worker of this start having begun its load
+    # (its own log line, not an older start's), not on a fixed sleep.
+    echo "== waiting for both workers to begin loading before rank 0 =="
+    wait_loading "$B2" 1 || return 1
+    wait_loading "$B3" 2 || return 1
     echo "== starting rank 0 (HTTP :$HTTP_PORT) =="
     [ -n "$P0" ] && p0env="ODL_RCCL_PEERS=$P0"
     nohup setsid env $p0env PYTHONUNBUFFERED=1 "$ROOT/tools/ds41/tp3_serve.sh" "$HTTP_PORT" "$MASTER" "$CONTROL" \
