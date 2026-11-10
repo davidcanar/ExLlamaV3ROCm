@@ -98,7 +98,7 @@ async def _tp_status(request: web.Request) -> web.Response:
         "ctx": getattr(engine, "ctx", None), "sessions": sessions,
     }
     if sessions > 1:
-        out["proto"] = tp_engine.PROTO_SESSIONS
+        out["proto"] = int(getattr(engine, "proto", tp_engine.PROTO_SESSIONS))
         status = getattr(engine, "session_status", None)
         if callable(status):
             out["pool"] = status()          # slots, pages used/free, per-session detail, counters
@@ -127,13 +127,26 @@ def build_tp_engine(args: argparse.Namespace) -> Any:
     if args.sessions is not None and env_sessions != sessions:
         print(f"tp3-serve: --sessions {sessions} overrides EXL3_TP_SESSIONS={env_sessions}; the "
               f"launcher can only forward the env var -- export it on every box too", flush=True)
-    proto = tp_engine.PROTO if sessions < 2 else tp_engine.PROTO_SESSIONS
+    # Interleaved requests (EXL3_TP_CONCURRENCY >= 2, needs sessions >= 2): proto 6, and every
+    # worker must have loaded as many live request slots (checked below)
+    concurrency = max(1, tp_engine.env_int("EXL3_TP_CONCURRENCY", 1))
+    if concurrency > 1 and sessions < 2:
+        startup_health.abort("EXL3_TP_CONCURRENCY >= 2 needs EXL3_TP_SESSIONS >= 2")
+        raise SystemExit(f"tp3-serve: EXL3_TP_CONCURRENCY={concurrency} needs the multi-session engine "
+                         f"(EXL3_TP_SESSIONS >= 2 on every box): each request in flight owns a session")
+    if concurrency > sessions:
+        startup_health.abort("EXL3_TP_CONCURRENCY exceeds EXL3_TP_SESSIONS")
+        raise SystemExit(f"tp3-serve: EXL3_TP_CONCURRENCY={concurrency} exceeds EXL3_TP_SESSIONS={sessions}")
+    proto = (tp_engine.PROTO_INTERLEAVE if concurrency > 1 else
+             tp_engine.PROTO if sessions < 2 else tp_engine.PROTO_SESSIONS)
     page_size = int(getattr(backend, "page_size", 256) or 256)
     pool_pages = int(backend.cache_tokens) // page_size
     hello = {"op": "hello", "proto": proto, "vocab_size": backend.vocab_size,
              "dspark": bool(backend.dspark), "vision": vision}
     if proto >= tp_engine.PROTO_SESSIONS:
         hello.update({"sessions": sessions, "pool_pages": pool_pages, "page_size": page_size})
+    if proto >= tp_engine.PROTO_INTERLEAVE:
+        hello["concurrency"] = concurrency
     # Same per-worker verification tp_serve.py applies to its single rank 1; the
     # workers' hello_ok all report rank 1 (the worker class predates tp3), which
     # the multi-channel normalizes away when comparing replies.
@@ -169,12 +182,19 @@ def build_tp_engine(args: argparse.Namespace) -> Any:
                 raise SystemExit(
                     f"tp3-serve: worker {i + 1}'s pool holds {reply.get('pool_pages')} pages, "
                     f"this rank's {pool_pages}; EXL3_TP_CACHE_TOKENS must match on every rank")
+        if proto >= tp_engine.PROTO_INTERLEAVE and int(reply.get("concurrency", -1)) != concurrency:
+            startup_health.abort(f"worker {i + 1} concurrency mismatch")
+            raise SystemExit(f"tp3-serve: worker {i + 1} runs {reply.get('concurrency')} requests at once, "
+                             f"this rank {concurrency}; export EXL3_TP_CONCURRENCY={concurrency} on every box")
     print(f"tp3-serve: {nworkers} worker(s) connected and verified (vocab {backend.vocab_size}, "
           f"dspark {'on' if backend.dspark else 'off'}, proto {proto})", flush=True)
     if sessions > 1:
         print(f"tp-serve: multi-session serving ON ({sessions} slots over the shared "
               f"{pool_pages}-page pool, dynamic noncontiguous pages; per-request \"session\" "
               f"ids 1..{sessions}; /tp/status reports the pool)", flush=True)
+    if concurrency > 1:
+        print(f"tp-serve: interleaved requests ON (up to {concurrency} in flight, one model step at a "
+              f"time, fair share by GPU time; /tp/status pool.scheduler)", flush=True)
     if vision:
         print("tp-serve: vision on (rank 0 tower + aligner loaded; image requests ship their rows "
               "to rank 1 per request; content-stable image ids use the prefix cache)", flush=True)
@@ -192,7 +212,8 @@ def build_tp_engine(args: argparse.Namespace) -> Any:
     ctx = max(16, min(ctx, backend.cache_tokens - 2))
     return tp_engine.TPEngine(backend, channel, tokenizer, ctx=ctx,
                               eos_id=tp_engine.eos_id_of(args.model, tokenizer), seed=args.seed,
-                              sessions=sessions,
+                              sessions=sessions, concurrency=concurrency,
+                              on_fatal=tp_engine.exit_on_fatal_hook(lambda line: print(line, flush=True)),
                               log=lambda line: print(line, flush=True))   # the launchers log to a file
 
 
@@ -285,8 +306,12 @@ def main() -> None:
     print(f"tp-serve: ctx {getattr(engine, 'ctx', '?')} tokens"
           + (f" (cache {be.cache_tokens}, prefill chunk {be.span} rows, block tables sized to the cache)"
              if be is not None else "")
-          + f", {int(getattr(engine, 'sessions', 1))} session slot(s), one in-flight request"
-          + (" (multi-session: GPU work serialized, queueing in the server)" if int(getattr(engine, "sessions", 1)) > 1 else ""),
+          + f", {int(getattr(engine, 'sessions', 1))} session slot(s), "
+          + (f"{int(getattr(engine, 'concurrency', 1))} interleaved requests in flight (proto 6)"
+             if int(getattr(engine, "concurrency", 1)) > 1 else
+             "one in-flight request"
+             + (" (multi-session: GPU work serialized, queueing in the server)"
+                if int(getattr(engine, "sessions", 1)) > 1 else "")),
           flush=True)
     if be is not None:
         print("tp-serve: prefix cache " + _prefix_cache_line(engine), flush=True)

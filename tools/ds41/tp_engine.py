@@ -93,6 +93,10 @@ raw bytes, which no JSON frame can start with):
                         "drop_all": true clears every checkpoint after a rank-0 bookkeeping failure)
                     {"op": "ping"}                                             liveness probe (idle only)
                     {"op": "shutdown"}                                         clean exit
+                    proto 6 (interleaved requests, see below): begin runs no model call;
+                    {"op": "chunk", "req": N, "a": A, "b": B}                  prefill prompt rows [A, B)
+                    the first step's token (spec: the first round's anchor) is the prompt's last
+                    token; every frame names its request; end + "reset": true forgets the session
   rank 1 -> rank 0: {"op": "hello_ok", "proto": 4, "rank": 1, "vocab_size": V, "dspark": B,
                      "vision_capable": B}   (proto-4 workers speak imgmeta + binary frames)
                     {"op": "imgmeta_ok", "req": N, "images": K, "rows": R}      vision rows landed intact
@@ -131,6 +135,40 @@ Multiple cached sessions (Stage 1, 2026-10-30, `tp_sessions.py`; EXL3_TP_SESSION
   whose checkpoint belongs to another session. hello/hello_ok validate proto, sessions and
   pool geometry with clear mismatch errors (a stale rank 1 refuses rather than desyncing).
 
+Interleaved requests (proto 6, 2026-11-10, test_tp_interleave.py; EXL3_TP_CONCURRENCY, default 1):
+- C >= 2 (needs S >= 2, C <= S, the same C on every rank) lets up to C requests run at once,
+  each in its own session with its own live recurrent slot (the trunk cache is built with
+  max_batch_size = C on every rank) and, on rank 0, its own drafter ring. They take turns on the
+  one model thread: a step is one prefill chunk, one decode token or one spec round, and the
+  scheduler (TPEngine._sched_main) runs a step of the running request that has used the least
+  model time so far. The GPU still does one thing at a time and every model call keeps the shape
+  it has with one request, so there is no throughput gain -- what goes is the head-of-line
+  blocking: a short request no longer waits for a long one to finish.
+- the lockstep rule extends unchanged: each frame is sent immediately before the model call it
+  names, every frame carries its request id, and a step yields only where both ranks have run
+  every call sent so far; one total frame order still pairs the ranks' collectives.
+- proto-6 frames: begin sets the request up (session routing, restore or fresh state) but runs
+  no model call; {"op": "chunk", "req", "a", "b"} prefills prompt rows [a, b) (the post-prefill
+  checkpoint is taken after the chunk that reaches the end of the prompt); the first decode
+  forward is a step frame (spec: the first round's anchor); step/round/accept/end as before,
+  per request. hello/hello_ok carry "concurrency"; end may carry "reset" (a rank-0 bookkeeping
+  failure forgets THAT session on both ranks -- the other running sessions are untouched, so
+  proto 6 never sends drop_all while anything runs).
+- admission (pure planning first): a prompt that continues a conversation whose request is still
+  running -- its committed turns (SessionManager.active_match) or the running request's own
+  prompt (prompt_continues: a resend of a FIRST turn, whose session has nothing committed yet) --
+  waits for it and then resumes from its checkpoint, as the serialized engine did, instead of
+  re-prefilling the whole conversation into a second session; a request whose pages or slot are
+  held by running requests waits for one to end (a request bigger than the whole pool is refused
+  at once); one waiting for pool room stops later requests from overtaking it; one cancelled
+  while waiting never reaches the wire (RequestCancelled). Prefill chunks are
+  EXL3_TP_INTERLEAVE_CHUNK rows (default 512) while another request runs, the full span alone.
+- a control-channel failure, or (proto 6) a rank-0 model call that fails after its frame left
+  (RankDesync: the peers sit in a collective rank 0 never joined), fails every request in flight
+  and latches the engine; on_fatal (the servers: exit rank 0, so the watchdog restarts all
+  ranks) fires first. Any other error fails its own request after its end frame settled it --
+  a spec round that fails after its verify sends accept 0 first (rank 1 waits for that accept).
+
 Long prompts (2026-10-28 fix, test_tp_chunked_prefill.py):
 - every trunk call (prefill chunks, decode steps, spec verifies) carries batch_shape =
   (1, cache_tokens): the library sizes the DSA pool's block table from batch_shape, and the
@@ -149,9 +187,10 @@ Long prompts (2026-10-28 fix, test_tp_chunked_prefill.py):
   memory floor (EXL3_TP_MEM_FLOOR, default 2 GiB) so a starved rank refuses to serve
 
 First-version limitations (documented in README.md):
-- one in-flight request; prompt reuse covers one conversation at a time (a request that diverges
-  early, say a client's side request for a title, overwrites the cached sequence past the shared
-  prefix, and the next turn of the main conversation re-prefills from there)
+- one in-flight request unless EXL3_TP_CONCURRENCY >= 2 (above); with S = 1, prompt reuse covers
+  one conversation at a time (a request that diverges early, say a client's side request for a
+  title, overwrites the cached sequence past the shared prefix, and the next turn of the main
+  conversation re-prefills from there)
 - serving context defaults to ~750 tokens (EXL3_TP_SAFE_CTX, tp_serve.py); the deployment
   (exl3ds4.sh) raises it to the full 512K cache, and prompts/chunks of any size up to
   cache_tokens - 2 are accepted (validated at ~8K-token prompts with DSpark)
@@ -164,7 +203,7 @@ First-version limitations (documented in README.md):
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
+import errno
 import json
 import os
 import socket
@@ -184,6 +223,10 @@ PROTO = 4                    # 4: vision frames (imgmeta + binary blobs, hello.v
 PROTO_SESSIONS = 5           # 5: per-session page allocation (hello.sessions/pool_pages; begin
                              #    carries session/pages/evict). Only sent with EXL3_TP_SESSIONS
                              #    >= 2; sessions=1 traffic stays proto 4, byte-compatible
+PROTO_INTERLEAVE = 6         # 6: interleaved requests (EXL3_TP_CONCURRENCY >= 2): begin no longer
+                             #    prefills; explicit chunk frames, the first decode step is a
+                             #    step frame, every frame names its request (hello.concurrency)
+PAGE_ROWS_MIN = 16           # smallest interleaved prefill chunk (EXL3_TP_INTERLEAVE_CHUNK floor)
 SESSIONS_DEFAULT = 1         # EXL3_TP_SESSIONS: 1 (default) = single-session engine above
 MAX_FRAME = 1 << 26          # 64 MiB frame guard (JSON and binary frames alike)
 MAX_HISTORY = 8              # recurrent rollback capacity of the spec path (as the proven script)
@@ -265,6 +308,25 @@ class SessionAlloc:
 
 class ProtocolError(RuntimeError):
     """The peer sent a frame this side does not understand."""
+
+
+class RankDesync(RuntimeError):
+    """A model call failed on rank 0 after its frame was sent: the peers ran (or are inside)
+    their side of it, so the ranks' collectives are no longer paired. Fatal: restart all ranks."""
+
+
+class RankLocalError(RuntimeError):
+    """A rank-0-only step failed AFTER the collective part of a model call completed on every
+    rank (drafter priming after a prefill chunk, the logits copy after a verify): the ranks are
+    still in step, so it fails one request, never the engine."""
+
+
+class RequestCancelled(Exception):
+    """The caller gave up on a request before it ever started; nothing reached the wire."""
+
+
+class EngineShutdown(RuntimeError):
+    """The engine is shutting down; the request stopped at its next boundary."""
 
 
 _BLOB_TAG = b"\x01"          # binary-frame tag: no JSON frame can start with this byte
@@ -653,7 +715,8 @@ class TPModelBackend:
     def __init__(self, model, cache, tokenizer, *, span: int, cache_tokens: int, rank: int = 0,
                  dspark: bool = False, draft_model=None, draft_cache=None, draft_bt=None,
                  export_layers=frozenset(), dspark_block: int = 5, page_size: int = 256,
-                 draft_window_rows: int = 128, vision=None, vision_cfg=None):
+                 draft_window_rows: int = 128, vision=None, vision_cfg=None, draft_bts=None,
+                 slots: int = 1):
         self.model = model
         self.cache = cache
         self.tokenizer = tokenizer
@@ -663,7 +726,12 @@ class TPModelBackend:
         self.dspark = bool(dspark)
         self.draft_model = draft_model            # rank 0 only, dspark
         self.draft_cache = draft_cache
-        self.draft_bt = draft_bt
+        # one drafter ring per live trunk slot (EXL3_TP_CONCURRENCY): bind(state) points
+        # draft_bt at the ring of the request that runs next; slot 0's ring is the only one
+        # at concurrency 1, so the single-request engine addresses exactly what it always did
+        self.draft_bts = list(draft_bts) if draft_bts else ([draft_bt] if draft_bt is not None else None)
+        self.draft_bt = self.draft_bts[0] if self.draft_bts else draft_bt
+        self.slots = max(1, int(slots))           # live recurrent-state slots of the trunk cache
         self.export_layers = frozenset(export_layers)
         self.dspark_block = int(dspark_block)
         self.page_size = int(page_size)
@@ -754,9 +822,15 @@ class TPModelBackend:
         # The cache must be attached before TP loading so cache layers are exported (as in the
         # scripts); dspark adds the recurrent rollback history the verify passes need.
         cache_kwargs = {"max_history": MAX_HISTORY} if dspark else {}
-        cache = Cache(model, max_num_tokens=cache_tokens, max_batch_size=1, **cache_kwargs)
+        # Live recurrent-state slots: one per request in flight (EXL3_TP_CONCURRENCY, proto 6:
+        # interleaved requests keep their SWA rings / compressor windows / Engram ids resident
+        # instead of stashing them at every switch). Must match on every rank: the handshake
+        # refuses a worker with fewer slots than rank 0 schedules.
+        slots = max(1, env_int("EXL3_TP_CONCURRENCY", 1))
+        cache = Cache(model, max_num_tokens=cache_tokens, max_batch_size=slots, **cache_kwargs)
         log(f"tp: rank {rank} cache {cache_tokens} tokens ({cache_tokens // PAGE_SIZE} pages of "
-            f"{PAGE_SIZE}); prefill chunks at {span} rows; block tables sized to the cache")
+            f"{PAGE_SIZE}); prefill chunks at {span} rows; block tables sized to the cache"
+            + (f"; {slots} live request slots" if slots > 1 else ""))
         started = time.time()
         # EXL3_TP_MOE_TENSOR_SPLIT=1 (every rank): split each routed expert's intermediate width
         # across the ranks instead of giving each rank a range of whole experts. Every rank then
@@ -778,7 +852,7 @@ class TPModelBackend:
 
         # ---- rank 0 only: the DSpark drafter, loaded beside the TP trunk (as the script) ----
         # (layer-split, no TP dispatches: rank 1's dispatch sequence is unaffected)
-        draft_model = draft_cache = draft_bt = None
+        draft_model = draft_cache = draft_bt = draft_bts = None
         if dspark and rank == 0:
             import torch
             report = _vram_report(env_int("EXL3_TP_LOCAL_DEVICE", 0))
@@ -800,16 +874,25 @@ class TPModelBackend:
                 raise ValueError(f"EXL3_TP_DRAFT_RING={ring} pages cannot hold a {span}-row prefill "
                                  f"chunk plus the drafter's {window}-row window")
             draft_model = Model.from_config(config, component="mtp")
-            draft_cache = Cache(draft_model, max_num_tokens=ring * PAGE_SIZE, max_batch_size=1)
+            # one ring per live trunk slot (interleaved requests must not overwrite each
+            # other's drafter rows); a full-context main-kv stays single (concurrency 1 only)
+            n_rings = slots if ring < cache_pages else 1
+            if n_rings < slots:
+                raise ValueError(f"EXL3_TP_CONCURRENCY={slots} needs the drafter's main-kv ring "
+                                 f"(EXL3_TP_DRAFT_RING > 0); a full-context drafter cache is "
+                                 f"single-request only")
+            draft_cache = Cache(draft_model, max_num_tokens=n_rings * ring * PAGE_SIZE, max_batch_size=1)
             draft_model.load(progressbar=False)
             draft_model.attach_to(model)     # private embedding (CPU) + private head (GPU)
             assert draft_model.own_head is not None, "drafter did not get its private head (attach order bug)"
-            draft_bt = (torch.arange(cache_pages, dtype=torch.int32) % ring).view(1, -1)
+            draft_bts = [(torch.arange(cache_pages, dtype=torch.int32) % ring + s * ring).view(1, -1)
+                         for s in range(n_rings)]
+            draft_bt = draft_bts[0]
             ring_mib = sum(l.storage_size() for l in draft_cache.layers.values()) / 2**20
             log(f"tp: rank 0 DSpark drafter loaded in {time.time() - started:.1f} s "
                 f"(block {block}, taps at layers {sorted(export_layers)}, max_history {MAX_HISTORY}; "
-                f"main-kv {'ring of ' + str(ring) + ' pages' if ring < cache_pages else 'full context'}, "
-                f"{ring_mib:.1f} MiB)")
+                f"main-kv {'ring of ' + str(ring) + ' pages' if ring < cache_pages else 'full context'}"
+                f"{f' x {n_rings} request slots' if n_rings > 1 else ''}, {ring_mib:.1f} MiB)")
             check_memory_floor("after the DSpark drafter load", rank=rank, floor_gib=floor_gib, log=log)
 
         # ---- rank 0 only: the vision tower + aligner, beside the TP trunk ---------------------
@@ -853,12 +936,22 @@ class TPModelBackend:
                    dspark=dspark, draft_model=draft_model, draft_cache=draft_cache, draft_bt=draft_bt,
                    export_layers=export_layers, dspark_block=block, page_size=PAGE_SIZE,
                    draft_window_rows=int(config.sliding_window), vision=vision_model,
-                   vision_cfg=getattr(config, "vision", None))
+                   vision_cfg=getattr(config, "vision", None),
+                   draft_bts=draft_bts, slots=slots)
 
     def new_state(self):
         import torch
         with torch.inference_mode():
             return self.cache.get_new_state()
+
+    def bind(self, state) -> None:
+        """Select what is per request but not passed per call: the drafter ring of the slot
+        `state` occupies (rank 0, DSpark). Trunk calls carry their state and page mapping
+        explicitly, so this is all an interleaved switch needs; the engine calls it before
+        each of a request's steps (a no-op at concurrency 1: one slot, one ring)."""
+        if state is None or not self.draft_bts or len(self.draft_bts) < 2:
+            return
+        self.draft_bt = self.draft_bts[int(state.slot)]
 
     def _check_alloc(self, alloc: "SessionAlloc", position: int, rows: int, state=None) -> None:
         """Engine-side pre-dispatch guards for block_table calls (multi-session): every
@@ -1136,11 +1229,17 @@ class TPModelBackend:
                 if self.draft_model is not None:
                     # rank 0 only: the tap states are visible on the output rank (its TP worker
                     # runs in this process); rank 1's workers export into their own copies, and
-                    # the export dispatch itself is what must match -- never the visibility
-                    if not taps:
-                        raise RuntimeError(
-                            f"target tap export missing after spec prefill chunk [{a}:{b})")
-                    self.draft_prefill_kv(taps, position=a)   # prime the drafter per chunk
+                    # the export dispatch itself is what must match -- never the visibility.
+                    # The trunk chunk is done on every rank here: a failure below is local
+                    # (RankLocalError), the ranks are still in step
+                    try:
+                        if not taps:
+                            raise RuntimeError(
+                                f"target tap export missing after spec prefill chunk [{a}:{b})")
+                        self.draft_prefill_kv(taps, position=a)   # prime the drafter per chunk
+                    except Exception as exc:
+                        raise RankLocalError(f"drafter priming after prefill chunk [{a}:{b}) "
+                                             f"failed on rank 0: {type(exc).__name__}: {exc}") from exc
                     params.pop("export_states", None)         # consumed; the engine must not re-prime
         return last_params or {}
 
@@ -1170,7 +1269,10 @@ class TPModelBackend:
         logits = self.model.forward(verify_ids, params)
         if self.rank != self.OUTPUT_RANK or logits is None:
             return None, params
-        return logits[0, :, : self.vocab_size].float(), params
+        try:                                 # (the verify ran on every rank: anything here is local)
+            return logits[0, :, : self.vocab_size].float(), params
+        except Exception as exc:
+            raise RankLocalError(f"verify logits copy failed on rank 0: {type(exc).__name__}: {exc}") from exc
 
     def rewind(self, state, steps: int) -> None:
         """Roll the recurrent state back `steps` tokens after a verify pass. A mirrored TP
@@ -1470,16 +1572,27 @@ class Rank1Worker:
     `end` releases the state. The mode is fixed per request: a request picks plain or spec at
     its settled start boundary and never switches mid-flight, so the collective sequences of
     the two ranks stay identical (see the module docstring for the full lockstep rules).
+
+    Proto 6 (interleaved requests, EXL3_TP_CONCURRENCY >= 2): up to `concurrency` requests run
+    at once, one record each in `jobs` (keyed by the frames' "req"); begin only sets the
+    request up, `chunk` frames prefill it, `step`/`round`/`accept`/`end` name the request they
+    advance. Frames still arrive in one total order and each one is one model call, so the
+    ranks' collectives stay paired; the guards refuse anything that would touch a session
+    another running request owns.
     """
 
     def __init__(self, backend, channel, *, log: Callable[[str], None] = print,
-                 sessions: int | None = None, disk_opts: dict | None = None):
+                 sessions: int | None = None, disk_opts: dict | None = None,
+                 concurrency: int | None = None):
         self.backend = backend
         self.channel = channel
         self.log = log
         self.sessions_env = sessions     # tests pin the expected session count; production
         #                                  validates rank 0's hello against EXL3_TP_SESSIONS
         self.disk_opts = disk_opts       # tests pin this rank's tier dir/cap; production env
+        self.concurrency_env = concurrency   # likewise for EXL3_TP_CONCURRENCY (proto 6)
+        self.concurrency = 1
+        self.jobs: dict[Any, dict] = {}  # proto 6: running requests by request id
         self.state = None
         self.position = -1
         self.request_id = None
@@ -1508,14 +1621,33 @@ class Rank1Worker:
         if hello.get("op") != "hello":
             raise ProtocolError(f"rank 1: expected hello, got {hello.get('op')!r}")
         proto = int(hello.get("proto", -1))
-        if proto not in (PROTO, PROTO_SESSIONS):
-            if proto > PROTO_SESSIONS:
+        if proto not in (PROTO, PROTO_SESSIONS, PROTO_INTERLEAVE):
+            if proto > PROTO_INTERLEAVE:
                 raise ProtocolError(
                     f"rank 1: rank 0 speaks control protocol {proto}, this worker speaks at most "
-                    f"{PROTO_SESSIONS}; sync tools/ds41 on both boxes and restart both ranks")
+                    f"{PROTO_INTERLEAVE}; sync tools/ds41 on both boxes and restart both ranks")
             raise ProtocolError(
                 f"rank 1: control protocol mismatch (rank 0 sent {proto!r}, this worker speaks "
-                f"{PROTO}/{PROTO_SESSIONS})")
+                f"{PROTO}/{PROTO_SESSIONS}/{PROTO_INTERLEAVE})")
+        here_conc = max(1, int(self.concurrency_env if self.concurrency_env is not None
+                               else env_int("EXL3_TP_CONCURRENCY", 1)))
+        if proto >= PROTO_INTERLEAVE:
+            want_conc = int(hello.get("concurrency", 0) or 0)
+            if want_conc < 2:
+                raise ProtocolError(f"rank 1: proto {proto} hello without concurrency >= 2")
+            if want_conc != here_conc:
+                raise ProtocolError(
+                    f"rank 1: rank 0 runs {want_conc} requests at once but this rank started with "
+                    f"EXL3_TP_CONCURRENCY={here_conc} (its cache has that many live request "
+                    f"slots); forward EXL3_TP_CONCURRENCY to this box and restart ALL ranks")
+            slots = getattr(self.backend, "slots", None)
+            if slots is not None and int(slots) < want_conc:
+                raise ProtocolError(f"rank 1: this rank's cache holds {slots} live request slots, "
+                                    f"rank 0 runs {want_conc} requests at once")
+        elif here_conc > 1:
+            raise ProtocolError(
+                f"rank 1: this rank started with EXL3_TP_CONCURRENCY={here_conc} but rank 0 speaks "
+                f"proto {proto} (one request at a time); start every rank with the same value")
         ok = {"op": "hello_ok", "proto": proto, "rank": 1,
               "vocab_size": int(self.backend.vocab_size),
               "dspark": bool(getattr(self.backend, "dspark", False)),
@@ -1542,6 +1674,9 @@ class Rank1Worker:
             self.sessions_max = want_sessions
             ok.update({"sessions": want_sessions, "pool_pages": self.pool_pages,
                        "page_size": self.page_size})
+            if proto >= PROTO_INTERLEAVE:
+                self.concurrency = here_conc
+                ok["concurrency"] = here_conc
             # stage 2: this rank's own NVMe tier (per-rank local images; disabled when the
             # backend lacks the hooks -- spills then come back as spill_error and rank 0
             # falls back to eviction, never wrong output)
@@ -1561,11 +1696,13 @@ class Rank1Worker:
         self.channel.send(ok)
         self.log(f"tp: rank 1 handshake complete (proto {proto}"
                  + (f", {self.sessions_max} sessions over {self.pool_pages} pages" if proto >= PROTO_SESSIONS else "")
+                 + (f", {self.concurrency} interleaved requests" if proto >= PROTO_INTERLEAVE else "")
                  + ")")
         return hello
 
     def serve_forever(self) -> None:
         self.handshake()
+        ilv = self.proto >= PROTO_INTERLEAVE
         while True:
             try:
                 msg = self.channel.recv()
@@ -1576,17 +1713,19 @@ class Rank1Worker:
             op = msg.get("op")
             try:
                 if op == "begin":
-                    self._begin(msg)
+                    self._begin6(msg) if ilv else self._begin(msg)
                 elif op == "imgmeta":
                     self._imgmeta(msg)
                 elif op == "step":
-                    self._step(msg)
+                    self._step6(msg) if ilv else self._step(msg)
+                elif op == "chunk" and ilv:
+                    self._chunk6(msg)
                 elif op == "round":
-                    self._round(msg)
+                    self._round6(msg) if ilv else self._round(msg)
                 elif op == "accept":
-                    self._accept(msg)
+                    self._accept6(msg) if ilv else self._accept(msg)
                 elif op == "end":
-                    self._end(msg)
+                    self._end6(msg) if ilv else self._end(msg)
                 elif op == "spill":
                     self._spill(msg)
                 elif op == "load":
@@ -1603,7 +1742,7 @@ class Rank1Worker:
             except Exception as exc:                                   # noqa: BLE001  (reported to rank 0, then fatal)
                 try:
                     self.channel.send({"op": "error", "message": f"{type(exc).__name__}: {exc}",
-                                       "req": self.request_id})
+                                       "req": msg.get("req") if ilv else self.request_id})
                 except OSError:
                     pass
                 raise
@@ -1613,8 +1752,14 @@ class Rank1Worker:
         frames. Validated (blob sizes, sha256, dynamic-id ranges) and rebuilt as this rank's
         indexed_embeddings, then acknowledged BEFORE rank 0 sends begin -- a shipment that did
         not land byte-exact never reaches a model call, where a bad row would fault inside a
-        collective and wedge rank 0's NCCL peer instead of erroring."""
-        if self.state is not None:
+        collective and wedge rank 0's NCCL peer instead of erroring.
+
+        Proto 6: other requests may be running (their rows travel in their own job records);
+        this shipment arms the begin that follows it, and only that begin's request takes it."""
+        if self.proto >= PROTO_INTERLEAVE:
+            if msg.get("req") in self.jobs:
+                raise ProtocolError(f"rank 1: imgmeta for request {msg.get('req')} that is already running")
+        elif self.state is not None:
             raise ProtocolError("rank 1: imgmeta while a request is still active")
         specs = msg.get("images") or []
         blobs = [self.channel.recv_blob() for _ in range(int(msg.get("n", len(specs))))]
@@ -1656,6 +1801,7 @@ class Rank1Worker:
             rec = self.sess.get(sid)
             if rec is None:
                 raise ProtocolError(f"rank 1: evict of unknown session {sid}")
+            self._guard_idle(sid, "evict")
             if rec["stashes"]:
                 raise ProtocolError(
                     f"rank 1: evict of session {sid} with checkpoints {sorted(rec['stashes'])} "
@@ -1666,9 +1812,28 @@ class Rank1Worker:
                 del self.claimed[p]
             del self.sess[sid]
 
+    def _running_in(self, sid: int):
+        """Proto 6: the running request that owns session `sid`, or None."""
+        for job in self.jobs.values():
+            if job["sid"] == int(sid):
+                return job
+        return None
+
+    def _guard_idle(self, sid: int, what: str, *, own=None) -> None:
+        """Proto 6: refuse `what` on a session another running request owns (rank 0 never
+        evicts, spills or drops into a running conversation; this is the mirror's check)."""
+        if self.proto < PROTO_INTERLEAVE:
+            return
+        job = self._running_in(sid)
+        if job is not None and job is not own:
+            raise ProtocolError(f"rank 1: {what} of session {sid} while request {job['req']} runs in it")
+
     def _drop_all_sessions(self) -> None:
         """drop_all (cache_salt reset / rank-0 bookkeeping failure): forget every stash,
         session record, page claim and disk image on this rank."""
+        if self.jobs:
+            raise ProtocolError(f"rank 1: drop_all while {len(self.jobs)} request(s) run "
+                                "(proto 6 resets only between requests)")
         for rec in self.sess.values():
             for _, (_, stash) in list(rec["stashes"].items()):
                 try:
@@ -1724,6 +1889,7 @@ class Rank1Worker:
         rec = self.sess.get(sid)
         if rec is None:
             raise ProtocolError(f"rank 1: spill of unknown session {sid}")
+        self._guard_idle(sid, "spill")       # proto 6: never a running conversation
         if self.tier is None or not self.tier.enabled:
             self.channel.send({"op": "spill_error", "session": sid, "req": msg.get("req"),
                                "reason": "rank 1 disk tier off (EXL3_TP_DISK_CACHE)"})
@@ -1764,6 +1930,8 @@ class Rank1Worker:
             raise ProtocolError("rank 1: load while a request is still active")
         if self.proto < PROTO_SESSIONS:
             raise ProtocolError("rank 1: load frame in proto 4")
+        for sid_e in msg.get("evict") or ():     # proto 6: victims are never running
+            self._guard_idle(int(sid_e), "evict (load)")
         sid = int(msg["session"])
         image_sid = int(msg.get("image") or sid)
         pages = [int(p) for p in msg["pages"]]
@@ -1822,9 +1990,11 @@ class Rank1Worker:
                  f"{'...' if len(pages) > 4 else ''} ({len(rec['stashes'])} checkpoints)")
         self.channel.send({"op": "load_ok", "session": sid, "req": msg.get("req")})
 
-    def _begin(self, msg: dict) -> None:
-        if self.state is not None:
-            raise ProtocolError("rank 1: begin while a request is still active")
+    def _begin_checks(self, msg: dict) -> dict:
+        """begin, the part every protocol shares: validate the prompt, the images and the
+        bounds, run the session routing (drops, evictions, page upsert -- the order rank 0's
+        session path runs them) and find the checkpoint to restore. Returns what the
+        protocol-specific tail needs; no state exists yet."""
         ids = [int(t) for t in msg["ids"]]
         if len(ids) < 2:
             raise ValueError("rank 1: prompt must hold at least 2 token ids")
@@ -1876,6 +2046,7 @@ class Rank1Worker:
             if not 1 <= sid <= self.sessions_max:
                 raise ProtocolError(f"rank 1: session {sid} outside 1..{self.sessions_max}")
             pages = [int(p) for p in msg["pages"]]
+            self._guard_idle(sid, "begin")    # proto 6: one request per session
             if not pages:
                 raise ProtocolError(f"rank 1: session {sid} begin with an empty page list")
             if len(ids) + 2 > len(pages) * self.page_size:
@@ -1923,6 +2094,15 @@ class Rank1Worker:
         if msg.get("drop_all") and self.proto < PROTO_SESSIONS:
             self._drop(list(self.stashes))             # rank 0 reset its prefix cache (cache_salt change)
         # (proto 5 handled drop_all above, before this request's own record was created)
+        return {"ids": ids, "embeds": embeds, "spec": spec, "sid": sid, "alloc": alloc,
+                "dropped": dropped, "start": start, "restore": restore, "entry": entry}
+
+    def _begin(self, msg: dict) -> None:
+        if self.state is not None:
+            raise ProtocolError("rank 1: begin while a request is still active")
+        b = self._begin_checks(msg)
+        ids, embeds, spec, sid, alloc = b["ids"], b["embeds"], b["spec"], b["sid"], b["alloc"]
+        dropped, start, restore, entry = b["dropped"], b["start"], b["restore"], b["entry"]
         self.spec = spec
         self.sid = sid
         self.alloc = alloc
@@ -1941,6 +2121,160 @@ class Rank1Worker:
             _forward(self.backend, ids[-1], self.position, self.state, em, alloc)
             self.position += 1
         # spec mode: no first forward -- the round window carries the anchor at this position
+
+    # ---- proto 6: interleaved requests (one record per running request) ---------------------
+
+    def _job6(self, msg: dict, op: str) -> dict:
+        job = self.jobs.get(msg.get("req"))
+        if job is None:
+            raise ProtocolError(f"rank 1: {op} for request {msg.get('req')!r}, which is not running")
+        bind = getattr(self.backend, "bind", None)
+        if bind is not None:
+            bind(job["state"])             # (a no-op on the real worker: no drafter here)
+        return job
+
+    def _begin6(self, msg: dict) -> None:
+        """Set the request up -- session routing, restore or a fresh state -- but run no model
+        call: the prefill arrives as chunk frames, the first decode forward as a step (spec:
+        the first round's window)."""
+        rid = msg.get("req")
+        if rid is None:
+            raise ProtocolError("rank 1: proto 6 begin without a request id")
+        if rid in self.jobs:
+            raise ProtocolError(f"rank 1: begin for request {rid}, which is already running")
+        if len(self.jobs) >= self.concurrency:
+            raise ProtocolError(f"rank 1: begin of a request beyond the {self.concurrency} that may "
+                                f"run at once (running: {sorted(self.jobs)})")
+        b = self._begin_checks(msg)
+        ids, start = b["ids"], b["start"]
+        # the armed image shipment belongs to this request now (it travels in the record)
+        self.embeddings = None
+        self.embeddings_req = None
+        state = self.backend.restore(b["entry"][1], start) if b["restore"] is not None \
+            else self.backend.new_state()
+        job = {"req": rid, "state": state, "ids": ids, "n": len(ids) - 1, "position": start,
+               "spec": b["spec"], "sid": b["sid"], "alloc": b["alloc"], "embeds": b["embeds"],
+               "save": msg.get("save"), "prefilled": False, "fed": 0, "round_k": None,
+               "prompt_len": len(ids) - start}
+        self.jobs[rid] = job
+        if job["position"] == job["n"]:
+            self._prefilled6(job)
+
+    def _prefilled6(self, job: dict) -> None:
+        """The prompt is in: the post-prefill checkpoint, as rank 0 saves it."""
+        job["prefilled"] = True
+        if job["save"] is not None:
+            self._save6(job, int(job["save"]))
+
+    def _save6(self, job: dict, key: int) -> None:
+        rec = self.sess.get(job["sid"])
+        if rec is None:
+            raise ProtocolError(f"rank 1: session {job['sid']} has no record (begin without pages?)")
+        if key in rec["stashes"]:
+            raise ProtocolError(f"rank 1: checkpoint {key} already exists")
+        rec["stashes"][key] = (job["position"], self.backend.stash(job["state"]))
+
+    def _chunk6(self, msg: dict) -> None:
+        job = self._job6(msg, "chunk")
+        if job["prefilled"]:
+            raise ProtocolError(f"rank 1: chunk for request {job['req']} after its prefill completed")
+        a, b = int(msg["a"]), int(msg["b"])
+        if a != job["position"] or not a < b <= job["n"]:
+            raise ProtocolError(f"rank 1: chunk [{a}, {b}) does not continue request {job['req']} "
+                                f"(prefilled to {job['position']} of {job['n']} prompt rows)")
+        _prefill(self.backend, job["ids"][: b + 1], job["state"], job["spec"], a, job["embeds"],
+                 job["alloc"])
+        job["position"] = b
+        if b == job["n"]:
+            self._prefilled6(job)
+
+    def _step6(self, msg: dict) -> None:
+        job = self._job6(msg, "step")
+        if job["spec"]:
+            raise ProtocolError("rank 1: step during a spec request (mode is fixed per request)")
+        if not job["prefilled"]:
+            raise ProtocolError(f"rank 1: step for request {job['req']} before its prefill completed")
+        token = int(msg["token"])
+        if job["fed"] == 0 and token != job["ids"][-1]:
+            raise ProtocolError("rank 1: the first step must feed the prompt's last token")
+        em = job["embeds"] if (job["embeds"] and token >= FIRST_MM_EMBEDDING_INDEX) else None
+        _forward(self.backend, token, job["position"], job["state"], em, job["alloc"])
+        job["position"] += 1
+        job["fed"] += 1
+
+    def _round6(self, msg: dict) -> None:
+        job = self._job6(msg, "round")
+        if not job["spec"]:
+            raise ProtocolError("rank 1: round without a spec request")
+        if not job["prefilled"]:
+            raise ProtocolError(f"rank 1: round for request {job['req']} before its prefill completed")
+        if job["round_k"] is not None:
+            raise ProtocolError("rank 1: round before the previous round's accept")
+        k = int(msg["k"])
+        window = [int(t) for t in msg["window"]]
+        if not 0 <= k <= getattr(self.backend, "dspark_block", 5) or len(window) != k + 1:
+            raise ProtocolError(f"rank 1: malformed round frame (k={k}, window {len(window)})")
+        if job["fed"] == 0 and window[0] != job["ids"][-1]:
+            raise ProtocolError("rank 1: the first round's anchor must be the prompt's last token")
+        job["round_k"] = k
+        _verify(self.backend, window, job["position"], job["state"], job["alloc"])
+        job["fed"] += 1
+
+    def _accept6(self, msg: dict) -> None:
+        job = self._job6(msg, "accept")
+        if not job["spec"] or job["round_k"] is None:
+            raise ProtocolError("rank 1: accept without round")
+        a = int(msg["accepted"])
+        if not 0 <= a <= job["round_k"]:
+            raise ProtocolError(f"rank 1: accepted {a} outside 0..{job['round_k']}")
+        self.backend.rewind(job["state"], job["round_k"] - a)
+        job["position"] += a + 1
+        job["round_k"] = None
+
+    def _end6(self, msg: dict) -> None:
+        """Settle and release one request, exactly like the proto-5 end, plus the session-
+        scoped reset: "reset" (rank 0's records of THIS session may be wrong) forgets this
+        session whole on both ranks while every other running request carries on."""
+        job = self._job6(msg, "end")
+        if job["round_k"] is not None:
+            raise ProtocolError("rank 1: end with a round still awaiting its accept")
+        if msg.get("session") is not None and int(msg["session"]) != job["sid"]:
+            raise ProtocolError(f"rank 1: end names session {msg.get('session')} but the request "
+                                f"runs in session {job['sid']}")
+        if msg.get("drop_all"):
+            raise ProtocolError("rank 1: drop_all in a proto 6 end frame (resets are session-scoped)")
+        reset = bool(msg.get("reset"))
+        if reset:
+            rec = self.sess.get(job["sid"]) or {"stashes": {}}
+            for key in list(rec["stashes"]):
+                _, st = rec["stashes"].pop(key)
+                try:
+                    self.backend.drop_stash(st)
+                except Exception:                                       # noqa: BLE001  (best effort)
+                    pass
+        else:
+            self._drop(msg.get("drop"), own=job)
+            if msg.get("save") is not None:
+                back = int(msg.get("rewind") or 0)
+                limit = min(job["position"], int(getattr(self.backend, "dspark_block", 5)))
+                if not 0 <= back <= limit:
+                    raise ProtocolError(f"rank 1: end rewind {back} outside 0..{limit}")
+                if back:
+                    self.backend.rewind(job["state"], back)   # to the end of the emitted reply (spec)
+                    job["position"] -= back
+                self._save6(job, int(msg["save"]))
+        self.backend.release_state(job["state"])
+        del self.jobs[job["req"]]
+        self.requests_served += 1
+        if reset:
+            self._drop_sessions([job["sid"]])
+        else:
+            # whole sessions freed at the settled end of their request (ephemeral warm-up
+            # slots; the drops above already emptied their stashes)
+            self._drop_sessions(msg.get("evict"))
+        trim = getattr(self.backend, "trim_memory", None)
+        if trim is not None and job["prompt_len"] > getattr(self.backend, "span", 0):
+            trim()
 
     def _step(self, msg: dict) -> None:
         if self.state is None:
@@ -1983,10 +2317,12 @@ class Rank1Worker:
             raise ProtocolError(f"rank 1: checkpoint {key} already exists")
         ns[key] = (self.position, self.backend.stash(self.state))
 
-    def _drop(self, keys) -> None:
+    def _drop(self, keys, own: dict | None = None) -> None:
         # unknown keys are fine: rank 0 also drops what a failed request may or may not have
         # saved here. Proto 5 keys are globally unique across sessions, so a drop list may
         # span sessions (whole-session evictions drop every key they owned in one list).
+        # Proto 6: never a checkpoint of a session another running request owns (`own` is the
+        # request whose own end frame is dropping).
         if self.proto < PROTO_SESSIONS:
             for key in keys or ():
                 entry = self.stashes.pop(int(key), None)
@@ -1996,8 +2332,11 @@ class Rank1Worker:
         wanted = {int(k) for k in (keys or ())}
         if not wanted:
             return
-        for rec in self.sess.values():
-            for key in [k for k in rec["stashes"] if k in wanted]:
+        for sid, rec in self.sess.items():
+            hit = [k for k in rec["stashes"] if k in wanted]
+            if hit:
+                self._guard_idle(sid, "drop of checkpoints", own=own)
+            for key in hit:
                 entry = rec["stashes"].pop(key)
                 self.backend.drop_stash(entry[1])
                 wanted.discard(key)
@@ -2049,7 +2388,14 @@ class Rank1Worker:
         self.sid = 0
 
     def drop_state(self) -> None:
-        """Release the request state (end of request, shutdown, or a dead channel)."""
+        """Release the request state (end of request, shutdown, or a dead channel); proto 6:
+        every running request's."""
+        for job in list(self.jobs.values()):
+            try:
+                self.backend.release_state(job["state"])
+            except Exception:                                       # noqa: BLE001
+                pass
+        self.jobs.clear()
         if self.state is not None:
             try:
                 self.backend.release_state(self.state)
@@ -2196,8 +2542,9 @@ PREFIX_LOG = env_truthy("EXL3_TP_PREFIX_LOG", False)
 
 
 class _ReqCtx:
-    """The active request's multi-session context (model thread; one at a time -- the GPU is
-    serialized and every routing decision runs under the engine's _busy lock)."""
+    """A running request's multi-session context. Only the model (scheduler) thread touches
+    it; with interleaved requests (proto 6) every running request has one and the scheduler
+    makes it the engine's current context (TPEngine._req) before each of the request's steps."""
 
     __slots__ = ("session", "alloc", "evicted", "ephemeral", "prompt_len")
 
@@ -2207,6 +2554,109 @@ class _ReqCtx:
         self.evicted = evicted                 # [(sid, Checkpoints)] whole sessions this request evicted
         self.ephemeral = bool(ephemeral)
         self.prompt_len = int(prompt_len)
+
+
+class _Flag:
+    """threading.Event-shaped cancel flag for requests whose caller passed none (so a consumer
+    that walks away still stops its request at the next boundary)."""
+
+    __slots__ = ("_set",)
+
+    def __init__(self):
+        self._set = False
+
+    def set(self) -> None:
+        self._set = True
+
+    def is_set(self) -> bool:
+        return self._set
+
+
+class _Job:
+    """One generate() call as the scheduler sees it (rank 0, model thread).
+
+    Lifecycle: submitted (inbox) -> pending (waiting for a slot, for its conversation to be
+    idle, or for pool room) -> admitted (rid assigned, `gen` created: its first step routes the
+    session, ships images and sends begin) -> running (one prefill chunk, decode token or spec
+    round per step) -> done (stats or an exception delivered to the caller's queue, `finished`
+    resolved once nothing of it is left on the wire)."""
+
+    def __init__(self, *, ids, max_tokens, sampler, eos_id, stops, cancel, spec, spec_k,
+                 use_cache, images, session, ephemeral, loop, queue, finished):
+        self.ids = ids
+        self.max_tokens = int(max_tokens)
+        self.sampler = sampler
+        self.eos_id = eos_id
+        self.stops = stops
+        self.cancel = cancel
+        self.spec = bool(spec)
+        self.spec_k = spec_k
+        self.use_cache = bool(use_cache)
+        self.images = images
+        self.session = session
+        self.ephemeral = bool(ephemeral)
+        self.loop = loop
+        self.queue = queue
+        self.finished = finished              # asyncio.Future on the caller's loop
+        self.rid: int | None = None           # control-frame request id, assigned at admission
+        self.plan = None                      # the admission's session plan (multi-session)
+        self.gen = None                       # the step generator (_run_steps / _run_spec_steps)
+        self.ctx: "_ReqCtx | None" = None     # session context once routed
+        self.state = None                     # backend recurrent state while running
+        self.vtime = 0.0                      # model-thread seconds used (fair share)
+        self.steps = 0
+        self.t_submit = time.perf_counter()
+        self.t_admit: float | None = None
+        self.wait = None                      # why it is still pending (status), None = not checked
+        self.closed = False
+        self.abort = False                    # set by the model thread (shutdown); cancel is the caller's
+        self._ids_arr = None
+
+    @property
+    def ids_arr(self) -> array:
+        if self._ids_arr is None:
+            self._ids_arr = array("i", self.ids)
+        return self._ids_arr
+
+    def cancelled(self) -> bool:
+        return self.abort or bool(self.cancel is not None and self.cancel.is_set())
+
+    def emit(self, piece: str) -> None:
+        self._put(piece)
+
+    def _put(self, item) -> None:
+        try:
+            self.loop.call_soon_threadsafe(self.queue.put_nowait, item)
+        except RuntimeError:                  # the caller's loop is gone: nobody is listening
+            pass
+
+    def deliver(self, item) -> None:
+        """The final item (a stats dict or an exception), then mark the job finished."""
+        if self.closed:
+            return
+        self.closed = True
+        self._put(item)
+
+        def resolve():
+            if not self.finished.done():
+                self.finished.set_result(None)
+        try:
+            self.loop.call_soon_threadsafe(resolve)
+        except RuntimeError:
+            pass
+
+
+_CHANNEL_ERRNOS = frozenset({errno.EBADF, errno.ENOTCONN, errno.EPIPE, errno.ECONNRESET,
+                             errno.ECONNABORTED, errno.ESHUTDOWN})
+
+
+def _is_fatal(exc: BaseException) -> bool:
+    """Errors after which the ranks can no longer be trusted to agree: a dead, timed-out or
+    garbled control channel (rank 1 died, a frame was cut). Everything else fails one request
+    and the others carry on (its own end frame already settled it on both ranks)."""
+    if isinstance(exc, (ChannelClosed, ProtocolError, RankDesync, ConnectionError, TimeoutError)):
+        return True                     # (socket.timeout is TimeoutError)
+    return isinstance(exc, OSError) and exc.errno in _CHANNEL_ERRNOS
 
 
 # ---- rank 0: the engine the vendored server talks to -------------------------------------------------------
@@ -2233,8 +2683,14 @@ class TPEngine:
     def __init__(self, backend, channel, tokenizer, *, ctx: int, eos_id: int | None = None,
                  seed: int | None = None, log: Callable[[str], None] = print,
                  prefix: "PrefixCache | bool | None" = None, sessions: int | None = None,
-                 session_opts: dict | None = None, disk_opts: dict | None = None):
+                 session_opts: dict | None = None, disk_opts: dict | None = None,
+                 concurrency: int | None = None,
+                 on_fatal: Callable[[BaseException], None] | None = None):
         self.backend = backend
+        # called once, from the model thread, after a fatal error failed every request: the
+        # servers exit rank 0 there (tp_serve/tp3_serve), so the watchdog -- which watches the
+        # rank processes, not HTTP -- restarts the stack instead of leaving it latched
+        self.on_fatal = on_fatal
         self.channel = channel
         self.tk = tokenizer
         self.log = log
@@ -2249,8 +2705,10 @@ class TPEngine:
         self.requests = 0
         self.last_stats: dict[str, Any] = {}
         self._gen = _torch_generator(seed)
-        self._pool = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="tp-model")
-        self._busy = threading.Lock()     # held while a request drives rank 1; pings wait it out
+        # held by the model (scheduler) thread whenever it has work -- a request in flight, an
+        # admission, a control task; rank1_ping never pings while it is held
+        self._busy = threading.Lock()
+        self._rid = 0                     # control-frame request id of the request being driven
         # ---- sessions: 1 (default) = the single-conversation prefix cache above, byte-
         # compatible frames and backend params; >= 2 (opt-in) = the SessionManager over the
         # shared pool (proto 5). The vendored server reads engine.sessions for its queue.
@@ -2310,6 +2768,47 @@ class TPEngine:
             log("tp: cold sessions spill to " + str(self.tier.root) +
                 f" (cap {self.tier.cap_bytes / (1 << 30):.0f} GiB); returning conversations "
                 "reload instead of re-prefilling")
+        # ---- interleaved requests (proto 6): up to `concurrency` requests in flight, each with
+        # its own session, live recurrent slot and drafter ring; the scheduler thread runs one
+        # step of one of them at a time (a prefill chunk, a decode token or a spec round), so
+        # the GPU work stays sequential and every model call keeps its single-request shape.
+        # 1 (default) keeps the wire protocol of the engine above (4, or 5 with sessions).
+        want = int(concurrency if concurrency is not None else env_int("EXL3_TP_CONCURRENCY", 1))
+        self.concurrency = max(1, want)
+        if self.concurrency > 1 and self.mgr is None:
+            raise ValueError("interleaved requests (EXL3_TP_CONCURRENCY >= 2) need the multi-session "
+                             "engine (EXL3_TP_SESSIONS >= 2): every request in flight owns a session")
+        if self.concurrency > self.sessions:
+            raise ValueError(f"EXL3_TP_CONCURRENCY={self.concurrency} exceeds EXL3_TP_SESSIONS="
+                             f"{self.sessions}: every request in flight owns a session slot")
+        slots = getattr(backend, "slots", None)
+        if slots is not None and int(slots) < self.concurrency:
+            raise ValueError(f"the backend holds {slots} live request slot(s) but the engine would run "
+                             f"{self.concurrency} at once; load every rank with EXL3_TP_CONCURRENCY="
+                             f"{self.concurrency}")
+        self.proto = PROTO_INTERLEAVE if self.concurrency > 1 else (
+            PROTO_SESSIONS if self.mgr is not None else PROTO)
+        self._interleave = self.proto >= PROTO_INTERLEAVE
+        # prefill rows per chunk while another request is running (a chunk is one scheduler
+        # step: smaller chunks keep the other streams moving, at some prefill throughput)
+        self.interleave_chunk = max(PAGE_ROWS_MIN, env_int("EXL3_TP_INTERLEAVE_CHUNK", 512))
+        self._cv = threading.Condition()
+        self._inbox: list[_Job] = []          # submitted, not yet seen by the scheduler
+        self._tasks: list[tuple] = []         # (fn, idle_only, box) control tasks for the model thread
+        self._pending: list[_Job] = []        # waiting for admission (scheduler-owned)
+        self._active: list[_Job] = []         # admitted and running (scheduler-owned)
+        self._pending_dirty = False
+        self._closing = False
+        self._fatal: BaseException | None = None
+        self.sched_counters = {"admitted": 0, "deferred_conversation": 0, "deferred_pool": 0,
+                               "cancelled_pending": 0, "switches": 0, "max_active": 0}
+        self._last_job: "_Job | None" = None
+        self._thread = threading.Thread(target=self._sched_main, name="tp-model", daemon=True)
+        self._thread.start()
+        if self._interleave:
+            self.log(f"tp: interleaved requests on (proto {self.proto}; up to {self.concurrency} "
+                     f"in flight, one model step at a time, fair share by GPU time; prefill "
+                     f"chunks of {self.interleave_chunk} rows while others run)")
 
     # -- vision (rank 0 prepares and ships; rank 1 receives through the control channel)
     def _resolve_image_token(self) -> int | None:
@@ -2386,7 +2885,7 @@ class TPEngine:
         binary frame per image, then the imgmeta_ok reply (validated: count, rows, sha256
         checked on rank 1 before it answers)."""
         meta, blobs = tp_vision.encode_imgmeta(images)
-        meta["req"] = self.requests
+        meta["req"] = self._rid
         reply = self.channel.request_with_blobs(meta, blobs, timeout=env_float("EXL3_TP_IMGMETA_TIMEOUT", 120.0))
         if reply.get("op") != "imgmeta_ok" or int(reply.get("images", -1)) != len(embeddings) \
                 or int(reply.get("rows", -1)) != sum(e.mm_length for e in embeddings):
@@ -2417,6 +2916,10 @@ class TPEngine:
 
     # -- liveness (the vendored /tp/status route of tp_serve.py calls this)
     def rank1_ping(self, timeout: float = 30.0) -> str:
+        """Idle-only liveness probe: the model thread holds _busy whenever it has work, so a
+        ping can never land between the frames of a running request."""
+        if self._fatal is not None:
+            return "disconnected" if isinstance(self._fatal, ChannelClosed) else f"error:{type(self._fatal).__name__}"
         if not self._busy.acquire(blocking=False):
             return "busy"
         try:
@@ -2522,7 +3025,7 @@ class TPEngine:
                 self._drop_images = []
         if PREFIX_LOG and all_evicted:
             st = self.mgr.status()
-            self.log(f"tp: sessions: request {self.requests} evicted sessions "
+            self.log(f"tp: sessions: request {self._rid} evicted sessions "
                      f"{[sid for sid, _ in all_evicted]} for {len(sess.pages)} pages; "
                      f"pool {st['pages_used']}/{st['pool_pages']} pages")
         return alloc
@@ -2597,7 +3100,7 @@ class TPEngine:
                      f"({type(exc).__name__}: {exc}); evicting it instead")
             return False
         try:
-            reply = self._disk_request({"op": "spill", "req": self.requests,
+            reply = self._disk_request({"op": "spill", "req": self._rid,
                                         "session": victim.sid, "image": img, "keys": keys})
             if reply.get("op") != "spill_ok" or int(reply.get("session", -1)) != victim.sid:
                 raise RuntimeError(f"rank 1 refused the spill: {reply.get('op')}: "
@@ -2678,7 +3181,7 @@ class TPEngine:
                 self._carry_drop.extend(c.key for c in cks)
             return False
         # rank 1 restores its half (the frame carries the evictions' keys/sids like a begin)
-        frame = {"op": "load", "req": self.requests, "session": session.sid, "image": cold.img,
+        frame = {"op": "load", "req": self._rid, "session": session.sid, "image": cold.img,
                  "pages": list(session.pages), "keys": [k for k, _ in cold.ckpt_meta],
                  "positions": [p for _, p in cold.ckpt_meta]}
         if evicted:
@@ -2780,6 +3283,7 @@ class TPEngine:
             state = self.backend.restore(ck.stash, start) if ck is not None else self.backend.new_state()
             for c in evicted:
                 self.backend.drop_stash(c.stash)
+        self._bind_state(state)          # the drafter ring of this state's slot (interleaved)
         if not spec:
             return state, None
         if ck is None:
@@ -2868,27 +3372,85 @@ class TPEngine:
             frame["drop"] = keys
         if PREFIX_LOG:
             where = f"session {self._req.session.sid}" if self.mgr is not None else "cache"
-            self.log(f"tp: prefix cache ({where}): request {self.requests} reused {start} of "
+            self.log(f"tp: prefix cache ({where}): request {self._rid} reused {start} of "
                      f"{len(committed or ())} committed tokens; checkpoints at "
                      f"{sorted(c.pos for c in px.ckpts)}"
                      f"{f', dropped {keys}' if keys else ''}")
 
     # -- one request (the model thread; the op sequence Rank1Worker mirrors)
-    def _run(self, ids: list[int], max_tokens: int, sampler: TopPSampler, eos_id: int | None,
-             stops: list[str], cancel: asyncio.Event | None, emit: Callable[[str], None],
-             use_cache: bool = True, images: list | None = None, session: int | None = None,
-             ephemeral: bool = False) -> dict[str, Any]:
-        # routing phase 1 (pure) -> everything fallible (vision encode + shipment) -> commit
-        plan = self._session_plan(ids, max_tokens, spec=False,
-                                  ephemeral=ephemeral, explicit_sid=session)
+    #
+    # Both request paths are generators driven by the scheduler (_sched_main): the first next()
+    # routes the session, ships images and sends begin; every later next() is one step -- one
+    # prefill chunk (proto 6), one decode token, one spec round. A step never leaves a frame
+    # without its model call: each yield sits where both ranks have settled (rank 1 has run
+    # every call rank 0 has run), so the scheduler may run another request's step in between
+    # and both ranks still issue their collectives in the same order. Proto 4/5 (concurrency 1)
+    # keep their exact frames: begin implies the whole prefill and the first decode forward.
+    def _settled(self, fn, what: str, rid, *, frame_implies_calls: bool = True):
+        """Run a rank-0 call whose frame already left. If it fails, the peers ran -- or sit
+        inside -- their side of it (a collective rank 0 never joined). Interleaved (proto 6),
+        that is fatal for every request in flight (RankDesync): the next request's collectives
+        would pair with the stuck ones. Concurrency 1 keeps the serialized engine's contract
+        (the request fails, the engine carries on) byte for byte. `frame_implies_calls=False`
+        for a step whose frame triggers no collective on the peers (proto-6 begin: restore only)."""
+        try:
+            return fn()
+        except BaseException as exc:
+            # RankLocalError: the backend says the collective part completed on every rank and
+            # only rank-0-local work after it failed -- the ranks are in step, one request fails
+            if (not self._interleave or not frame_implies_calls
+                    or isinstance(exc, (RankLocalError, GeneratorExit, KeyboardInterrupt))):
+                raise
+            raise RankDesync(f"{what} of request {rid} failed on rank 0 after its frame left "
+                             f"({type(exc).__name__}: {exc}); the ranks' collectives are no "
+                             f"longer paired") from exc
+
+    def _prefill_steps(self, job: "_Job", ids: list[int], state, spec: bool, start: int,
+                       embeddings, alloc):
+        """Proto 6: the prompt prefill as chunk frames, one chunk per step. A chunk is the full
+        span while the request runs alone, EXL3_TP_INTERLEAVE_CHUNK rows while others are in
+        flight (the step bounds how long they wait). Returns the last chunk's params."""
+        n = len(ids) - 1
+        a = int(start)
+        last: dict = {}
+        while a < n:
+            if job.abort:                  # shutdown: stop between chunks (the end frame settles it)
+                raise EngineShutdown("the TP engine is shutting down")
+            rows = int(getattr(self.backend, "span", 0) or n)
+            if len(self._active) > 1:
+                rows = min(rows, self.interleave_chunk)
+            b = min(a + rows, n)
+            self.channel.send({"op": "chunk", "req": job.rid, "a": a, "b": b})
+            last = self._settled(
+                lambda: _prefill(self.backend, ids[: b + 1], state, spec, a, embeddings, alloc),
+                f"prefill chunk [{a}, {b})", job.rid) or {}
+            if spec:
+                taps = last.get("export_states")
+                if taps:          # stand-ins that do not prime their own drafter (real one does)
+                    self.backend.draft_prefill_kv(taps, position=a)
+                    last.pop("export_states", None)
+            a = b
+            if a < n:
+                yield
+        return last
+
+    def _run_steps(self, job: "_Job"):
+        ids, max_tokens, sampler, eos_id = job.ids, job.max_tokens, job.sampler, job.eos_id
+        stops, cancel, emit = job.stops, job.cancel, job.emit
+        use_cache, images = job.use_cache, job.images
+        rid = job.rid
+        # routing phase 1 (pure, done at admission) -> everything fallible (vision encode +
+        # shipment) -> commit
+        plan = job.plan
         embeddings = self._vision_encode(images) if images else None
         if embeddings:
             self._ship_embeddings(images, embeddings)    # imgmeta + blobs + imgmeta_ok, before begin
-        begin = {"op": "begin", "req": self.requests, "ids": [int(t) for t in ids]}
+        begin = {"op": "begin", "req": rid, "ids": [int(t) for t in ids]}
         alloc = self._session_commit(plan, begin)
+        job.ctx = self._req
         ck, start, pending, evicted = self._prefix_begin(ids, False, use_cache, begin)
         self.channel.send(begin)
-        end = {"op": "end", "req": self.requests}
+        end = {"op": "end", "req": rid}
         state = None
         committed = None
         n_new = 0
@@ -2899,8 +3461,14 @@ class TPEngine:
         detok = _Detok(getattr(self.tk, "_tk", self.tk))
         text = ""
         try:
-            state, _ = self._prefix_state(ck, start, evicted)
-            _prefill(self.backend, ids, state, False, start, embeddings, alloc)
+            state, _ = self._settled(lambda: self._prefix_state(ck, start, evicted),
+                                     "state setup", rid, frame_implies_calls=not self._interleave)
+            job.state = state
+            if self._interleave:
+                yield from self._prefill_steps(job, ids, state, False, start, embeddings, alloc)
+            else:
+                self._settled(lambda: _prefill(self.backend, ids, state, False, start, embeddings, alloc),
+                              "prefill", rid)
             self._prefix_save(pending, state, ids)
             pending = None
             cur, pos = int(ids[-1]), len(ids) - 1
@@ -2908,9 +3476,15 @@ class TPEngine:
             # first forward is therefore always a text token (no rows to attach)
             assert cur < FIRST_MM_EMBEDDING_INDEX, "image-span prompt tail slipped through"
             fed = list(ids)              # the tokens at positions [0, pos) once `cur` is forwarded
-            # Lockstep rule: every stop decision happens after sampling, before the step frame.
+            first = True
+            # Lockstep rule: every stop decision happens after sampling, before the step frame
+            # that would feed the token (proto 4/5: begin already implied the first forward).
             while True:
-                row = _forward(self.backend, cur, pos, state, None, alloc)
+                if self._interleave or not first:
+                    self.channel.send({"op": "step", "req": rid, "token": cur})
+                first = False
+                row = self._settled(lambda: _forward(self.backend, cur, pos, state, None, alloc),
+                                    "decode forward", rid)
                 pos += 1
                 if t_first is None:
                     t_first = time.perf_counter()
@@ -2929,12 +3503,12 @@ class TPEngine:
                 if n_new >= max_tokens:
                     reason = "max_new_tokens"
                     break
-                if cancel is not None and cancel.is_set():
+                if job.cancelled():
                     reason = "cancelled"
                     break
-                self.channel.send({"op": "step", "req": self.requests, "token": token})
                 cur = token
                 fed.append(token)
+                yield                    # settled: both ranks ran every forward sent so far
             committed = fed[:pos]
             tail = detok.flush()
             if tail:
@@ -2942,11 +3516,14 @@ class TPEngine:
                 emit(tail)
         finally:
             self._finish_request(state, end, start, False, committed, pending, use_cache, len(ids))
+            job.state = None
         t1 = time.perf_counter()
         t_first = t_first if t_first is not None else t1
         stats = {"cached_tokens": start, "new_tokens": n_new, "prompt_tokens": len(ids),
                  "time_prefill": t_first - t0, "time_generate": t1 - t_first,
                  "eos": eos, "eos_reason": reason, "spec_used": False}
+        if self._interleave:
+            stats["time_queued"] = (job.t_admit or t0) - job.t_submit
         if self.mgr is not None and self._req is not None:
             stats["session"] = self._req.session.sid
         if images:
@@ -2982,35 +3559,54 @@ class TPEngine:
         the new namespace reuses anything of the old one. Rank 1 drops its copies at the next
         begin ("drop_all"). Multi-session mode forgets every session the same way."""
         if self.prefix is not None or self.mgr is not None:
-            await asyncio.get_running_loop().run_in_executor(self._pool, self._prefix_clear)
+            # on the model thread, once no request is running (the server drained them first)
+            await asyncio.get_running_loop().run_in_executor(
+                None, lambda: self._call_on_model_thread(self._prefix_clear, idle_only=True))
 
     def _prefix_clear(self) -> None:
-        with self._busy:
-            if self.mgr is not None:
-                for c in self.mgr.clear():
+        """(model thread, nothing running) Forget every checkpoint / session."""
+        if self.mgr is not None:
+            for c in self.mgr.clear():
+                try:
+                    self.backend.drop_stash(c.stash)
+                except Exception:                                       # noqa: BLE001
+                    pass
+            if self.tier is not None:         # cold sessions die with the reset too
+                for img in list(self.tier._sizes):
+                    self.tier.drop(img)
+            # drop_all makes rank 1 forget every record, stash and image: anything we
+            # were still carrying for it (late evictions from a failed load, spent
+            # image ids) must not leak into the next begin frame
+            self._carry_evict.clear()
+            self._carry_drop.clear()
+            self._drop_images.clear()
+            self._drop_all_next = True
+            return
+        px = self.prefix
+        for c in px.ckpts:
+            self.backend.drop_stash(c.stash)
+        px.ckpts.clear()
+        px.kv_ids = array("i")
+        self._drop_all_next = True
+
+    def _prefix_reset(self, end: dict) -> None:
+        if self.mgr is not None and self._interleave:
+            # interleaved: other sessions are live on both ranks, so forget only THIS request's
+            # session (its records are the ones in doubt); rank 1 drops every stash it holds
+            # for it and frees it at the end frame's "reset"
+            ctx = self._req
+            sess = ctx.session if ctx is not None else None
+            if sess is not None and self.mgr.sessions.get(sess.sid) is sess:
+                for c in list(sess.px.ckpts):
                     try:
                         self.backend.drop_stash(c.stash)
                     except Exception:                                   # noqa: BLE001
                         pass
-                if self.tier is not None:         # cold sessions die with the reset too
-                    for img in list(self.tier._sizes):
-                        self.tier.drop(img)
-                # drop_all makes rank 1 forget every record, stash and image: anything we
-                # were still carrying for it (late evictions from a failed load, spent
-                # image ids) must not leak into the next begin frame
-                self._carry_evict.clear()
-                self._carry_drop.clear()
-                self._drop_images.clear()
-                self._drop_all_next = True
-                return
-            px = self.prefix
-            for c in px.ckpts:
-                self.backend.drop_stash(c.stash)
-            px.ckpts.clear()
-            px.kv_ids = array("i")
-            self._drop_all_next = True
-
-    def _prefix_reset(self, end: dict) -> None:
+                self.mgr.evict(sess, reason="reset")
+            for k in ("save", "rewind", "drop", "evict"):
+                end.pop(k, None)
+            end["reset"] = True
+            return
         if self.mgr is not None:
             # the record no longer matches what the ranks hold: forget every session, and
             # rank 1 drops its stashes, records and images at the end frame's drop_all
@@ -3046,42 +3642,51 @@ class TPEngine:
 
     def session_status(self) -> dict[str, Any]:
         """Pool/session state for /tp/status (single-session engines report the plain
-        shape). The manager is mutated on the model thread, so the snapshot is taken under
-        the engine lock; if a request holds it for longer than the (short) wait, the
-        report says so instead of reading a half-mutated structure."""
+        shape). The manager is mutated on the model thread only: an idle engine is read
+        under _busy, a busy one hands the snapshot to the model thread, which takes it
+        between two steps; if that does not happen within the (short) wait, the report says
+        so instead of reading a half-mutated structure."""
         if self.mgr is None:
             return {"slots": 1, "pool_pages": None, "pages_used": None, "pages_free": None,
                     "sessions": [], "counters": {"requests": self.requests}}
-        if not self._busy.acquire(timeout=2.0):
+        if self._busy.acquire(blocking=False):
+            try:
+                return self._status_snapshot()
+            finally:
+                self._busy.release()
+        try:
+            return self._call_on_model_thread(self._status_snapshot, timeout=2.0)
+        except (TimeoutError, RuntimeError):
             return {"slots": self.mgr.slots, "pool_pages": self.mgr.pool.pool_pages,
                     "busy": True, "sessions": [], "cold_sessions": [],
                     "counters": {**self.mgr.counters, **self.mgr.pool.counters}}
-        try:
-            st = self.mgr.status()
-        finally:
-            self._busy.release()
+
+    def _status_snapshot(self) -> dict[str, Any]:
+        st = self.mgr.status()
         if self.tier is not None:
             st["disk"] = self.tier.status()
+        if self._interleave:
+            st["scheduler"] = self.scheduler_status()
         return st
 
     # -- one spec request (the model thread; mirrors the round/accept sequence of Rank1Worker)
-    def _run_spec(self, ids: list[int], max_tokens: int, stops: list[str], cancel: asyncio.Event | None,
-                  emit: Callable[[str], None], spec_k: int | None, eos_id: int | None,
-                  sampler: TopPSampler | None = None, use_cache: bool = True,
-                  images: list | None = None, session: int | None = None,
-                  ephemeral: bool = False) -> dict[str, Any]:
+    def _run_spec_steps(self, job: "_Job"):
         import torch                                                    # the whole request runs under inference_mode (as the script)
-        # routing phase 1 (pure) -> vision encode/shipment -> commit (nothing fails after it)
-        plan = self._session_plan(ids, max_tokens, spec=True,
-                                  ephemeral=ephemeral, explicit_sid=session)
+        ids, max_tokens, stops, cancel, emit = job.ids, job.max_tokens, job.stops, job.cancel, job.emit
+        spec_k, eos_id, sampler, use_cache, images = job.spec_k, job.eos_id, job.sampler, job.use_cache, job.images
+        rid = job.rid
+        # routing phase 1 (pure, at admission) -> vision encode/shipment -> commit (nothing
+        # fails after it)
+        plan = job.plan
         embeddings = self._vision_encode(images) if images else None
         if embeddings:
             self._ship_embeddings(images, embeddings)    # imgmeta + blobs + imgmeta_ok, before begin
-        begin = {"op": "begin", "req": self.requests, "ids": [int(t) for t in ids], "spec": True}
+        begin = {"op": "begin", "req": rid, "ids": [int(t) for t in ids], "spec": True}
         alloc = self._session_commit(plan, begin)
+        job.ctx = self._req
         ck, start, pending, evicted = self._prefix_begin(ids, True, use_cache, begin)
         self.channel.send(begin)
-        end = {"op": "end", "req": self.requests}
+        end = {"op": "end", "req": rid}
         state = None
         committed = end_pos = draft_from = None
         n_new = 0
@@ -3094,9 +3699,19 @@ class TPEngine:
         text = ""
         block = int(self.backend.dspark_block)
         try:
+            # (the scheduler thread runs every step under inference_mode too, so this context
+            # staying open across yields never leaks a mode into another request's steps)
             with torch.inference_mode():
-                state, draft_from = self._prefix_state(ck, start, evicted, spec=True)
-                pparams = _prefill(self.backend, ids, state, True, start, embeddings, alloc)
+                state, draft_from = self._settled(
+                    lambda: self._prefix_state(ck, start, evicted, spec=True), "state setup", rid,
+                    frame_implies_calls=not self._interleave)
+                job.state = state
+                if self._interleave:
+                    pparams = yield from self._prefill_steps(job, ids, state, True, start, embeddings, alloc)
+                else:
+                    pparams = self._settled(
+                        lambda: _prefill(self.backend, ids, state, True, start, embeddings, alloc),
+                        "prefill", rid)
                 taps = (pparams or {}).get("export_states")
                 if taps:
                     # Stand-ins (and any backend that does not prime its own drafter): prime
@@ -3110,8 +3725,12 @@ class TPEngine:
                 seq = list(ids)          # seq[:position] is committed, seq[position] the anchor
                 # All stop decisions happen after a round has settled on both ranks (post rewind):
                 # the next frame rank 1 sees is either another round or end, never a half-round.
+                first = True
                 while True:
-                    if cancel is not None and cancel.is_set():
+                    if not first:
+                        yield            # settled: the previous round's accept/rewind ran on both ranks
+                    first = False
+                    if job.cancelled():
                         reason = "cancelled"
                         break
                     budget = max_tokens - n_new
@@ -3120,23 +3739,41 @@ class TPEngine:
                         break
                     k_cap = min(int(spec_k) if spec_k else block, budget - 1)
                     k, drafts = self.backend.draft(anchor, position, k_cap)
-                    self.channel.send({"op": "round", "req": self.requests, "k": int(k),
-                                       "window": [int(anchor)] + [int(t) for t in drafts]})
-                    logits, vparams = _verify(self.backend, [int(anchor)] + [int(t) for t in drafts],
-                                              position, state, alloc)
+                    window = [int(anchor)] + [int(t) for t in drafts]
+                    self.channel.send({"op": "round", "req": rid, "k": int(k), "window": window})
+                    try:
+                        logits, vparams = self._settled(
+                            lambda: _verify(self.backend, window, position, state, alloc),
+                            "spec verify", rid)
+                    except RankDesync:
+                        raise            # fatal: the peers sit in a collective; nothing to settle
+                    except BaseException:
+                        # a failure the ranks survive (RankLocalError, or any error at C=1):
+                        # rank 1 verified and waits for this round's accept -- settle it
+                        self.channel.send({"op": "accept", "req": rid, "accepted": 0})
+                        self.backend.rewind(state, k)
+                        raise
                     rounds += 1
                     drafted_total += k
-                    if logits is None:
-                        raise RuntimeError("spec verify returned no logits on the output rank")
-                    if sampler is not None and sampler.stochastic:
-                        a, bonus = _accept_sampled(logits, drafts, k, sampler)
-                    else:
-                        greedy = logits.argmax(dim=-1).tolist()
-                        a = 0
-                        while a < k and int(drafts[a]) == greedy[a]:
-                            a += 1
-                        bonus = int(greedy[a])
-                    self.channel.send({"op": "accept", "req": self.requests, "accepted": int(a)})
+                    try:
+                        if logits is None:
+                            raise RuntimeError("spec verify returned no logits on the output rank")
+                        if sampler is not None and sampler.stochastic:
+                            a, bonus = _accept_sampled(logits, drafts, k, sampler)
+                        else:
+                            greedy = logits.argmax(dim=-1).tolist()
+                            a = 0
+                            while a < k and int(drafts[a]) == greedy[a]:
+                                a += 1
+                            bonus = int(greedy[a])
+                    except BaseException:
+                        # every rank ran the verify and rank 1 now waits for this round's accept:
+                        # settle it (accept nothing, rewind the whole window on both ranks) so the
+                        # end frame finds a settled round -- this request fails, rank 1 lives on
+                        self.channel.send({"op": "accept", "req": rid, "accepted": 0})
+                        self.backend.rewind(state, k)
+                        raise
+                    self.channel.send({"op": "accept", "req": rid, "accepted": int(a)})
                     self.backend.rewind(state, k - a)
                     position += a + 1
                     seq += [int(t) for t in drafts[:a]] + [int(bonus)]
@@ -3172,6 +3809,7 @@ class TPEngine:
         finally:
             self._finish_request(state, end, start, True, committed, pending, use_cache, len(ids), end_pos,
                                  draft_from)
+            job.state = None
         t1 = time.perf_counter()
         t_first = t_first if t_first is not None else t1
         stats = {"cached_tokens": start, "new_tokens": n_new, "prompt_tokens": len(ids),
@@ -3181,11 +3819,325 @@ class TPEngine:
                  "accepted_draft_tokens": accepted_total, "rejected_draft_tokens": drafted_total - accepted_total,
                  "draft_steps": rounds,
                  "accepted_per_step": (accepted_total / rounds) if rounds else 0.0}
+        if self._interleave:
+            stats["time_queued"] = (job.t_admit or t0) - job.t_submit
         if self.mgr is not None and self._req is not None:
             stats["session"] = self._req.session.sid
         if images:
             stats.update(images=len(images), image_tokens=sum(1 for t in ids if t >= FIRST_MM_EMBEDDING_INDEX))
         return stats
+
+    # -- the scheduler: the one model thread ---------------------------------------------------
+    #
+    # Every model call and every control frame happens here, so both ranks see one totally
+    # ordered stream of frames. generate() submits a _Job and streams its pieces; the thread
+    # admits jobs (session routing is pure planning first: a prompt that continues a conversation
+    # which is still running, or that needs pool pages held by running requests, waits instead
+    # of failing or taking a second session), then runs one step of the job with the least
+    # model time used so far. Concurrency 1 runs each job start to finish in arrival order.
+    def _submit(self, job: _Job) -> None:
+        with self._cv:
+            if self._closing:
+                raise RuntimeError("the TP engine is shutting down")
+            if self._fatal is not None:
+                raise RuntimeError(self._fatal_message())
+            self._inbox.append(job)
+            self._cv.notify()
+
+    def _fatal_message(self) -> str:
+        exc = self._fatal
+        return (f"the TP engine stopped after a rank / control-channel failure "
+                f"({type(exc).__name__}: {exc}); restart ALL ranks")
+
+    def _sched_main(self) -> None:
+        try:
+            import torch
+            mode = torch.inference_mode()
+        except Exception:                                               # noqa: BLE001  (CPU tests w/o torch)
+            import contextlib
+            mode = contextlib.nullcontext()
+        busy = False
+        try:
+            with mode:
+                while True:
+                    with self._cv:
+                        while not (self._inbox or self._tasks or self._active or self._pending_dirty
+                                   or self._closing):
+                            if busy:
+                                self._busy.release()
+                                busy = False
+                            self._cv.wait()
+                        if self._inbox:
+                            self._pending.extend(self._inbox)
+                            self._inbox.clear()
+                            self._pending_dirty = True
+                        tasks, self._tasks = self._tasks, []
+                        closing = self._closing
+                    if not busy:
+                        self._busy.acquire()
+                        busy = True
+                    later = []
+                    for task in tasks:
+                        if task[1] and self._active:      # idle-only: after the running jobs end
+                            later.append(task)
+                        else:
+                            self._run_task(task)
+                    if later:
+                        with self._cv:
+                            self._tasks[:0] = later
+                    if closing:
+                        self._cancel_everything()
+                    if self._pending_dirty:
+                        self._admit_pending()
+                    if self._active:
+                        self._step_one()
+                    elif closing and not self._pending:
+                        with self._cv:
+                            if not self._inbox and not self._tasks:
+                                return
+        except BaseException as exc:                                    # noqa: BLE001  (never die silently)
+            self.log(f"tp: scheduler thread failed ({type(exc).__name__}: {exc}); failing every request")
+            self._latch_fatal(exc)
+            raise
+        finally:
+            # nobody will run what is still queued for this thread: fail it, never leave a
+            # caller waiting (reset_prefix_cache, a status snapshot)
+            with self._cv:
+                tasks, self._tasks = self._tasks, []
+            for _, _, box in tasks:
+                box["error"] = RuntimeError("the TP engine's model thread has exited")
+                box["event"].set()
+            if busy:
+                self._busy.release()
+
+    @staticmethod
+    def _run_task(task) -> None:
+        fn, _, box = task
+        try:
+            box["result"] = fn()
+        except BaseException as exc:                                    # noqa: BLE001  (handed to the caller)
+            box["error"] = exc
+        finally:
+            box["event"].set()
+
+    def _call_on_model_thread(self, fn, *, idle_only: bool = False, timeout: float | None = None):
+        """Run fn() on the scheduler thread between steps (idle_only: once no job is running)
+        and return its result. Raises TimeoutError if it did not run within `timeout`."""
+        if threading.current_thread() is self._thread:
+            return fn()
+        box = {"event": threading.Event()}
+        with self._cv:
+            if not self._thread.is_alive():
+                raise RuntimeError("the TP engine's model thread is not running")
+            self._tasks.append((fn, bool(idle_only), box))
+            self._cv.notify()
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while not box["event"].wait(0.5 if deadline is None else max(0.0, min(0.5, deadline - time.monotonic()))):
+            if not self._thread.is_alive() and not box["event"].is_set():
+                raise RuntimeError("the TP engine's model thread exited before running the task")
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("the model thread did not run the task in time")
+        if "error" in box:
+            raise box["error"]
+        return box.get("result")
+
+    def _bind_state(self, state) -> None:
+        bind = getattr(self.backend, "bind", None)
+        if bind is not None and state is not None:
+            bind(state)
+
+    def _bind_job(self, job: _Job) -> None:
+        """Make `job` the engine's current request: its frame id, its session context and its
+        drafter ring (everything the shared helpers read from self)."""
+        if self._last_job is not job:
+            if self._last_job is not None:
+                self.sched_counters["switches"] += 1
+            self._last_job = job
+        self._rid = int(job.rid or 0)
+        self._req = job.ctx
+        self._bind_state(job.state)
+
+    def _resume(self, job: _Job) -> None:
+        """One step of `job` (its admission step included). A job that ends here is retired
+        and its stats delivered; an exception fails it, and a fatal one every other job too."""
+        self._bind_job(job)
+        t = time.perf_counter()
+        try:
+            next(job.gen)
+        except StopIteration as stop:
+            job.vtime += time.perf_counter() - t
+            self._retire(job)
+            job.deliver(stop.value if isinstance(stop.value, dict) else {})
+            return
+        except BaseException as exc:                                    # noqa: BLE001  (handed to the caller)
+            self._retire(job)
+            if _is_fatal(exc):
+                self._latch_fatal(exc, culprit=job)
+            job.deliver(exc)
+            return
+        job.vtime += time.perf_counter() - t
+        job.steps += 1
+
+    def _retire(self, job: _Job) -> None:
+        if job in self._active:
+            self._active.remove(job)
+        job.gen = None
+        job.state = None
+        self._pending_dirty = True
+
+    def _step_one(self) -> None:
+        """Fair share by model time: the running job that has used the least goes next."""
+        job = min(self._active, key=lambda j: (j.vtime, j.rid))
+        self._resume(job)
+
+    def _admit_pending(self) -> None:
+        """Admit what can run, in arrival order. A job waiting for its own conversation is
+        skipped (others may start); one waiting for slots or pool pages stops the scan, so a
+        large request is never starved by later small ones."""
+        self._pending_dirty = False
+        keep: list[_Job] = []
+        barrier = False
+        for job in self._pending:
+            if job.cancelled():
+                # an exception, not stats: nothing ran, so /metrics must not count its prompt.
+                # It still takes its request id, as the serialized engine (which ran it) did.
+                self.requests += 1
+                self.sched_counters["cancelled_pending"] += 1
+                job.deliver(RequestCancelled("cancelled before it started (nothing was sent to "
+                                             "the ranks)"))
+                continue
+            if barrier or len(self._active) >= self.concurrency or self._fatal is not None:
+                if self._fatal is not None:
+                    job.deliver(RuntimeError(self._fatal_message()))
+                    continue
+                keep.append(job)
+                continue
+            verdict = self._try_admit(job)
+            if verdict in ("admitted", "failed"):
+                continue
+            keep.append(job)
+            if verdict == "wait_pool":
+                barrier = True
+        self._pending = [j for j in keep if not j.closed]   # (a fatal latch mid-scan failed them)
+
+    def _fits_alone(self, job: _Job) -> bool:
+        """Whether the request fits the whole pool at all (otherwise waiting cannot help: it
+        fails now, exactly like the serialized engine's refusal)."""
+        import tp_sessions
+        need = len(job.ids) + job.max_tokens + tp_sessions.spill_slack(
+            job.spec, getattr(self.backend, "dspark_block", 5))
+        return -(-need // self.mgr.page_size) <= self.mgr.pool.pool_pages
+
+    def _defer(self, job: _Job, why: str) -> str:
+        if job.wait != why:
+            self.sched_counters["deferred_conversation" if why == "conversation" else "deferred_pool"] += 1
+            job.wait = why
+        return "wait_pool" if why == "pool" else "wait_conv"
+
+    def _try_admit(self, job: _Job) -> str:
+        mgr = self.mgr
+        if mgr is not None and not job.ephemeral and self._active:
+            sid = job.session
+            if sid is not None:
+                if isinstance(sid, int) and not isinstance(sid, bool):
+                    s = mgr.sessions.get(sid)
+                    if s is not None and s.active:
+                        return self._defer(job, "conversation")
+            elif mgr.active_match(job.ids_arr) is not None or any(
+                    not j.ephemeral and mgr.prompt_continues(j.ids_arr, job.ids_arr)
+                    for j in self._active):
+                # the prompt continues a conversation whose request is still running -- its
+                # session's committed turns (active_match) or the running request's own prompt
+                # (a retry / resend of a conversation's FIRST turn, whose session has nothing
+                # committed yet): run it after that one (as the serialized engine did), in the
+                # same session, instead of re-prefilling the whole conversation into a second one
+                return self._defer(job, "conversation")
+        # every planned attempt takes a request id, as the serialized engine counted them
+        self.requests += 1
+        job.rid = self.requests
+        try:
+            plan = self._session_plan(job.ids, job.max_tokens, spec=job.spec,
+                                      ephemeral=job.ephemeral, explicit_sid=job.session)
+        except Exception as exc:                                        # noqa: BLE001  (fails or waits)
+            if (mgr is not None and self._active and type(exc).__name__ == "PoolOverflow"
+                    and self._fits_alone(job)):
+                mgr.counters["requests"] -= 1      # plan() counted it; a deferral is not a request
+                self.requests -= 1
+                job.rid = None
+                return self._defer(job, "pool")
+            job.deliver(exc)
+            return "failed"
+        job.plan = plan
+        job.t_admit = time.perf_counter()
+        job.vtime = min((j.vtime for j in self._active), default=0.0)
+        job.wait = None
+        job.gen = self._run_spec_steps(job) if job.spec else self._run_steps(job)
+        self._active.append(job)
+        self.sched_counters["admitted"] += 1
+        self.sched_counters["max_active"] = max(self.sched_counters["max_active"], len(self._active))
+        self._resume(job)                  # routing, images, begin (+ the first step)
+        return "admitted"
+
+    def _latch_fatal(self, exc: BaseException, culprit: "_Job | None" = None) -> None:
+        """The ranks can no longer be trusted to agree: fail everything in flight or queued
+        (each running job still settles its rank-0 bookkeeping), refuse new work."""
+        if self._fatal is None:
+            self._fatal = exc
+            self.log(f"tp: rank / control-channel failure ({type(exc).__name__}: {exc}); failing "
+                     f"every request in flight -- restart ALL ranks")
+            # first, before the cleanup below: settling a job may dispatch to rank 0's own TP
+            # workers, which can be wedged too -- the hook must not depend on that finishing.
+            # Not during a deliberate shutdown (close() closing the channel under a stuck
+            # thread is not a failure to recover from).
+            if self.on_fatal is not None and not self._closing:
+                try:
+                    self.on_fatal(exc)
+                except Exception as hook_exc:                           # noqa: BLE001
+                    self.log(f"tp: fatal hook failed ({type(hook_exc).__name__}: {hook_exc})")
+        err = RuntimeError(self._fatal_message())
+        for job in list(self._active):
+            if job is culprit:
+                continue
+            gen = job.gen
+            self._bind_job(job)
+            self._retire(job)
+            if gen is not None:
+                try:
+                    gen.close()              # its finally settles rank 0's records (end send fails)
+                except BaseException:                                   # noqa: BLE001
+                    pass
+            job.deliver(err)
+        for job in self._pending:
+            job.deliver(err)
+        self._pending = []
+        with self._cv:
+            inbox, self._inbox = self._inbox, []
+        for job in inbox:
+            job.deliver(err)
+
+    def _cancel_everything(self) -> None:
+        """Shutdown: queued jobs fail, running ones stop at their next boundary."""
+        err = EngineShutdown("the TP engine is shutting down")
+        for job in self._pending:
+            job.deliver(err)
+        self._pending = []
+        for job in self._active:
+            job.abort = True               # (the caller's asyncio.Event is not ours to set here)
+
+    def scheduler_status(self) -> dict[str, Any]:
+        """The scheduler's view for /tp/status (model thread, or under _busy while idle)."""
+        now = time.perf_counter()
+        active = []
+        for j in self._active:
+            ctx = j.ctx
+            active.append({"req": j.rid, "session": ctx.session.sid if ctx is not None else None,
+                           "spec": j.spec, "prompt_tokens": len(j.ids), "steps": j.steps,
+                           "model_s": round(j.vtime, 3), "age_s": round(now - j.t_submit, 3)})
+        pending = [{"wait": j.wait or "slot", "prompt_tokens": len(j.ids),
+                    "queued_s": round(now - j.t_submit, 3)} for j in self._pending]
+        return {"proto": self.proto, "concurrency": self.concurrency, "active": active,
+                "pending": pending, "counters": dict(self.sched_counters),
+                "fatal": None if self._fatal is None else f"{type(self._fatal).__name__}: {self._fatal}"}
 
     async def generate(self, prompt: str, *, max_tokens: int, temperature: float, top_p: float,
                        stop: list[str], cancel: asyncio.Event | None = None, stats: dict | None = None,
@@ -3254,26 +4206,12 @@ class TPEngine:
         loop = asyncio.get_running_loop()
         q: asyncio.Queue = asyncio.Queue()
         self.last_stats = {}
-
-        def work():
-            try:
-                self.requests += 1
-                with self._busy:
-                    if spec:
-                        done = self._run_spec(ids, max_tokens, [s for s in (stop or []) if s],
-                                              cancel, lambda piece: loop.call_soon_threadsafe(q.put_nowait, piece),
-                                              spec_k, eos_id, sampler, use_cache=bool(cache_prompt),
-                                              images=images, session=session, ephemeral=ephemeral)
-                    else:
-                        done = self._run(ids, max_tokens, sampler, eos_id, [s for s in (stop or []) if s],
-                                         cancel, lambda piece: loop.call_soon_threadsafe(q.put_nowait, piece),
-                                         use_cache=bool(cache_prompt), images=images, session=session,
-                                         ephemeral=ephemeral)
-                loop.call_soon_threadsafe(q.put_nowait, done)
-            except BaseException as exc:                                # noqa: BLE001  (handed to the awaiting side)
-                loop.call_soon_threadsafe(q.put_nowait, exc)
-
-        fut = loop.run_in_executor(self._pool, work)
+        job = _Job(ids=ids, max_tokens=max_tokens, sampler=sampler, eos_id=eos_id,
+                   stops=[s for s in (stop or []) if s], cancel=cancel if cancel is not None else _Flag(),
+                   spec=spec, spec_k=spec_k, use_cache=bool(cache_prompt), images=images,
+                   session=session, ephemeral=ephemeral, loop=loop, queue=q,
+                   finished=loop.create_future())
+        self._submit(job)
         done: dict[str, Any] | None = None
         try:
             while True:
@@ -3285,25 +4223,60 @@ class TPEngine:
                     break
                 yield item
         finally:
-            if done is None and cancel is not None:
-                cancel.set()            # the consumer went away: stop the worker at the next token boundary
-            await asyncio.shield(fut)
+            if done is None:
+                job.cancel.set()        # the consumer went away: stop the job at the next boundary
+            # nothing of this request may still be on the wire when the caller moves on (the
+            # old executor future gave the same guarantee)
+            await asyncio.shield(job.finished)
         self.last_stats = done
         if stats is not None:
             stats.update(done)
 
     def close(self, *, shutdown_rank1: bool = True) -> None:
-        """Server shutdown: tell rank 1 to exit, drain the model thread, close the channel."""
-        if shutdown_rank1:
+        """Server shutdown: drain the model thread (queued requests fail, running ones stop at
+        their next boundary and send their end frames), tell rank 1 to exit, close the channel."""
+        with self._cv:
+            self._closing = True
+            self._cv.notify()
+        stuck = False
+        if threading.current_thread() is not self._thread:
+            self._thread.join(timeout=env_float("EXL3_TP_CLOSE_TIMEOUT", 900.0))
+            stuck = self._thread.is_alive()
+        if stuck:
+            # never a second thread on the channel (a frame could land between the model
+            # thread's frames): closing the socket makes rank 1 see the channel end and exit,
+            # and the model thread's next send fail
+            self.log("tp: model thread still busy at shutdown; closing the channel under it")
+        elif shutdown_rank1:
             try:
                 self.channel.send({"op": "shutdown"})
             except OSError:
                 pass
-        self._pool.shutdown(wait=True)
         self.channel.close()
 
 
 # ---- rank-0 helpers -----------------------------------------------------------------------------------------
+
+
+def exit_on_fatal_hook(log: Callable[[str], None] = print, delay_s: float = 3.0, code: int = 70,
+                       *, default_on: bool = True):
+    """TPEngine(on_fatal=...) for the servers. After a fatal rank / control-channel failure the
+    engine has failed every request and refuses new ones; with every process still alive (a
+    worker that diverged, a timed-out reply) nothing would restart it -- the TP=3 watchdog
+    watches the rank processes, not HTTP. So rank 0 exits `delay_s` later (the error replies
+    still go out) and the watchdog restarts all ranks (its process-group stop also reaps the TP
+    worker children os._exit leaves behind). EXL3_TP_EXIT_ON_FATAL=0: stay up latched. The TP=2
+    server has no watchdog and passes default_on=False (EXL3_TP_EXIT_ON_FATAL=1 turns it on)."""
+    if not env_truthy("EXL3_TP_EXIT_ON_FATAL", default_on):
+        return None
+
+    def hook(exc: BaseException) -> None:
+        log(f"tp: fatal ({type(exc).__name__}: {exc}); rank 0 exits in {delay_s:g} s so the "
+            f"watchdog restarts ALL ranks (EXL3_TP_EXIT_ON_FATAL=0 keeps it up)")
+        t = threading.Timer(delay_s, os._exit, args=(code,))
+        t.daemon = True
+        t.start()
+    return hook
 
 
 def eos_id_of(model_dir: str | Path, tokenizer) -> int | None:

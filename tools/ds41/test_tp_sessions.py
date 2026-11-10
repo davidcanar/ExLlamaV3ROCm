@@ -794,7 +794,7 @@ def test_proto5_handshake_validates_sessions_and_pool():
     for kw, worker_sessions, needle in ((dict(sessions=4, pool_pages=8), 2, "EXL3_TP_SESSIONS"),
                                         (dict(sessions=4, pool_pages=8), 1, "EXL3_TP_SESSIONS"),
                                         (dict(sessions=4, pool_pages=7), 4, "pool mismatch"),
-                                        (dict(proto=tp_engine.PROTO_SESSIONS + 1), 4,
+                                        (dict(proto=tp_engine.PROTO_INTERLEAVE + 1), 4,
                                          "sync tools/ds41")):
         port = free_port()
         errors = []

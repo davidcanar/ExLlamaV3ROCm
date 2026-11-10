@@ -127,6 +127,12 @@ two seconds per attempt) and is the quickest check after any driver or plugin ch
   byte-identical to the RCCL-only path. Until 2026-11-02 TP=3 ran the single-conversation
   engine, where any other conversation (a client's title request, a test) overwrote the
   cached one and its next turn re-prefilled from scratch.
+- Interleaved requests (`EXL3_TP_CONCURRENCY=2..4`, control protocol 6, default 1 = off):
+  up to C requests take turns step by step instead of queueing (no throughput gain; no
+  head-of-line blocking). `tp3_start.sh` forwards the knob; every rank must use the same value
+  (it sizes each rank's live cache slots) and the handshake refuses a mismatch. See
+  `tools/ds41/README.md#interleaved-requests-2026-11-10`. CPU-validated
+  (`test_tp_interleave.py`); not yet run on the rig.
 - Vision (rank 0 loads the tower, the workers get each image's rows): on since
   2026-11-02; `perf/tp3/vision_check.py` reads the BLUE HERON 42 card exactly with DSpark
   and plain decoding, and a broken image is a clean 400.

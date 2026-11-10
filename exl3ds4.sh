@@ -51,6 +51,8 @@
 #   EXL3_TP_VISION (default 1 = rank 0 loads the vision tower; a load or floor failure
 #     degrades to text-only unless EXL3_TP_VISION_STRICT=1)  EXL3_TP_MAX_IMAGES (16)
 #   EXL3_TP_SESSIONS (4 cached conversations; 1 = single-session rollback)
+#   EXL3_TP_CONCURRENCY (1 = one request at a time; 2..SESSIONS = interleaved requests,
+#     proto 6, both ranks)  EXL3_TP_INTERLEAVE_CHUNK (512 prefill rows/step while others run)
 #   EXL3_TP_PREFIX_CACHE (1; S=1 engine; S>=2 caches per conversation)
 #   EXL3_TP_DISK_CACHE (1)  EXL3_TP_DISK_CACHE_DIR
 #     ($ROOT/diskcache)  EXL3_TP_DISK_CACHE_GIB (32)  EXL3_TP_DISK_TIMEOUT (300 s)
@@ -161,6 +163,7 @@ PASS_ENV=()
 for v in EXL3_TP_DSPARK EXL3_TP_BUDGETS EXL3_TP_DSPARK_CONF EXL3_DS41_CONF \
          EXL3_TP_SAFE_CTX EXL3_TP_CACHE_TOKENS EXL3_TP_MODEL_DIR \
          EXL3_TP_SESSIONS EXL3_TP_SESSION_MIN_MATCH EXL3_TP_PREFIX_SLOTS EXL3_TP_PREFIX_MIN \
+         EXL3_TP_CONCURRENCY EXL3_TP_INTERLEAVE_CHUNK \
          EXL3_TP_PREFIX_END EXL3_TP_PREFIX_CACHE EXL3_TP_PREFIX_LOG \
          EXL3_TP_DISK_CACHE EXL3_TP_DISK_CACHE_DIR EXL3_TP_DISK_CACHE_GIB EXL3_TP_DISK_TIMEOUT \
          EXL3_TP_SPAN EXL3_TP_USE_PER_DEVICE EXL3_TP_MEM_FLOOR \

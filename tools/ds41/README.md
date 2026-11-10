@@ -178,7 +178,10 @@ before serving; `begin` carries the conversation's `session`, full `pages`, `evi
 `spill {session, image, keys}` -> `spill_ok {bytes}` / `spill_error`, and
 `load {session, image, pages, keys, positions}` -> `load_ok` / `load_error`; a failed load
 falls back to a fresh prefill, never wrong output. `ping`/`pong` for `/tp/status`,
-`shutdown` for clean exit.
+`shutdown` for clean exit. Protocol 6 (`EXL3_TP_CONCURRENCY >= 2`, interleaved requests)
+adds `hello.concurrency`; `begin` only sets a request up, `chunk {req, a, b}` prefills prompt
+rows `[a, b)`, the first decode forward is a `step` (spec: the first `round`), every frame
+names its request, and `end` may carry `reset` (forget that one session on both ranks).
 
 **Lockstep rule:** every stop decision (eos, stop string, `max_tokens`, cancel) happens on
 rank 0 *after* sampling a token and *before* sending its `step`. Once a `step` is sent the next
@@ -299,6 +302,63 @@ restored reply was identical to a fresh `cache_prompt: false` prefill; a 4,820-t
 resumed from its checkpoint; the vision card still read **BLUE HERON 42**; and the restore
 counters recorded no fallbacks. A DSpark streaming run measured 45.74 tok/s.
 
+## Interleaved requests (2026-11-10)
+
+`EXL3_TP_CONCURRENCY=C` (2..`EXL3_TP_SESSIONS`, the same on every rank; default 1) lets up to
+C requests run at once instead of queueing behind each other. Each running request owns a
+session (as before), a live recurrent-state slot (the trunk cache is built with C slots on
+every rank, ~32 MiB each per rank) and on rank 0 its own DSpark drafter ring (~7.5 MiB).
+They take turns on the single model thread: one step is a prefill chunk, a decode token or a
+DSpark round, and the scheduler always runs the request that has used the least model time so
+far. The GPU still does one thing at a time and every model call has exactly the shape it has
+for a lone request, so **total throughput is unchanged** — what changes is that a short
+request (a title, a subagent's question) no longer waits minutes for a long generation, and
+two conversations stream side by side at about half speed each.
+
+- **Lockstep** is the same rule with request ids: each frame is sent immediately before the
+  model call it names and a step only ends where both ranks have run every call sent so far,
+  so one total frame order still pairs every collective. `test_tp_interleave.py` checks the
+  ranks' model calls request by request, the pool invariants, and that every interleaved
+  reply equals the reply the same request gets alone on the serialized engine.
+- **Admission**: a prompt that continues a conversation whose request is still running (a
+  cancel + resend, a client retry -- of a later turn or of the conversation's very first one,
+  whose session has nothing committed yet) waits for it and then resumes from its checkpoint,
+  instead of re-prefilling the whole conversation into a second session. The same holds for a
+  side request that repeats the running prompt and appends to it: it waits, as it did on the
+  serialized engine, and lands in that conversation's session. A request whose slot or pool
+  pages are held by running requests waits for one to end, and later requests do not overtake
+  it; a request bigger than the whole pool is refused at once, as before. A request cancelled
+  while it is still waiting never reaches the ranks (it ends with `RequestCancelled`, so
+  `/metrics` does not count it).
+- **Prefill** of a request that arrives while others run goes in `EXL3_TP_INTERLEAVE_CHUNK`
+  rows per step (default 512, rank 0 only) so the others keep streaming; alone it uses the full
+  `EXL3_TP_SPAN`. Smaller chunks cost some prefill throughput (per-chunk fixed costs). A
+  cancelled request still finishes its prefill (a resend then resumes from it, as before);
+  shutdown stops a prefill at the next chunk.
+- **Failures**: a control-channel failure (a rank died, a reply timed out or diverged) or a
+  rank-0 model call that fails after its frame left (the peers sit in a collective rank 0
+  never joined) fails every request in flight and latches the engine; the TP=3 server then
+  exits rank 0 three seconds later so the watchdog (which watches the rank processes, not
+  HTTP) restarts all ranks (`EXL3_TP_EXIT_ON_FATAL=0` keeps a latched rank 0 up; the TP=2
+  server, which has no watchdog, stays up latched unless it is set to 1). Rank-0-only work
+  that runs after a collective completed on every rank (drafter priming after a prefill
+  chunk, the logits copy after a verify: `RankLocalError`) and any other error fail only
+  their own request: a spec round that fails after its verify is settled first (`accept 0`),
+  so rank 1 never sees an `end` with a round open. A rank-0 bookkeeping failure forgets only
+  that request's session (`end.reset`), never the others'.
+- **Status**: `/tp/status` reports `proto: 6` and `pool.scheduler` (running requests with
+  session, steps and model seconds; waiting requests and why; counters `admitted`,
+  `deferred_conversation`, `deferred_pool`, `cancelled_pending`, `switches`, `max_active`).
+  Responses carry `time_queued`.
+
+`EXL3_TP_CONCURRENCY=1` is the rollback: the protocol-5 engine with its exact frames and
+request numbering (the whole pre-existing suite runs on that path unchanged). Three
+failure/cancel paths behave better than before at C=1 too: a request whose client left while
+it was still queued in the engine is skipped instead of prefilled; a spec round that fails
+after its verify is settled before the request ends (rank 1 used to exit on that `end`); and a
+fatal control-channel failure fails the queued requests at once and (servers) exits rank 0 for
+the watchdog, instead of letting the next requests hang on a broken channel.
+
 ## Vision (image input, 2026-10-29)
 
 Rank 0 loads the tower + aligner (`component = "vision"`, the PR #449 architecture
@@ -382,7 +442,7 @@ cd ~/exl3ds4/tools/ds41
 DS41_REF_DIR=~/exl3ds4/model ../../.venv/bin/python -m pytest -q \
     test_ds41_chat.py test_ds41_parse.py test_ds41_serve.py test_tp_control.py \
     test_tp_chunked_prefill.py test_tp_prefix_cache.py test_serve_compat.py \
-    test_tp_sessions.py test_tp_disk.py test_vendor_kyojin.py
+    test_tp_sessions.py test_tp_disk.py test_tp_interleave.py test_vendor_kyojin.py
 PYTHONPATH=~/exl3ds4/src/exllamav3-dsv41f \
     ../../.venv/bin/python -m pytest -q test_tp_vision.py     # engine-level vision tests
 # stage 1 + stage 2 in one process: tier state must not leak across suites
@@ -393,6 +453,12 @@ Last run: **606 passed, 6 skipped** for all 11 CPU files together (the skips nee
 tokenizer; set `DS41_REF_DIR`), including **33/33** in the vision suite; the dedicated
 combined sessions+disk run: **44 passed**.
 
+- `test_tp_interleave.py` — interleaved requests (proto 6): replies equal to the serialized
+  engine's for 2 and 4 concurrent conversations (plain and DSpark, per-slot drafter rings),
+  multi-turn reuse under interleaving, no head-of-line blocking, a follow-up of a running
+  conversation waits and reuses it, pool-pressure deferral, cancels (queued and running),
+  chunked prefill beside decoding, fair share, status, rank-1 failure, the HTTP layer
+  streaming two requests at once, and the proto-6 handshake/guards on raw frames.
 - `test_ds41_chat.py` — golden: rendered prompts byte- and token-identical to the official
   reference encoding (`testdata/reference`, DeepSeek-AI MIT); real-tokenizer test uses
   `$DS41_REF_DIR/tokenizer.json`.
@@ -483,6 +549,10 @@ combined sessions+disk run: **44 passed**.
 | `EXL3_TP_PREFIX_LOG` | 0 | log one line per request: reused tokens and the checkpoint positions |
 | `EXL3_TP_SESSIONS` | 1 (deployment 4) | cached conversation slots over one shared pool; 1 = single-session engine and proto 4, >=2 = proto 5 |
 | `EXL3_TP_SESSION_MIN_MATCH` | 1 | minimum matched prefix for auto-routing (the last-prompt tolerance is applied on top) |
+| `EXL3_TP_CONCURRENCY` | 1 | requests in flight at once (2..`EXL3_TP_SESSIONS`, proto 6, every rank: it sizes each rank's live cache slots); 1 = one at a time (proto 5) |
+| `EXL3_TP_INTERLEAVE_CHUNK` | 512 | prefill rows per scheduler step while other requests run (rank 0; alone a prompt uses `EXL3_TP_SPAN`) |
+| `EXL3_TP_CLOSE_TIMEOUT` | 900 s | how long shutdown waits for the running requests to reach their next boundary |
+| `EXL3_TP_EXIT_ON_FATAL` | 1 (TP=3) / 0 (TP=2) | after a fatal rank / control-channel failure, rank 0 exits 3 s later so the watchdog restarts all ranks; 0 keeps it up, latched (refusing requests) |
 | `EXL3_TP_DISK_CACHE` | 1 when S>=2 | spill whole LRU conversations to per-rank local NVMe images; 0 = eviction-only |
 | `EXL3_TP_DISK_CACHE_DIR` | `<checkout>/diskcache` | per-rank image directory (created 0o700; trusted local storage) |
 | `EXL3_TP_DISK_CACHE_GIB` | 32 | per-rank byte cap, enforced while writing (data + stashes + trailer) |
@@ -502,7 +572,8 @@ holds for `EXL3_TP_ODL_AR2*`, `EXL3_TP_SHARED_EXPERT_DEVICE` (it changes the TP 
 `EXL3_DSV4_CAND_ROWS`, which `exl3ds4.sh` / `tp_serve_odl.sh` forward as well.
 `EXL3_TP_SESSIONS`, `EXL3_TP_PREFIX_*` and the `EXL3_TP_DISK_*` knobs are forwarded too: the
 handshake refuses a rank 1 with a different session count or pool geometry, and each rank
-enforces its own local disk cap and directory.
+enforces its own local disk cap and directory. `EXL3_TP_CONCURRENCY` is forwarded the same way
+(and checked at the handshake against each worker's live slot count).
 
 ## First-version limitations (deliberate)
 
@@ -511,8 +582,9 @@ enforces its own local disk cap and directory.
    prefilled up to the full cache: prefill is chunked at `EXL3_TP_SPAN`, block tables span the
    cache, and prompts past `cache_tokens - 2` are a clean 400 before any rank dispatch.
    `EXL3_TP_SESSIONS=1` restores the old single-conversation engine and protocol 4.
-2. **One in-flight request**; the four sessions are cached conversations, not concurrent GPU
-   work. Others queue in the server.
+2. **One model step at a time.** With `EXL3_TP_CONCURRENCY=1` (default) one request runs at a
+   time and the others queue in the server; with C >= 2 up to C requests take turns step by
+   step (see Interleaved requests) -- concurrency, not batching: no throughput gain.
 3. **No rank-failure recovery.** If either rank fails mid-request, RCCL wedges; restart both
    (`pkill -f tp_serve.py; pkill -f tp_rank1.py`, then relaunch). `/tp/status` surfaces rank-1
    health between requests. The pre-dispatch bounds checks and the startup memory floor remove

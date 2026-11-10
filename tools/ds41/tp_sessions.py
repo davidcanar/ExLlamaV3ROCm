@@ -152,12 +152,15 @@ class ColdSession:
 class SessionManager:
     """EXL3_TP_SESSIONS > 1: S conversation slots over one shared page pool.
 
-    The engine routes every request through plan()/commit() on the model thread (GPU stays
-    serialized: at most one session is active, so "inactive" is every other session and
-    LRU eviction is always safe). commit() returns exactly what the begin frame must tell
-    rank 1: the session, its page list after this request's allocation, the checkpoints to
-    drop (the request's own prefix-slot evictions plus every evicted session's), and the
-    whole sessions to evict.
+    The engine routes every request through plan()/commit() on the model thread. A session
+    is active while its request runs (one request per session); with interleaved requests
+    (EXL3_TP_CONCURRENCY >= 2) several sessions can be active at once, and eviction, spills
+    and matching only ever pick inactive ones -- a plan that would need an active session's
+    slot or pages raises PoolOverflow, and the engine keeps that request waiting until a
+    running one ends. commit() returns exactly what the begin frame must tell rank 1: the
+    session, its page list after this request's allocation, the checkpoints to drop (the
+    request's own prefix-slot evictions plus every evicted session's), and the whole
+    sessions to evict.
     """
 
     def __init__(self, *, slots: int, pool_pages: int, page_size: int,
@@ -213,7 +216,8 @@ class SessionManager:
         so it can never take an existing session over.
 
         Ephemeral sessions never match (their ids are unique per request anyway); an active
-        session cannot (the GPU is serialized and this one request is the only candidate)."""
+        session cannot: its request owns it until it ends (the interleaved engine defers a
+        prompt that would match one -- active_match -- instead of routing it elsewhere)."""
         best = None
         best_len = 0
         best_tick = -1
@@ -223,16 +227,49 @@ class SessionManager:
                     continue
                 if pool is self.cold and s.img in skip_cold:
                     continue
-                seq = s.seq
-                if not len(seq):
-                    continue
-                m = _common_prefix(seq, ids)
-                eff = m if m >= max(1, s.last_prompt_len - 1) else 0
+                eff = self._match_len(s, ids)
                 if eff < max(self.min_match, 1):
                     continue
                 if eff > best_len or (eff == best_len and s.tick > best_tick):
                     best, best_len, best_tick = s, eff, s.tick
         return best, best_len
+
+    @staticmethod
+    def _match_len(s, ids: array) -> int:
+        """The effective match length of `ids` against session `s` (the rule in match())."""
+        seq = s.seq
+        if not len(seq):
+            return 0
+        m = _common_prefix(seq, ids)
+        return m if m >= max(1, s.last_prompt_len - 1) else 0
+
+    def prompt_continues(self, running: array, ids: array) -> bool:
+        """Whether `ids` would match the session a request with prompt `running` is building,
+        once that request commits (it then holds at least `running`, and last_prompt_len is
+        len(running)). The interleaved engine needs this for a conversation's FIRST request:
+        its session's committed sequence is still empty while it runs, so active_match cannot
+        see that a retry / resend of the same turn belongs to it. A running prompt shorter than
+        the checkpoint minimum gets no post-prefill checkpoint, so waiting for it would buy
+        nothing: never defer on one."""
+        if len(running) - 1 < self.min_tokens:
+            return False
+        m = _common_prefix(running, ids)
+        eff = m if m >= max(1, len(running) - 1) else 0
+        return eff >= max(self.min_match, 1)
+
+    def active_match(self, ids: array) -> "Session | None":
+        """The ACTIVE session this prompt continues, if any: a request still running in it
+        would otherwise make match() route the prompt to a fresh session (a full re-prefill
+        of the whole conversation). The interleaved engine (proto 6) keeps such a prompt
+        waiting until that session's request ends; then it matches normally."""
+        best, best_len = None, 0
+        for s in self.sessions.values():
+            if not getattr(s, "active", False) or getattr(s, "ephemeral", False):
+                continue
+            eff = self._match_len(s, ids)
+            if eff >= max(self.min_match, 1) and eff > best_len:
+                best, best_len = s, eff
+        return best
 
     # -- slots and pages ---------------------------------------------------------------------
     def _free_sid(self, wanted: int | None = None, freed: set[int] = frozenset()) -> int | None:
@@ -336,8 +373,8 @@ class SessionManager:
             wanted = explicit_sid if not ephemeral and explicit_sid is not None else None
             free_sid = self._free_sid(wanted, picked)
             while free_sid is None:
-                # evict LRU sessions (never the spilled; never the active one -- there is
-                # none but ours) until the wanted slot is virtually free
+                # evict LRU sessions (never the spilled; never an active one: a running
+                # request owns it) until the wanted slot is virtually free
                 victim = self._lru_victim(exclude=picked | ({wanted} if wanted else set()))
                 if victim is None:
                     raise PoolOverflow(f"all {self.slots} session slots are busy; cannot "
