@@ -66,11 +66,12 @@ export EXL3_TP_ODL_AR3=${EXL3_TP_ODL_AR3:-1}
 export EXL3_TP_SESSIONS=${EXL3_TP_SESSIONS:-4}
 # Interleaved requests (proto 6): up to EXL3_TP_CONCURRENCY requests in flight at once, each in
 # its own session with its own live cache slot, taking turns one model step at a time (fair
-# share by GPU time). 1 (default) = one request at a time, the proto-5 engine. Must match on
-# every rank (it sizes each rank's cache slots; the handshake refuses a mismatch) and may not
-# exceed EXL3_TP_SESSIONS. EXL3_TP_INTERLEAVE_CHUNK (rank 0, default 512) = prefill rows per
-# step while other requests run.
-export EXL3_TP_CONCURRENCY=${EXL3_TP_CONCURRENCY:-1}
+# share by GPU time). Default 4 (run on the rig 2026-11-10), or EXL3_TP_SESSIONS if that is
+# smaller; 1 = one request at a time, the proto-5 engine (the rollback). Must match on every
+# rank (it sizes each rank's cache slots; the handshake refuses a mismatch; tp3_serve.sh has
+# the same default) and may not exceed EXL3_TP_SESSIONS. EXL3_TP_INTERLEAVE_CHUNK (rank 0,
+# default 512) = prefill rows per step while other requests run.
+export EXL3_TP_CONCURRENCY=${EXL3_TP_CONCURRENCY:-$(( EXL3_TP_SESSIONS < 4 ? EXL3_TP_SESSIONS : 4 ))}
 # Vision runs on rank 0 only (this rank just receives image rows); the per-request image cap
 # must match rank 0's.
 export EXL3_TP_VISION=${EXL3_TP_VISION:-1}

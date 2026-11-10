@@ -304,8 +304,9 @@ counters recorded no fallbacks. A DSpark streaming run measured 45.74 tok/s.
 
 ## Interleaved requests (2026-11-10)
 
-`EXL3_TP_CONCURRENCY=C` (2..`EXL3_TP_SESSIONS`, the same on every rank; default 1) lets up to
-C requests run at once instead of queueing behind each other. Each running request owns a
+`EXL3_TP_CONCURRENCY=C` (2..`EXL3_TP_SESSIONS`, the same on every rank; the TP=3 launchers
+default to 4, or to the session count if that is smaller; TP=2 defaults to 1) lets up to C
+requests run at once instead of queueing behind each other. Each running request owns a
 session (as before), a live recurrent-state slot (the trunk cache is built with C slots on
 every rank, ~32 MiB each per rank) and on rank 0 its own DSpark drafter ring (~7.5 MiB).
 They take turns on the single model thread: one step is a prefill chunk, a decode token or a
@@ -368,8 +369,10 @@ streams finishes in ~0.3 s instead of waiting ~13 s behind it, and the long stre
 512-row chunk) instead of ~67 s; a cancelled and resent turn reuses 7204 of its 7205 prompt
 tokens; at C=4 four streams share the GPU (8.9-14.7 chunks/s each: fair share is by model
 time, and DSpark acceptance differs per stream) and a fifth request waits for a free slot.
-The deployment runs `EXL3_TP_CONCURRENCY=4`. `tp3_start.sh restart` (and the watchdog) keep
-the running stack's value; `stop` + `start` falls back to the default 1 unless it is exported.
+Since then the TP=3 launchers (`tp3_serve.sh`, `tp3_worker.sh`) default to
+`EXL3_TP_CONCURRENCY=4`; export `EXL3_TP_CONCURRENCY=1` for the serialized engine
+(`tp3_start.sh` forwards it to the workers; `restart` and the watchdog keep the running
+stack's value).
 
 ## Vision (image input, 2026-10-29)
 
@@ -561,7 +564,7 @@ combined sessions+disk run: **44 passed**.
 | `EXL3_TP_PREFIX_LOG` | 0 | log one line per request: reused tokens and the checkpoint positions |
 | `EXL3_TP_SESSIONS` | 1 (deployment 4) | cached conversation slots over one shared pool; 1 = single-session engine and proto 4, >=2 = proto 5 |
 | `EXL3_TP_SESSION_MIN_MATCH` | 1 | minimum matched prefix for auto-routing (the last-prompt tolerance is applied on top) |
-| `EXL3_TP_CONCURRENCY` | 1 | requests in flight at once (2..`EXL3_TP_SESSIONS`, proto 6, every rank: it sizes each rank's live cache slots); 1 = one at a time (proto 5) |
+| `EXL3_TP_CONCURRENCY` | 4 (TP=3, capped at `EXL3_TP_SESSIONS`), 1 (TP=2) | requests in flight at once (2..`EXL3_TP_SESSIONS`, proto 6, every rank: it sizes each rank's live cache slots); 1 = one at a time (proto 5) |
 | `EXL3_TP_INTERLEAVE_CHUNK` | 512 | prefill rows per scheduler step while other requests run (rank 0; alone a prompt uses `EXL3_TP_SPAN`) |
 | `EXL3_TP_CLOSE_TIMEOUT` | 900 s | how long shutdown waits for the running requests to reach their next boundary |
 | `EXL3_TP_EXIT_ON_FATAL` | 1 (TP=3) / 0 (TP=2) | after a fatal rank / control-channel failure, rank 0 exits 3 s later so the watchdog restarts all ranks; 0 keeps it up, latched (refusing requests) |
@@ -594,9 +597,10 @@ enforces its own local disk cap and directory. `EXL3_TP_CONCURRENCY` is forwarde
    prefilled up to the full cache: prefill is chunked at `EXL3_TP_SPAN`, block tables span the
    cache, and prompts past `cache_tokens - 2` are a clean 400 before any rank dispatch.
    `EXL3_TP_SESSIONS=1` restores the old single-conversation engine and protocol 4.
-2. **One model step at a time.** With `EXL3_TP_CONCURRENCY=1` (default) one request runs at a
-   time and the others queue in the server; with C >= 2 up to C requests take turns step by
-   step (see Interleaved requests) -- concurrency, not batching: no throughput gain.
+2. **One model step at a time.** With `EXL3_TP_CONCURRENCY=1` (the TP=2 default) one request
+   runs at a time and the others queue in the server; with C >= 2 (TP=3: 4 by default) up to C
+   requests take turns step by step (see Interleaved requests) -- concurrency, not batching:
+   no throughput gain.
 3. **No rank-failure recovery.** If either rank fails mid-request, RCCL wedges; restart both
    (`pkill -f tp_serve.py; pkill -f tp_rank1.py`, then relaunch). `/tp/status` surfaces rank-1
    health between requests. The pre-dispatch bounds checks and the startup memory floor remove
