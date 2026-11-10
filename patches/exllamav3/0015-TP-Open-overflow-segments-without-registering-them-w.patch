@@ -1,0 +1,186 @@
+From bf86feee504d5846a71a18e8dc1acf2c13fa7c80 Mon Sep 17 00:00:00 2001
+From: David Canar <davidcanar@gmail.com>
+Date: Tue, 10 Nov 2026 06:55:54 -0700
+Subject: [PATCH] TP: Open overflow segments without registering them with the
+ resource tracker
+
+On Python < 3.13, _open_shm() opened a consumer's handle with SharedMemory(name), which registers
+it with the resource tracker, and then unregistered it. The processes of one host share a single
+tracker (spawned TP workers inherit the parent's), where a second register is a no-op but the
+first unregister removes the name: the consumer's unregister took away the producer's
+registration, and the producer's unlink() in clear() then raised KeyError inside the tracker.
+That printed a traceback on stderr for every overflow segment, tens of thousands while a large
+model loads, and left each segment untracked between the consumer's open and the producer's
+unlink.
+
+Map the segment directly instead (the constructor's shm_open + mmap, minus the registration), so
+the producer's registration stays balanced. Python 3.13+ keeps using track=False; other platforms
+do not track shared memory at all. The new test runs a local and a spawned consumer against the
+real SMConsumer.recv() overflow path without a GPU and fails on the old code with the KeyErrors.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ exllamav3/model/model_tp_shared.py | 52 +++++++++++++++++++----
+ tests/tp/test_sm_overflow.py       | 67 ++++++++++++++++++++++++++++++
+ 2 files changed, 110 insertions(+), 9 deletions(-)
+
+diff --git a/exllamav3/model/model_tp_shared.py b/exllamav3/model/model_tp_shared.py
+index dc400532..f16239cf 100644
+--- a/exllamav3/model/model_tp_shared.py
++++ b/exllamav3/model/model_tp_shared.py
+@@ -1,7 +1,9 @@
+ from __future__ import annotations
++import mmap
++import os
+ import torch
+ import numpy as np
+-from multiprocessing import shared_memory, resource_tracker
++from multiprocessing import shared_memory
+ import sys
+ import uuid
+ from .model_tp_cuda import cuda_host_register, cuda_host_unregister, CUDA_HOST_REGISTER_PORTABLE
+@@ -10,18 +12,50 @@ from ..util.shm import check_shm_capacity
+ DEFAULT_BUFFER_SIZE = 2 * 1024 ** 3
+ MAX_CACHE_PER_PROCESS = 4 * 1024**3
+ 
+-def _open_shm(name: str) -> shared_memory.SharedMemory:
++def _open_shm(name: str) -> shared_memory.SharedMemory | _UntrackedSegment:
+     """
+-    Open an existing shared-memory segment by name without registering it with this process's resource
+-    tracker: the creating process owns the segment and unlinks it, so a consumer handle must not count as a
+-    leak when the consumer exits (Python 3.13 has a flag for this; earlier versions register in the
+-    constructor and have to be told to forget)
++    Open an existing shared-memory segment by name without registering it with the resource tracker: the
++    creating process owns the segment and unlinks it, so a consumer handle must not count as a leak when the
++    consumer exits.
++
++    Python 3.13 has a flag for this. Earlier versions register every handle in the constructor, and telling
++    the tracker to forget it afterwards is not the same as never registering it: the processes of one host
++    share a single tracker (spawned workers inherit the parent's), where a second register is a no-op but the
++    first unregister removes the name. The consumer's unregister took away the producer's registration, and
++    the producer's unlink() in clear() then raised KeyError inside the tracker, a traceback on stderr per
++    overflow segment (tens of thousands while a large model loads). So the segment is mapped here directly.
+     """
+     if sys.version_info >= (3, 13):
+         return shared_memory.SharedMemory(name = name, track = False)
+-    shm = shared_memory.SharedMemory(name = name)
+-    resource_tracker.unregister(shm._name, "shared_memory")
+-    return shm
++    if os.name != "posix":
++        return shared_memory.SharedMemory(name = name)  # only POSIX segments are tracked
++    return _UntrackedSegment(name)
++
++
++class _UntrackedSegment:
++    """
++    An existing POSIX shared-memory segment, mapped the way SharedMemory(name) maps it minus the resource
++    tracker registration, with the part of SharedMemory's interface a consumer uses (name, size, buf, close)
++    """
++
++    def __init__(self, name: str):
++        import _posixshmem
++        self.name = name
++        fd = _posixshmem.shm_open("/" + name, os.O_RDWR, mode = 0o600)
++        try:
++            self.size = os.fstat(fd).st_size
++            self._mmap = mmap.mmap(fd, self.size)
++        finally:
++            os.close(fd)
++        self.buf = memoryview(self._mmap)
++
++    def close(self):
++        if self.buf is not None:
++            self.buf.release()
++            self.buf = None
++        if self._mmap is not None:
++            self._mmap.close()
++            self._mmap = None
+ 
+ 
+ _torch_dtypes = {
+diff --git a/tests/tp/test_sm_overflow.py b/tests/tp/test_sm_overflow.py
+index 719872b2..eac2bd73 100644
+--- a/tests/tp/test_sm_overflow.py
++++ b/tests/tp/test_sm_overflow.py
+@@ -6,7 +6,10 @@ with it, so late ranks cannot open it).
+ """
+ 
+ import multiprocessing as mp
++import os
+ import pickle
++import subprocess
++import sys
+ import time
+ from multiprocessing import shared_memory
+ 
+@@ -114,3 +117,67 @@ def test_one_command_pickled_for_three_staggered_ranks():
+             if r.is_alive():
+                 r.kill()
+         producer.close()
++
++
++_REPO_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++# Run in a process of its own: the resource tracker prints to that process's stderr, and only once the
++# process (and the tracker with it) has exited is every message in
++_TRACKER_SCRIPT = """
++import multiprocessing as mp
++
++import torch
++
++from exllamav3.model.model_tp_shared import SMConsumer, SMProducer
++
++
++def tensor(k):
++    return torch.randn(300, 1024, generator = torch.Generator().manual_seed(k))   # 1.2 MB
++
++
++def remote_rank(producer_imp, descs, results):
++    consumer = SMConsumer(producer_imp, device = -1)    # device -1: set_device is a no-op, no GPU needed
++    try:
++        results.put([torch.equal(consumer.recv(d), tensor(k)) for k, d in descs])
++    finally:
++        consumer.close()
++
++
++if __name__ == "__main__":
++    producer = SMProducer(buffer_size = 64 * 1024)
++    descs = [(k, producer.send(tensor(k))) for k in range(4)]
++    assert all(d["method"] == "overflow" for _, d in descs), descs
++    local = SMConsumer(producer, device = -1)            # the rank in this process
++    ok = [torch.equal(local.recv(d), tensor(k)) for k, d in descs[:2]]
++    ctx = mp.get_context("spawn")                        # a TP worker: it inherits this process's tracker
++    results = ctx.Queue()
++    worker = ctx.Process(target = remote_rank, args = (producer.export(), descs[2:], results))
++    worker.start()
++    ok += results.get(timeout = 300)
++    worker.join(60)
++    assert ok == [True] * 4 and worker.exitcode == 0, (ok, worker.exitcode)
++    producer.clear()                                     # unlinks the overflow segments
++    local.close()
++    producer.close()
++    print(" ".join(d["shm_name"] for _, d in descs))
++"""
++
++
++@pytest.mark.nogpu
++def test_overflow_segments_keep_the_resource_tracker_consistent(tmp_path):
++    """
++    A consumer opening an overflow segment must leave the producer's resource-tracker registration alone. On
++    Python < 3.13 it registered its handle and unregistered it right away; the processes of a host share one
++    tracker, where that removed the producer's entry, so the producer's unlink() in clear() raised KeyError
++    inside the tracker: a traceback on stderr per overflow segment, tens of thousands per model load.
++    """
++    script = tmp_path / "tracker_check.py"
++    script.write_text(_TRACKER_SCRIPT)
++    path = os.pathsep.join(p for p in (_REPO_DIR, os.environ.get("PYTHONPATH")) if p)
++    out = subprocess.run([sys.executable, str(script)], capture_output = True, text = True, timeout = 600,
++                         env = dict(os.environ, PYTHONPATH = path))
++    assert out.returncode == 0, out.stderr[-4000:]
++    assert "KeyError" not in out.stderr, out.stderr[-4000:]
++    assert "leaked shared_memory" not in out.stderr, out.stderr[-4000:]
++    names = out.stdout.split()
++    assert len(names) == 4 and not any(segment_exists(n) for n in names)
+-- 
+2.56.0
+
