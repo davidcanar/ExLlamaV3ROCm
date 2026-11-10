@@ -6,7 +6,8 @@ How the three-node stack is put together. How to install and start it is in the
 
 ```bash
 cd ~/exl3ds4
-EXL3_TP_MODEL_DIR=$HOME/exl3ds4/model-3.5bpw ./tools/ds41/tp3_start.sh start   # stop | restart | status | logs | probe | watch | unwatch
+./tools/ds41/tp3_start.sh start   # stop | restart | status | logs | probe | watch | unwatch
+# (model: $EXL3_TP_MODEL_DIR, else ~/exl3ds4/model-3.5bpw when present, else ~/exl3ds4/model)
 ```
 
 ## Files (tools/ds41/)

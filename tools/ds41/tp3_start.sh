@@ -293,7 +293,22 @@ adopt_env() {
     fi
     B2=${EXL3_BOX2:-192.168.0.103}; B3=${EXL3_BOX3:-192.168.0.105}; HTTP_PORT=${EXL3_HTTP_PORT:-1234}
     WD_INTERVAL=${EXL3_TP3_WATCH_INTERVAL:-15}; WD_LOAD_TIMEOUT=${EXL3_TP3_WATCH_LOAD_TIMEOUT:-900}
-    echo "  model for (re)starts: ${EXL3_TP_MODEL_DIR:-$ROOT/model (default; EXL3_TP_MODEL_DIR unset)}"
+}
+
+# The model folder every rank loads, resolved ONCE here (after adopt_env, so a restart keeps the
+# running stack's folder) and forwarded to both workers: EXL3_TP_MODEL_DIR when set, else the
+# 3.5 bpw quant when this box has it, else the 2.9 bpw one in $ROOT/model -- the same rule
+# tp3_serve.sh / tp3_worker.sh apply on their own. A start without EXL3_TP_MODEL_DIR used to
+# fall back to the 2.9 bpw folder even where the 3.5 bpw one was the intended model.
+resolve_model() {
+    if [ -z "${EXL3_TP_MODEL_DIR:-}" ]; then
+        if [ -f "$ROOT/model-3.5bpw/config.json" ]; then
+            export EXL3_TP_MODEL_DIR=$ROOT/model-3.5bpw
+        else
+            export EXL3_TP_MODEL_DIR=$ROOT/model
+        fi
+    fi
+    echo "  model for (re)starts: $EXL3_TP_MODEL_DIR"
 }
 
 # ---- the watchdog --------------------------------------------------------------------------
@@ -365,7 +380,7 @@ wait_up() {   # <timeout_s>: 0 once /health answers; 1 (DOWN_WHY says why) if th
 watchdog() {
     local fails=0 up_at why="" k delay
     trap 'wlog "stopped (signal)"; exit 0' TERM INT
-    wlog "started (pid $$): checks every ${WD_INTERVAL}s; restarts serve ${EXL3_TP_MODEL_DIR:-$ROOT/model}"
+    wlog "started (pid $$): checks every ${WD_INTERVAL}s; restarts serve ${EXL3_TP_MODEL_DIR:-(unresolved)}"
     up_at=$(date +%s)
     if wait_up "$WD_LOAD_TIMEOUT"; then wlog "stack up"; else why=$DOWN_WHY; fi
     while [ -f "$WANT" ]; do
@@ -420,6 +435,7 @@ start|restart)
         echo "  '$0 stop' first, or '$0 restart'"
         exit 1
     fi
+    resolve_model
     touch "$WANT"
     if ! start_stack; then
         echo "!! start failed; stopping whatever did start"
@@ -441,6 +457,7 @@ watch)
     fi
     if wd_running; then echo "a watchdog is already running (pid $(cat "$WD_PID"))"; exit 0; fi
     adopt_env
+    resolve_model
     record_offsets
     launch_watchdog;;
 unwatch)

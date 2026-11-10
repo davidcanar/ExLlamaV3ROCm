@@ -53,7 +53,7 @@ export EXL3_TP_CONCURRENCY=${EXL3_TP_CONCURRENCY:-$(( EXL3_TP_SESSIONS < 4 ? EXL
 # Image input: rank 0 loads the vision tower + aligner (~0.7 GiB) beside its shard and ships
 # each image's rows to the workers per request (they never load it). Same defaults as TP=2.
 export EXL3_TP_VISION=${EXL3_TP_VISION:-1}
-export EXL3_TP_MAX_IMAGES=${EXL3_TP_MAX_IMAGES:-16}
+export EXL3_TP_MAX_IMAGES=${EXL3_TP_MAX_IMAGES:-20}
 export EXL3_TP_DISK_CACHE=${EXL3_TP_DISK_CACHE:-1}
 export EXL3_TP_DISK_CACHE_DIR=${EXL3_TP_DISK_CACHE_DIR:-$ROOT/diskcache}
 # 100 GiB per box: these boxes serve nothing else, and a spilled conversation costs ~68 MB +
@@ -65,9 +65,18 @@ export EXL3_TP_DISK_TIMEOUT=${EXL3_TP_DISK_TIMEOUT:-300}
 # timeout drop the stream (which cancels the job). Rank 0 only: it is the HTTP layer.
 export KYOJIN_SSE_PING_S=${KYOJIN_SSE_PING_S:-30}
 export EXL3_TP_BUDGETS=${EXL3_TP_BUDGETS:-100,100,100}
-# Model selection: default is the 2.9bpw quant; export EXL3_TP_MODEL_DIR to
-# serve another checkpoint (e.g. model-3.5bpw). Paths must mirror on every box.
-export EXL3_TP_MODEL_DIR=${EXL3_TP_MODEL_DIR:-$ROOT/model}
+# Model selection: the 3.5 bpw quant when this box has it (TP=3 has the room, ~80 GiB of
+# weights per rank), else the 2.9 bpw one in $ROOT/model; export EXL3_TP_MODEL_DIR to serve
+# another checkpoint. Paths must mirror on every box: tp3_start.sh resolves the folder once
+# and forwards it to both workers, so the three ranks always load the same one.
+if [ -z "${EXL3_TP_MODEL_DIR:-}" ]; then
+    if [ -f "$ROOT/model-3.5bpw/config.json" ]; then
+        EXL3_TP_MODEL_DIR=$ROOT/model-3.5bpw
+    else
+        EXL3_TP_MODEL_DIR=$ROOT/model
+    fi
+fi
+export EXL3_TP_MODEL_DIR
 # 1M context (the model's own limit: max_position_embeddings 1048576, YaRN x16). The DSA KV
 # pools cost ~1.6 GiB per rank per 512K tokens; must match on every rank (pool geometry).
 export EXL3_TP_SAFE_CTX=${EXL3_TP_SAFE_CTX:-1048576}

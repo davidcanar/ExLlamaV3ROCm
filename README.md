@@ -168,7 +168,7 @@ From Box1:
 
 ```bash
 cd ~/exl3ds4
-EXL3_TP_MODEL_DIR=$HOME/exl3ds4/model-3.5bpw ./tools/ds41/tp3_start.sh start
+./tools/ds41/tp3_start.sh start     # serves ~/exl3ds4/model-3.5bpw when it is there
 ./tools/ds41/tp3_start.sh status    # rank 0 /health, the worker processes, the watchdog
 ./tools/ds41/tp3_start.sh logs      # follow rank 0
 ./tools/ds41/tp3_start.sh restart   # stop + start, keeping the running stack's settings
@@ -181,7 +181,9 @@ EXL3_TP_MODEL_DIR=$HOME/exl3ds4/model-3.5bpw ./tools/ds41/tp3_start.sh start
 Box2, rank 2 on Box3) over ssh, waits until both have loaded the model, then starts
 rank 0. The server is ready about three minutes later, when
 `curl -s localhost:1234/health` reports `"status": "ok"`. Without
-`EXL3_TP_MODEL_DIR` it serves the 2.9 bpw quant from `~/exl3ds4/model`. Logs:
+`EXL3_TP_MODEL_DIR` it serves the 3.5 bpw quant from `~/exl3ds4/model-3.5bpw` when that
+folder exists, else the 2.9 bpw one from `~/exl3ds4/model`; Box1 resolves the folder once
+and forwards it to both workers, and `restart` keeps the running stack's folder. Logs:
 `~/exl3ds4/logs/tp3-rank0.log` on Box1, `tp3-rank1.log` on Box2, `tp3-rank2.log` on Box3.
 
 `start` also leaves a watchdog running on Box1 (`~/exl3ds4/logs/tp3-watchdog.log`). When
@@ -287,13 +289,14 @@ On other machines, override the rig's addresses and paths:
 ### TP=3
 
 `tp3_start.sh` forwards these to every rank, and they must match on all of them:
-`EXL3_TP_MODEL_DIR` (default `$EXL3DS4_ROOT/model`), `EXL3_TP_SAFE_CTX` /
+`EXL3_TP_MODEL_DIR` (default `$EXL3DS4_ROOT/model-3.5bpw` when present, else
+`$EXL3DS4_ROOT/model`), `EXL3_TP_SAFE_CTX` /
 `EXL3_TP_CACHE_TOKENS` (1048576), `EXL3_TP_DSPARK` (1), `EXL3_TP_BUDGETS` (GiB per rank,
 `100,100,100`), `EXL3_TP_ODL_AR3` (1; `0` puts decode back on RCCL), `EXL3_TP_NCCL_SYNC`
 (`stream`), `EXL3_TP_SPAN`, `NCCL_MAX_NCHANNELS` (4), the conversation cache knobs
 (`EXL3_TP_SESSIONS` 4, `EXL3_TP_PREFIX_*`, `EXL3_TP_DISK_CACHE` 1, `EXL3_TP_DISK_CACHE_DIR`
 `$EXL3DS4_ROOT/diskcache`, `EXL3_TP_DISK_CACHE_GIB` 100, `EXL3_TP_DISK_TIMEOUT` 300) and
-the vision knobs (`EXL3_TP_VISION` 1, `EXL3_TP_VISION_STRICT`, `EXL3_TP_MAX_IMAGES` 16).
+the vision knobs (`EXL3_TP_VISION` 1, `EXL3_TP_VISION_STRICT`, `EXL3_TP_MAX_IMAGES` 20).
 The 1M pool costs 1.6 GiB per rank more than 512K, and the vision tower ~0.7 GiB on rank 0
 only; with both, Box1 keeps ~15 GiB free. Spilled conversations take ~68 MB plus ~3.3 KB
 per token on each box (a full 1M-token one ~3.3 GB), so the 100 GiB tier holds a few hundred
