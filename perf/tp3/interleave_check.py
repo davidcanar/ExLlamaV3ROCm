@@ -107,8 +107,12 @@ class Stream:
         return (self.times[0] - self.t0) if self.times else float("nan")
 
     def gap(self, t_from=None, t_to=None):
-        ts = [t for t in self.times if (t_from is None or t >= t_from) and (t_to is None or t <= t_to)]
-        return max((b - a for a, b in zip(ts, ts[1:])), default=0.0)
+        """The longest pause between two consecutive chunks that overlaps [t_from, t_to] (a
+        pause that straddles either end counts: that is the stall the stream saw)."""
+        lo = float("-inf") if t_from is None else t_from
+        hi = float("inf") if t_to is None else t_to
+        return max((b - a for a, b in zip(self.times, self.times[1:]) if b >= lo and a <= hi),
+                   default=0.0)
 
     def cached(self):
         return (self.usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
