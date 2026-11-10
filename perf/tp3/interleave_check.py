@@ -12,6 +12,8 @@ Run it only on a server nobody else is using: it creates (and evicts) cached con
          step) instead of one stall for the whole prefill
   CR     a conversation turn is cancelled mid-stream and sent again at once: the resend must
          resume from the conversation's cache (cached_tokens), not re-prefill it
+  MX     (concurrency >= 3) that many streams at once share the GPU fairly (similar chunk rates,
+         together about the solo rate), and one more request waits for a free slot
   ST     /tp/status reports proto 6 and the scheduler; nothing is left running
 
 Greedy replies can differ run to run on this rig even serially (near-ties, see
@@ -194,6 +196,30 @@ results["CR"] = ok
 print(f"CR cancel + resend: resend cached {c3.cached()} of {c3.usage.get('prompt_tokens')} prompt "
       f"tokens (turn 1 prompt {c1.usage.get('prompt_tokens')}), first token after {c3.ttft:5.2f}s  "
       f"{'OK' if ok else 'MISS'}", flush=True)
+
+# ---- MX: as many streams as the server interleaves at once, and one more, which must wait
+if conc and conc >= 3:
+    mx = [Stream(f"M{k}", [{"role": "user", "content": f"Count upwards from {1000 * (k + 1)}, one "
+                            "number per line, nothing else."}], 160).start() for k in range(conc)]
+    for m in mx:
+        m.started.wait(600)
+    t_all = time.perf_counter()                       # every one of them is streaming now
+    extra = Stream("MX", [{"role": "user", "content": "Name one prime number. Number only."}], 8).start()
+    time.sleep(0.5)
+    waiting = len(status().get("pool", {}).get("scheduler", {}).get("pending", []))
+    for m in mx + [extra]:
+        m.join()
+    t_first = min(m.times[-1] for m in mx if m.times)   # the last chunk of the first one to finish
+    win = max(t_first - t_all, 1e-9)
+    rates = [sum(t_all <= t <= t_first for t in m.times) / win for m in mx]
+    waited = bool(extra.times) and extra.times[0] >= t_first - 0.25
+    ok = (all(m.error is None for m in mx + [extra]) and waited
+          and sum(rates) >= 0.6 * l0_rate and min(rates) >= 0.5 * max(rates))
+    results["MX"] = ok
+    print(f"MX {conc} streams at once: {min(rates):4.1f}-{max(rates):4.1f} chunks/s each, "
+          f"{sum(rates):5.1f} together (solo {l0_rate:5.1f}); request {conc + 1} "
+          f"{'waited for a slot' if waited else 'did NOT wait'} (pending while they ran: {waiting}), "
+          f"first token {extra.ttft:5.2f}s after it was sent  {'OK' if ok else 'FAIL'}", flush=True)
 
 # ---- ST: status
 time.sleep(1.0)

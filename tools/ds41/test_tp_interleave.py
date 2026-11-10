@@ -463,6 +463,27 @@ def test_four_conversations_at_concurrency_four(spec):
 
 
 @pytest.mark.parametrize("spec", [False, True])
+def test_a_fifth_conversation_waits_while_four_run_in_four_sessions(spec):
+    """The rig's setting, concurrency = sessions = 4: a fifth conversation arriving while four run
+    can neither start nor take a session; it waits in the queue, starts once one of the four has
+    ended (in a session whose conversation then leaves), and every reply matches the serialized run."""
+    ps = [prompt(340 + i, 30 + 4 * i) for i in range(5)]
+    want = serial_replies([(p, 16) for p in ps], spec=spec, pool_pages=96)
+    r = IlvRanks(spec=spec, concurrency=4, sessions=4, pool_pages=96, delay=0.003)
+    try:
+        got = r.gather(*(r.one(str(i), p, 16) for i, p in enumerate(ps)))
+        r.check()
+        assert [t for t, _ in got] == want
+        assert r.engine.sched_counters["max_active"] == 4 and r.be1.max_live == 4
+        marks = [f["op"] for f in r.frames if f.get("op") in ("begin", "end")]
+        assert marks.count("begin") == 5 and marks.index("end") == 4, marks   # 4 begins, an end, the 5th
+        if spec:
+            assert r.be0.stale_drafts == 0
+    finally:
+        r.stop()
+
+
+@pytest.mark.parametrize("spec", [False, True])
 def test_multi_turn_reuse_survives_interleaving(spec):
     """Turn 2 of conversation A runs while conversation B generates: A still resumes from its
     own checkpoint (cached_tokens > 0, same session) and both replies match the serialized run."""
