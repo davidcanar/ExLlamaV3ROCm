@@ -359,6 +359,18 @@ after its verify is settled before the request ends (rank 1 used to exit on that
 fatal control-channel failure fails the queued requests at once and (servers) exits rank 0 for
 the watchdog, instead of letting the next requests hang on a broken channel.
 
+**On the rig (TP=3, 2026-11-10)**, same build at C=1, C=2 and C=4: `session_check.py`,
+`http_check.py` and `vision_check.py` pass at every C; single-stream decode is unchanged
+(DSpark 30-33 tok/s, plain 24-25 tok/s) and so is memory (C=4 adds ~50 MiB per rank).
+`perf/tp3/interleave_check.py` passes at C=2 and C=4: a short request sent while a long reply
+streams finishes in ~0.3 s instead of waiting ~13 s behind it, and the long stream pauses at most
+0.35 s; a 22K-token prompt arriving beside a stream stalls it at most 1.5-1.8 s at a time (one
+512-row chunk) instead of ~67 s; a cancelled and resent turn reuses 7204 of its 7205 prompt
+tokens; at C=4 four streams share the GPU (8.9-14.7 chunks/s each: fair share is by model
+time, and DSpark acceptance differs per stream) and a fifth request waits for a free slot.
+The deployment runs `EXL3_TP_CONCURRENCY=4`. `tp3_start.sh restart` (and the watchdog) keep
+the running stack's value; `stop` + `start` falls back to the default 1 unless it is exported.
+
 ## Vision (image input, 2026-10-29)
 
 Rank 0 loads the tower + aligner (`component = "vision"`, the PR #449 architecture
