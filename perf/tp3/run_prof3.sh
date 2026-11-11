@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # Three-node profiling run: ranks 1/2 = stock tools/ds41/tp3_worker.sh on Box2/Box3, rank 0 =
-# perf/tp3/tp3_prof.py here with the environment of tools/ds41/tp3_serve.sh.
+# the driver perf/tp3/$PROF_DRIVER (default ts_ab.py) here with the environment of
+# tools/ds41/tp3_serve.sh. tp3_prof.py's own main() predates the interleaved engine (it calls the
+# removed TPEngine._run/_run_spec); ts_ab.py runs the same measurements through TPEngine.generate.
 # The tp3 server must be stopped first (tools/ds41/tp3_start.sh stop).
 # usage: run_prof3.sh [tag]
-#   PROF_* configure the driver (see tp3_prof.py); EXL3_*, NCCL_*, ODL2_*, HSA_*, ... are forwarded
-#   to the workers too, except the per-box ones (rank, local IP, peer map, socket ifname).
+#   PROF_* configure the driver (see ts_ab.py / tp3_prof.py); EXL3_*, NCCL_*, ODL2_*, HSA_*, ... are
+#   forwarded to the workers too, except the per-box ones (rank, local IP, peer map, socket ifname).
+#   A/B: run twice with a different tag and setting (e.g. EXL3_TP_MOE_TENSOR_SPLIT=0 / 1, the second
+#   with PROF_LOGITS_REF=<first tag>), then python3 perf/tp3/ab_summary.py perf/tp3/ab.jsonl A B
 set -uo pipefail
 
 TAG=${1:-prof3}
@@ -26,6 +30,9 @@ export EXL3_TP_BUDGETS=${EXL3_TP_BUDGETS:-100,100,100}
 export EXL3_TP_SESSIONS=${EXL3_TP_SESSIONS:-1}
 export EXL3_TP_VISION=${EXL3_TP_VISION:-0}
 export EXL3_TP_DISK_CACHE=${EXL3_TP_DISK_CACHE:-0}
+# the server's default (tp3_serve.sh / tp3_worker.sh): unset here, rank 0 would set odl_ar3 up
+# off while the workers' launcher turns it on, and every rank falls back to RCCL decode
+export EXL3_TP_ODL_AR3=${EXL3_TP_ODL_AR3:-1}
 
 PASS=""
 for v in $(compgen -e | grep -E '^(EXL3_|NCCL_|ODL2_|ODL_TB5|HSA_|HIP_|AMD_|GPU_|PYTORCH_|TORCH_)'); do
@@ -100,7 +107,7 @@ export PYTHONPATH="$ROOT/src/exllamav3-dsv41f${PYTHONPATH:+:$PYTHONPATH}"
 export PROF_TAG=${PROF_TAG:-$TAG}
 cd "$ROOT/src/exllamav3-dsv41f"
 echo "[run_prof3] rank 0 -> $LOG0"
-"$ROOT/.venv/bin/python" "$ROOT/perf/tp3/${PROF_DRIVER:-tp3_prof.py}" > "$LOG0" 2>&1
+"$ROOT/.venv/bin/python" "$ROOT/perf/tp3/${PROF_DRIVER:-ts_ab.py}" > "$LOG0" 2>&1
 rc=$?
 echo "[run_prof3] rank 0 exited $rc"
 sleep 5

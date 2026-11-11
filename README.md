@@ -65,6 +65,15 @@ a 10K-token conversation came back from cache after a different conversation had
 in 0.8 s instead of a 29 s prefill. Details: [docs/tp3-runtime.md](docs/tp3-runtime.md)
 and [docs/tp3-review-2026-11-02.md](docs/tp3-review-2026-11-02.md).
 
+Since 2026-11-11 the MoE layers are tensor split (`EXL3_TP_MOE_TENSOR_SPLIT`, default at
+TP=3): every rank runs all of a token's 6 experts at a third of their width, instead of
+holding 128 whole experts and waiting for whichever rank the router picked most of them
+from. Against expert parallelism on the same build (`perf/tp3/ts_ab.py`, greedy, 512K
+cache): plain decode 48.4 → 44.6 ms/token at 2K and 48.9 → 45.3 at 24K (−7.5%), DSpark
+verify passes 7–14% shorter at 24K (6 rows: 89.7 → 81.0 ms), prompt processing 377 →
+402 tok/s at 24K, ~9 GiB more free memory per rank, first-token logits within KL 5e-3.
+The load takes ~190 s instead of ~120 s.
+
 ## What you need
 
 - Two (TP=2) or three (TP=3) Strix Halo (`gfx1151`) machines with 128 GB each,
@@ -292,7 +301,10 @@ On other machines, override the rig's addresses and paths:
 `EXL3_TP_MODEL_DIR` (default `$EXL3DS4_ROOT/model-3.5bpw` when present, else
 `$EXL3DS4_ROOT/model`), `EXL3_TP_SAFE_CTX` /
 `EXL3_TP_CACHE_TOKENS` (1048576), `EXL3_TP_DSPARK` (1), `EXL3_TP_BUDGETS` (GiB per rank,
-`100,100,100`), `EXL3_TP_ODL_AR3` (1; `0` puts decode back on RCCL), `EXL3_TP_NCCL_SYNC`
+`100,100,100`), `EXL3_TP_ODL_AR3` (1; `0` puts decode back on RCCL),
+`EXL3_TP_MOE_TENSOR_SPLIT` (1 at TP=3: every rank holds 1/3 of the width of every routed expert
+instead of 128 whole experts, so no rank waits on the one the router picked most experts from;
+`0` restores expert parallelism; measured under Results), `EXL3_TP_NCCL_SYNC`
 (`stream`), `EXL3_TP_SPAN`, `NCCL_MAX_NCHANNELS` (4), the conversation cache knobs
 (`EXL3_TP_SESSIONS` 4, `EXL3_TP_PREFIX_*`, `EXL3_TP_DISK_CACHE` 1, `EXL3_TP_DISK_CACHE_DIR`
 `$EXL3DS4_ROOT/diskcache`, `EXL3_TP_DISK_CACHE_GIB` 100, `EXL3_TP_DISK_TIMEOUT` 300) and

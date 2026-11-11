@@ -108,7 +108,8 @@ raw bytes, which no JSON frame can start with):
                     token; every frame names its request; end + "reset": true forgets the session
   rank 1 -> rank 0: {"op": "hello_ok", "proto": 4, "rank": 1, "vocab_size": V, "dspark": B,
                      "vision_capable": B,   (proto-4 workers speak imgmeta + binary frames)
-                     "image_skip": B}       (rows needed only from the restore point on)
+                     "image_skip": B,       (rows needed only from the restore point on)
+                     "moe_tensor_split": B} (this rank's MoE layout; rank 0 refuses a mismatch)
                     {"op": "imgmeta_ok", "req": N, "images": K, "rows": R}      vision rows landed intact
                     {"op": "pong"}
                     {"op": "error", "message": "..."}                          rank 1 failed; restart both
@@ -271,6 +272,14 @@ def env_truthy(name: str, default: bool = False) -> bool:
     if raw is None or raw == "":
         return bool(default)
     return str(raw).strip().lower() not in ("0", "false", "no", "off")
+
+
+def moe_tensor_split_wanted(world_size: int) -> bool:
+    """EXL3_TP_MOE_TENSOR_SPLIT: split every routed expert's intermediate width across the ranks
+    (tensor split) instead of giving each rank a range of whole experts (expert parallelism).
+    Default on at world size >= 3, where it was measured (TP=3 A/B 2026-11-11, perf/tp3/ts_ab.py),
+    off at TP=2 (not measured there). Every rank must agree; hello_ok reports it."""
+    return env_truthy("EXL3_TP_MOE_TENSOR_SPLIT", int(world_size) >= 3)
 
 
 class ChannelClosed(ConnectionError):
@@ -733,11 +742,12 @@ class TPModelBackend:
                  dspark: bool = False, draft_model=None, draft_cache=None, draft_bt=None,
                  export_layers=frozenset(), dspark_block: int = 5, page_size: int = 256,
                  draft_window_rows: int = 128, vision=None, vision_cfg=None, draft_bts=None,
-                 slots: int = 1):
+                 slots: int = 1, moe_tensor_split: bool = False):
         self.model = model
         self.cache = cache
         self.tokenizer = tokenizer
         self.span = int(span)
+        self.moe_tensor_split = bool(moe_tensor_split)   # MoE layout of this rank's load
         self.cache_tokens = int(cache_tokens)
         self.rank = int(rank)
         self.dspark = bool(dspark)
@@ -849,11 +859,17 @@ class TPModelBackend:
             f"{PAGE_SIZE}); prefill chunks at {span} rows; block tables sized to the cache"
             + (f"; {slots} live request slots" if slots > 1 else ""))
         started = time.time()
-        # EXL3_TP_MOE_TENSOR_SPLIT=1 (every rank): split each routed expert's intermediate width
-        # across the ranks instead of giving each rank a range of whole experts. Every rank then
-        # runs all of a token's experts at 1/N width, so decode no longer waits on whichever rank
-        # the router happened to pick most experts from (expert parallelism: max-of-N imbalance)
-        tp_options = {"moe_tensor_split": True} if env_truthy("EXL3_TP_MOE_TENSOR_SPLIT", False) else None
+        # EXL3_TP_MOE_TENSOR_SPLIT (every rank; default on at world size >= 3, see
+        # moe_tensor_split_wanted): split each routed expert's intermediate width across the
+        # ranks instead of giving each rank a range of whole experts. Every rank then runs all of
+        # a token's experts at 1/N width, so decode no longer waits on whichever rank the router
+        # happened to pick most experts from (expert parallelism: max-of-N imbalance). TP=3 A/B
+        # 2026-11-11: plain decode -7.5%, verify -7..-14%, prefill +7..11%, ~9 GiB more free per
+        # rank, first-token logits KL <= 5e-3 vs expert parallelism; the TP load takes ~190 s
+        # instead of ~120 s (every rank reads a slice of every expert). =0 restores expert
+        # parallelism (tp3_start.sh forwards it to every rank)
+        moe_ts = moe_tensor_split_wanted(world_size)
+        tp_options = {"moe_tensor_split": True} if moe_ts else None
         model.load(
             tensor_p=True,
             tp_backend="nccl",
@@ -954,7 +970,7 @@ class TPModelBackend:
                    export_layers=export_layers, dspark_block=block, page_size=PAGE_SIZE,
                    draft_window_rows=int(config.sliding_window), vision=vision_model,
                    vision_cfg=getattr(config, "vision", None),
-                   draft_bts=draft_bts, slots=slots)
+                   draft_bts=draft_bts, slots=slots, moe_tensor_split=moe_ts)
 
     def new_state(self):
         import torch
@@ -1671,7 +1687,11 @@ class Rank1Worker:
               "vision_capable": True,   # proto 4: imgmeta + binary frames understood
               # image ids below a begin's restore point need no rows (rank 0 ships only the
               # images its prefill reads); rank 0 ships every image to a worker without this
-              "image_skip": True}
+              "image_skip": True,
+              # this rank's MoE layout: ranks that split the experts differently would sum
+              # mismatched partials in every MoE all-reduce (wrong output, no error), so rank 0
+              # refuses to start on a mismatch
+              "moe_tensor_split": bool(getattr(self.backend, "moe_tensor_split", False))}
         if proto >= PROTO_SESSIONS:
             want_sessions = int(hello.get("sessions", 0) or 0)
             self.page_size = int(getattr(self.backend, "page_size", 256) or 256)

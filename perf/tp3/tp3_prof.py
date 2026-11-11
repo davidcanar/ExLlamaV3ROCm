@@ -10,6 +10,10 @@ tp3_channel.MultiControlChannel over N-1 workers. Same measurements:
 env: PROF_CTX="2000,24000"  PROF_WARM=24  PROF_STEPS=6  PROF_MODES="spec,plain"  PROF_TEMP=0
      PROF_OUT=$EXL3DS4_ROOT/perf/tp3/prof3.jsonl  PROF_HOOKS=1 (0: no instrumentation)
      PROF_TAG (label stored in the jsonl record)
+
+main() below drives TPEngine._run/_run_spec, which the interleaved engine (proto 6) no longer
+has: run ts_ab.py (run_prof3.sh's default driver), which imports the helpers of this module and
+measures the same things through TPEngine.generate.
 """
 from __future__ import annotations
 
@@ -92,6 +96,8 @@ def connect_workers(backend, world):
         reply = channel.channels[i].recv()
         assert reply.get("op") == "hello_ok", reply
         assert bool(reply.get("dspark")) == bool(backend.dspark), reply
+        assert bool(reply.get("moe_tensor_split", False)) == bool(getattr(backend, "moe_tensor_split", False)), \
+            f"MoE layout differs from rank 0's: {reply}"
     return channel
 
 

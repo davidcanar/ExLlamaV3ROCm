@@ -173,6 +173,15 @@ def build_tp_engine(args: argparse.Namespace) -> Any:
             raise SystemExit(f"tp3-serve: DSpark mismatch with worker {i + 1} "
                              f"(rank 0 {bool(backend.dspark)}, worker {bool(reply.get('dspark'))}); "
                              "restart ALL ranks with EXL3_TP_DSPARK set the same way")
+        # Ranks that split the MoE experts differently would sum mismatched partials in every
+        # MoE all-reduce: wrong output with no error anywhere, so refuse to serve at all
+        here_ts = bool(getattr(backend, "moe_tensor_split", False))
+        if bool(reply.get("moe_tensor_split", False)) != here_ts:
+            startup_health.abort(f"worker {i + 1} MoE layout mismatch")
+            raise SystemExit(f"tp3-serve: MoE layout mismatch with worker {i + 1} (rank 0 "
+                             f"moe_tensor_split={here_ts}, worker "
+                             f"{bool(reply.get('moe_tensor_split', False))}); restart ALL ranks with "
+                             "the same tools/ds41 and EXL3_TP_MOE_TENSOR_SPLIT (tp3_start.sh forwards it)")
         if proto >= tp_engine.PROTO_SESSIONS:
             if int(reply.get("sessions", -1)) != sessions:
                 startup_health.abort(f"worker {i + 1} session count mismatch")

@@ -779,6 +779,36 @@ def _hello(chan, dspark=False):
     return chan.recv()
 
 
+def test_hello_ok_reports_the_moe_layout():
+    """hello_ok carries the worker's MoE layout: rank 0 refuses a worker that split the experts
+    differently (mismatched partials in every MoE all-reduce: wrong output and no error)."""
+    for ts in (False, True):
+        be = ScriptedBackend([1, 2, 3])
+        if ts:
+            be.moe_tensor_split = True
+        port = free_port()
+        errors = []
+        t = _worker_thread(be, port, errors)
+        cli = tp_engine.ControlChannel.listen("127.0.0.1", port, accept_timeout=20.0)
+        ok = _hello(cli)
+        assert ok["op"] == "hello_ok" and ok["moe_tensor_split"] is ts
+        cli.send({"op": "shutdown"})
+        t.join(10.0)
+        assert not t.is_alive() and not errors
+        cli.close()
+
+
+def test_moe_tensor_split_default(monkeypatch):
+    """Tensor split by default at world size >= 3 (measured there), expert parallelism at TP=2;
+    EXL3_TP_MOE_TENSOR_SPLIT overrides either way."""
+    monkeypatch.delenv("EXL3_TP_MOE_TENSOR_SPLIT", raising=False)
+    assert tp_engine.moe_tensor_split_wanted(3) and not tp_engine.moe_tensor_split_wanted(2)
+    monkeypatch.setenv("EXL3_TP_MOE_TENSOR_SPLIT", "0")
+    assert not tp_engine.moe_tensor_split_wanted(3)
+    monkeypatch.setenv("EXL3_TP_MOE_TENSOR_SPLIT", "1")
+    assert tp_engine.moe_tensor_split_wanted(2)
+
+
 def test_spec_round_and_accept_framing_roundtrip():
     """round/accept frames (window = list of ints) round-trip byte-exact through the channel."""
     port = free_port()

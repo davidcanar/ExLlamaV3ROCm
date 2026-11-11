@@ -158,7 +158,9 @@ and spec prompts, back-to-back requests on one server, server healthy throughout
 Framed JSON over the Thunderbolt TCP control channel (`EXL3_TP_CONTROL_PORT`): 4-byte
 little-endian length prefix + UTF-8 JSON. Binary payloads (vision rows) use the same prefix
 with a `0x01` tag byte ahead of the raw bytes — a byte no JSON frame can start with.
-`hello`/`hello_ok` (protocol + vocab + DSpark check) after both loads; then per request
+`hello`/`hello_ok` (protocol + vocab + DSpark + MoE layout check: `moe_tensor_split` must
+match rank 0's, since ranks that split the experts differently would sum mismatched partials
+without any error) after both loads; then per request
 `begin {ids, spec}` → fresh state, prefill (with the DSpark tap export on spec requests), and
 in spec mode forward #1 of the last prompt token only on plain requests; `step {token}` per
 plain token, or `round {k, window}` + `accept {a}` per spec round (one multi-row verify + one
